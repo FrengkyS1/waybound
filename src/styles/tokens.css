@@ -1,0 +1,146 @@
+/* Waybound design tokens — see using-ui-stack skill (8px grid, dark tool UI) */
+
+/* Display face for titles and instance names; body stays Segoe UI. */
+@font-face {
+  font-family: "Space Grotesk";
+  src: url("../assets/fonts/SpaceGrotesk-latin-wght.woff2") format("woff2-variations");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+:root {
+  /* Neutrals (60%) */
+  --color-bg: #141414;
+  --color-surface: #1c1c1c;
+  --color-surface-raised: #242424;
+  --color-border: #333333;
+  --color-border-subtle: #2a2a2a;
+  --color-border-hover: #444444;
+
+  /* Hover/active elevation for surface-raised buttons and inputs */
+  --color-surface-hover: #2c2c2c;
+  --color-surface-active: #262626;
+
+  /* Text — three-step ramp. Values are set so even the quietest step clears
+     WCAG 4.5:1 for small text on the most elevated surface it sits on
+     (muted #8c8c8c on surface-raised #242424 = 4.6:1); don't darken these
+     for elegance. */
+  --color-text: #ececec;
+  --color-text-secondary: #a3a3a3;
+  --color-text-muted: #8c8c8c;
+
+  /* Brand / accent (10%) */
+  --color-accent: #2e9e4a;
+  --color-accent-hover: #37a850;
+  --color-accent-active: #208e3c;
+  /* Bright end of the beacon gradient on live progress fills. */
+  --color-accent-bright: #4fc46e;
+
+  /* Semantic */
+  --color-error: #e05c5c;
+  --color-info: #4a7fc4;
+  --color-warning: #d4a574;
+  /* Text/icon color for content sitting on a solid accent/error-colored surface. */
+  --color-on-accent: #ffffff;
+
+  /* Typography */
+  --font-sans: "Segoe UI", system-ui, sans-serif;
+  --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, monospace;
+
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+
+  /* Spacing (8px grid) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 16px;
+  --space-4: 24px;
+  --space-5: 32px;
+
+  /* Layout */
+  --sidebar-width: 200px;
+  --radius-sm: 3px;
+  --radius-md: 8px;
+
+  /* Elevation (floating UI shadows, small → large) */
+  --shadow-sm: 0 8px 24px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 12px 32px rgb(0 0 0 / 0.45);
+  --shadow-lg: 0 16px 48px rgb(0 0 0 / 0.5);
+
+  /* Depth (in-flow surfaces, not floating UI): a faint top-light edge so
+     panels read as lit slabs instead of flat fills, plus a resting/lifted
+     shadow pair for cards. */
+  --edge-light: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35), 0 4px 12px rgb(0 0 0 / 0.25);
+  --shadow-card-hover: 0 2px 4px rgb(0 0 0 / 0.4), 0 12px 28px rgb(0 0 0 / 0.45);
+  --surface-sheen: linear-gradient(180deg, rgb(255 255 255 / 0.025), transparent 48%);
+
+  /* Beacon glow — the accent read as light, used on primary/play actions
+     and live progress. */
+  --glow-accent: 0 0 16px rgb(46 158 74 / 0.35);
+  --glow-accent-strong: 0 0 24px rgb(46 158 74 / 0.5);
+
+  /* Z-index scale — always reference these, never a raw number.
+     Only the tiers this app actually uses; add more only when a real need
+     for them shows up (dropdown menus < toast notifications < modal dialogs). */
+  --z-dropdown: 20;
+  --z-toast: 40;
+  --z-modal: 100;
+
+  /* Interaction */
+  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+  --transition-fast: 150ms ease-out;
+
+  /* Motion — strong custom curves for deliberate UI motion; built-in CSS
+     ease-out/ease-in-out read as weak/mushy at these durations. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --duration-popover: 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition-fast: 0ms;
+    --duration-popover: 0ms;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+h1,
+h2 {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

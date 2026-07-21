@@ -1,0 +1,56 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust
+src-tauri/target/
+
+# Tauri
+src-tauri/gen/
+
+# Local icon source (generated icons live in src-tauri/icons/)
+app-icon/
+
+# App secrets (CurseForge API key lives in OS config dir, never here)
+config.toml
+*.secrets.toml
+.env
+docker/**/.env
+
+# Local Minecraft server data (world saves, player data, logs with IPs)
+docker/**/data/
+
+# Local AI/session tooling state and internal working docs (not for the public repo)
+.impeccable/
+.claude/
+.agents/
+CLAUDE.md
+skills-lock.json
+SUMMARY.md
+PRODUCT.md
+Prompt.txt
+UX_AUDIT.md
+
+# Personal Minecraft server setup (unrelated to the app itself)
+docker/

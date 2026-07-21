@@ -1,0 +1,46 @@
+.menu {
+  position: fixed;
+  min-width: 180px;
+  padding: var(--space-1);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  z-index: var(--z-dropdown);
+  /* Scales from its top-left corner, which is where the cursor opened it —
+     the closest thing this menu has to a "trigger" to originate from. */
+  transform-origin: top left;
+  animation: menuIn var(--duration-popover) var(--ease-out) both;
+}
+
+@keyframes menuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-2);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.item:hover {
+  background: var(--color-surface);
+}
+
+.itemDanger {
+  color: var(--color-error);
+}

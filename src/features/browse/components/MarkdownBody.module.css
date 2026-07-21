@@ -1,0 +1,313 @@
+.prose {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  width: 100%;
+  max-width: none;
+  word-wrap: break-word;
+}
+
+.prose :global(> :first-child) {
+  margin-top: 0;
+}
+
+.prose :global(h1),
+.prose :global(h2),
+.prose :global(h3),
+.prose :global(h4) {
+  color: var(--color-text);
+  margin: var(--space-5) 0 var(--space-2);
+  line-height: var(--leading-tight);
+  font-weight: 700;
+}
+
+.prose :global(h1:first-child),
+.prose :global(h2:first-child),
+.prose :global(h3:first-child) {
+  margin-top: 0;
+}
+
+.prose :global(h1) {
+  font-size: 1.35rem;
+}
+
+.prose :global(h2) {
+  font-size: 1.1rem;
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.prose :global(h3) {
+  font-size: var(--text-sm);
+}
+
+.prose :global(strong) {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.prose :global(p) {
+  margin: 0 0 var(--space-3);
+}
+
+.prose :global(ul),
+.prose :global(ol) {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-4);
+}
+
+.prose :global(li) {
+  margin-bottom: var(--space-1);
+}
+
+.prose :global(a) {
+  color: var(--color-info);
+  text-decoration: none;
+}
+
+.prose :global(a:hover) {
+  text-decoration: underline;
+}
+
+.prose :global(code) {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 4px;
+  border-radius: 2px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.prose :global(pre) {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  overflow-x: auto;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.prose :global(pre code) {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.prose :global(blockquote) {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--color-border);
+  /* Quoted prose is still reading text — secondary, not muted, so it stays
+     above 4.5:1 at body size. */
+  color: var(--color-text-secondary);
+}
+
+.prose :global(img) {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+  margin: var(--space-2) 0;
+}
+
+.prose :global(hr) {
+  border: none;
+  border-top: 1px solid var(--color-border-subtle);
+  margin: var(--space-4) 0;
+}
+
+.prose :global(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.prose :global(th),
+.prose :global(td) {
+  border: 1px solid var(--color-border-subtle);
+  padding: var(--space-2);
+  text-align: left;
+}
+
+.prose :global(th) {
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+/* HTML blocks common on Modrinth (Fresh Animations, modpack pages) */
+.prose :global(center),
+.richHtml center {
+  display: block;
+  text-align: center;
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.prose :global(details),
+.richHtml details {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.prose :global(summary),
+.richHtml summary {
+  cursor: pointer;
+  color: var(--color-text);
+  font-weight: 600;
+  font-size: var(--text-sm);
+  list-style: none;
+  user-select: none;
+}
+
+.prose :global(summary::-webkit-details-marker),
+.richHtml summary::-webkit-details-marker {
+  display: none;
+}
+
+.prose :global(summary::before),
+.richHtml summary::before {
+  content: "▸ ";
+  color: var(--color-accent);
+}
+
+.prose :global(details[open] summary::before),
+.richHtml details[open] summary::before {
+  content: "▾ ";
+}
+
+.prose :global(details > *:not(summary)),
+.richHtml details > *:not(summary) {
+  margin-top: var(--space-2);
+}
+
+.prose :global(a > img),
+.richHtml a > img {
+  display: inline-block;
+  vertical-align: middle;
+  margin: var(--space-1);
+  border-radius: var(--radius-sm);
+}
+
+.prose :global(img[width]),
+.richHtml img[width] {
+  max-width: 100%;
+  height: auto;
+}
+
+.prose :global(h1#installation),
+.prose :global(h1#hardware-compatibility),
+.richHtml h1 {
+  margin-top: var(--space-5);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.prose :global(h1:first-child),
+.richHtml h1:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* Native HTML path (CurseForge / pure HTML descriptions) */
+.richHtml {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  width: 100%;
+  max-width: none;
+  word-wrap: break-word;
+}
+
+.richHtml h1,
+.richHtml h2,
+.richHtml h3,
+.richHtml h4 {
+  color: var(--color-text);
+  margin: var(--space-5) 0 var(--space-2);
+  line-height: var(--leading-tight);
+  font-weight: 700;
+}
+
+.richHtml h2 {
+  font-size: 1.1rem;
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.richHtml p {
+  margin: 0 0 var(--space-3);
+}
+
+.richHtml ul,
+.richHtml ol {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-4);
+}
+
+.richHtml a {
+  color: var(--color-info);
+  text-decoration: none;
+}
+
+.richHtml a:hover {
+  text-decoration: underline;
+}
+
+.richHtml img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+  margin: var(--space-2) 0;
+}
+
+.richHtml code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 4px;
+  border-radius: 2px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.richHtml pre {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  overflow-x: auto;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+/* Icon rows in centered blocks (Modrinth social / platform badges) */
+.prose :global(center img[width="50"]),
+.richHtml center img[width="50"] {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  margin: var(--space-1);
+  padding: var(--space-1);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  transition: border-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.prose :global(center img[width="50"]:hover),
+.richHtml center img[width="50"]:hover {
+  border-color: var(--color-accent);
+  transform: translateY(-1px);
+}
+
+.prose :global(center img[width="600"]),
+.richHtml center img[width="600"] {
+  display: block;
+  margin: var(--space-2) auto;
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-sm);
+}

@@ -1,0 +1,205 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 200px;
+  padding: 0;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card), var(--edge-light);
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  transition:
+    border-color var(--transition-fast),
+    transform var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.card:hover {
+  border-color: var(--color-border);
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-card-hover), var(--edge-light);
+}
+
+.card:active {
+  transform: translateY(-1px);
+}
+
+.card:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.cover {
+  position: relative;
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.loader_fabric {
+  background: linear-gradient(145deg, #2a3d28 0%, #1a2418 100%);
+}
+
+.loader_forge {
+  background: linear-gradient(145deg, #3d2f22 0%, #241a12 100%);
+}
+
+.loader_neoforge {
+  background: linear-gradient(145deg, #3d2828 0%, #241818 100%);
+}
+
+.loader_quilt {
+  background: linear-gradient(145deg, #2a283d 0%, #181824 100%);
+}
+
+.loader_vanilla {
+  background: linear-gradient(145deg, #333 0%, #1c1c1c 100%);
+}
+
+.coverImg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 300ms ease-out;
+}
+
+.card:hover .coverImg {
+  transform: scale(1.05);
+}
+
+/* Bottom scrim so the art fades into the meta strip instead of ending at a
+   hard edge, and the quick-play button always sits on a dark ground. */
+.scrim {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 45%;
+  background: linear-gradient(180deg, transparent, rgb(0 0 0 / 0.55));
+  pointer-events: none;
+}
+
+.initial {
+  font-size: 48px;
+  font-weight: 700;
+  font-family: var(--font-display);
+  color: rgb(255 255 255 / 0.15);
+  line-height: 1;
+  user-select: none;
+}
+
+.badges {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.versionBadge,
+.loaderBadge {
+  padding: 2px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--color-text);
+  background: rgb(0 0 0 / 0.55);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 2px;
+  backdrop-filter: blur(4px);
+}
+
+/* Quick play: a beacon that lights up on card hover or keyboard focus. */
+.quickPlay {
+  position: absolute;
+  bottom: var(--space-2);
+  right: var(--space-2);
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  padding: 0 0 0 2px;
+  border: none;
+  border-radius: 50%;
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(4px);
+  box-shadow: var(--glow-accent);
+  transition:
+    opacity var(--transition-fast),
+    transform var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.card:hover .quickPlay,
+.card:focus-visible .quickPlay,
+.quickPlay:focus-visible {
+  opacity: 1;
+  transform: none;
+}
+
+.quickPlay:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+  box-shadow: var(--glow-accent-strong);
+}
+
+.quickPlay:disabled {
+  background: var(--color-surface-raised);
+  color: var(--color-text-muted);
+  box-shadow: none;
+  cursor: default;
+}
+
+.meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+}
+
+.name {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nameInput {
+  width: 100%;
+  padding: 1px var(--space-1);
+  margin: -1px calc(var(--space-1) * -1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  color: var(--color-text);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+}
+
+.sub {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .coverImg,
+  .quickPlay {
+    transition: none;
+  }
+  .card:hover .coverImg {
+    transform: none;
+  }
+}

@@ -1,0 +1,27 @@
+.wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.badge {
+  flex-shrink: 0;
+  padding: 2px var(--space-2);
+  font-size: var(--text-xs);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.modrinth {
+  color: var(--color-text-secondary);
+  background: var(--color-bg);
+}
+
+.curseforge {
+  /* CurseForge's brand ochre happens to equal the warning token; use the
+     token so a warning-color retune keeps this badge in sync. The bg/border
+     are local dark tints of that hue, not semantic values. */
+  color: var(--color-warning);
+  background: #1f1a14;
+  border-color: #3d3428;
+}
