@@ -1,6 +1,6 @@
 use crate::dto::instance::{InstalledMod, InstanceSummary};
 use crate::dto::{ModLoader, ModSource};
-use rusqlite::{params, Row};
+use rusqlite::{params, OptionalExtension, Row};
 
 use super::{DbError, Database};
 
@@ -265,6 +265,42 @@ impl Database {
         Ok(())
     }
 
+    /// Backfills an icon onto an already-tracked row that doesn't have one
+    /// yet — e.g. a mod first synced by an older Modrinth import, before
+    /// icon lookup existed for that path, catching up once a later
+    /// sync/re-import can actually resolve one. Never overwrites an icon
+    /// already on record.
+    pub fn update_instance_mod_icon(&self, instance_id: &str, mod_uid: &str, icon_url: &str) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instance_mods SET icon_url = ?1 WHERE instance_id = ?2 AND mod_uid = ?3 AND icon_url IS NULL",
+            params![icon_url, instance_id, mod_uid],
+        )?;
+        Ok(())
+    }
+
+    /// Just the icon for one mod file, without materializing every other
+    /// mod row in the instance. The Content tab's per-row metadata fetch
+    /// used to call `list_instance_mods` (the whole table) here — fine for
+    /// one row, but O(n) work repeated for every one of a few hundred rows
+    /// as they scroll into view made a big instance's Content tab visibly
+    /// slow to fill in.
+    pub fn get_instance_mod_icon_by_file(
+        &self,
+        instance_id: &str,
+        file_name: &str,
+    ) -> Result<Option<String>, DbError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT icon_url FROM instance_mods WHERE instance_id = ?1 AND file_name = ?2 LIMIT 1",
+            params![instance_id, file_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(DbError::from)
+    }
+
     pub fn get_instance_mod(&self, instance_id: &str, mod_uid: &str) -> Result<Option<(InstalledMod, String)>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -294,6 +330,85 @@ impl Database {
 
         Ok(Some(file_path))
     }
+
+    /// Every cached jar/zip metadata entry for one instance, in a single
+    /// query — the Content tab's initial load joins this against the disk
+    /// scan by (category, file_name) so a file whose size+mtime still match
+    /// what was cached needs no jar/zip parsing at all to show its name and
+    /// icon.
+    pub fn get_content_meta_cache(&self, instance_id: &str) -> Result<Vec<CachedContentMeta>, DbError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT category, file_name, size_bytes, mtime_unix, name, icon
+             FROM content_meta_cache WHERE instance_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![instance_id], |row| {
+            Ok(CachedContentMeta {
+                category: row.get(0)?,
+                file_name: row.get(1)?,
+                size_bytes: row.get::<_, i64>(2)? as u64,
+                mtime_unix: row.get(3)?,
+                name: row.get(4)?,
+                icon: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Drops one file's cached metadata — used when something *other* than
+    /// the file itself changed what its name/icon should be (e.g. its
+    /// `instance_mods.icon_url` just got backfilled), since the cache is
+    /// fingerprinted by the file's own size+mtime and has no way to know
+    /// that kind of change happened. The next `list_instance_content` call
+    /// treats it as unresolved and re-parses it fresh.
+    pub fn delete_content_meta_cache(&self, instance_id: &str, category: &str, file_name: &str) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM content_meta_cache WHERE instance_id = ?1 AND category = ?2 AND file_name = ?3",
+            params![instance_id, category, file_name],
+        )?;
+        Ok(())
+    }
+
+    /// Records one file's parsed name/icon (or the fact that parsing found
+    /// neither — still worth caching, so a jar with no embedded icon isn't
+    /// re-opened forever trying to find one) against its current size+mtime
+    /// fingerprint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_content_meta_cache(
+        &self,
+        instance_id: &str,
+        category: &str,
+        file_name: &str,
+        size_bytes: u64,
+        mtime_unix: i64,
+        name: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO content_meta_cache (instance_id, category, file_name, size_bytes, mtime_unix, name, icon)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(instance_id, category, file_name) DO UPDATE SET
+               size_bytes = excluded.size_bytes,
+               mtime_unix = excluded.mtime_unix,
+               name = excluded.name,
+               icon = excluded.icon",
+            params![instance_id, category, file_name, size_bytes as i64, mtime_unix, name, icon],
+        )?;
+        Ok(())
+    }
+}
+
+/// One cached jar/zip metadata row, fingerprinted by the file's size+mtime at
+/// the time it was parsed.
+pub struct CachedContentMeta {
+    pub category: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub mtime_unix: i64,
+    pub name: Option<String>,
+    pub icon: Option<String>,
 }
 
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {

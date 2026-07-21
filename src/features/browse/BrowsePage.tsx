@@ -5,7 +5,7 @@ import { ProjectDetailPage } from "./components/ProjectDetailPage";
 import { SearchBar } from "./components/SearchBar";
 import type { InstanceInstallTarget } from "../navigation/types";
 import type { ModSummary } from "./types";
-import { PAGE_SIZES, useBrowseStore } from "./store/browseStore";
+import { useBrowseStore } from "./store/browseStore";
 import styles from "./BrowsePage.module.css";
 
 const LOADER_LABEL: Record<string, string> = {
@@ -41,7 +41,6 @@ export function BrowsePage({
   const setContentType = useBrowseStore((s) => s.setContentType);
   const offset = useBrowseStore((s) => s.offset);
   const limit = useBrowseStore((s) => s.limit);
-  const setLimit = useBrowseStore((s) => s.setLimit);
   const nextPage = useBrowseStore((s) => s.nextPage);
   const prevPage = useBrowseStore((s) => s.prevPage);
   const [selected, setSelected] = useState<ModSummary | null>(initialMod);
@@ -123,20 +122,6 @@ export function BrowsePage({
           )}
           {error && <span className={styles.error}>{error}</span>}
         </div>
-        <label className={styles.pageSize}>
-          <span>Per page</span>
-          <select
-            value={limit}
-            onChange={(e) => setLimit(Number(e.target.value))}
-            aria-label="Results per page"
-          >
-            {PAGE_SIZES.map((size) => (
-              <option key={size} value={size}>
-                {size}
-              </option>
-            ))}
-          </select>
-        </label>
       </div>
 
       {warnings.length > 0 && (

@@ -2,6 +2,7 @@ use crate::dto::instance::{
     CreateInstanceInput, GameVersionOption, InstallModInput, InstallModResult, InstalledMod,
     InstanceSummary, MissingMod,
 };
+use crate::dto::{ContentType, ModSource, ModSummary};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
@@ -233,6 +234,169 @@ pub async fn install_mod_to_instance(
     );
 
     Ok(result)
+}
+
+/// Re-resolves a Content-tab mod against its own project and installs
+/// whatever the instance's Minecraft version + loader currently resolve to
+/// — the same thing Browse's install button does, just re-triggered for a
+/// mod already on disk. Only works for a mod actually tracked back to a
+/// CurseForge/Modrinth project; a modpack-dropped or manually-added file
+/// (tracked, if at all, under an internal `file:` id) has no project to
+/// check against, and this rejects it clearly rather than silently no-op'ing.
+#[tauri::command]
+pub async fn update_mod_in_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_id: String,
+    file_name: String,
+    install_id: String,
+) -> Result<InstallModResult, String> {
+    let existing = state.db.list_instance_mods(&instance_id).map_err(|e| e.to_string())?;
+    let row = existing
+        .into_iter()
+        .find(|m| m.file_name == file_name)
+        .ok_or_else(|| format!("'{file_name}' is not tracked in this instance."))?;
+
+    let Some((source_str, id_str)) = row.mod_uid.split_once(':') else {
+        return Err(
+            "This file isn't tracked from Browse, so there's nothing to check for updates against."
+                .to_string(),
+        );
+    };
+
+    let mut summary = ModSummary {
+        uid: row.mod_uid.clone(),
+        slug: String::new(),
+        name: row.mod_name.clone(),
+        description: String::new(),
+        author: String::new(),
+        icon_url: row.icon_url.clone(),
+        downloads: 0,
+        project_type: ContentType::Mod,
+        loaders: Vec::new(),
+        sources: Vec::new(),
+        updated_at: String::new(),
+        curseforge_id: None,
+        modrinth_id: None,
+    };
+    let preferred_source = match source_str {
+        "curseforge" => {
+            let id: u32 = id_str
+                .parse()
+                .map_err(|_| "Invalid CurseForge id on record for this mod.".to_string())?;
+            summary.curseforge_id = Some(id);
+            summary.sources.push(ModSource::Curseforge);
+            ModSource::Curseforge
+        }
+        "modrinth" => {
+            summary.modrinth_id = Some(id_str.to_string());
+            summary.sources.push(ModSource::Modrinth);
+            ModSource::Modrinth
+        }
+        _ => {
+            return Err(
+                "This file isn't tracked from Browse, so there's nothing to check for updates against."
+                    .to_string(),
+            )
+        }
+    };
+
+    // Only the DB row is dropped here, not the file — `install_mod` refuses
+    // to touch a project it already sees tracked (`AlreadyInstalled`), so
+    // this is what lets it re-resolve the same project at all. Restored
+    // below if the update fails for any reason, so a flaky network call
+    // never costs the user a working mod.
+    let _ = state.db.delete_instance_mod(&instance_id, &row.mod_uid);
+
+    let cancel = crate::download::CancelToken::new();
+    state
+        .installs
+        .lock()
+        .unwrap()
+        .insert(install_id.clone(), cancel.clone());
+    struct InstallGuard<'a> {
+        installs: &'a std::sync::Mutex<std::collections::HashMap<String, crate::download::CancelToken>>,
+        id: &'a str,
+    }
+    impl Drop for InstallGuard<'_> {
+        fn drop(&mut self) {
+            self.installs.lock().unwrap().remove(self.id);
+        }
+    }
+    let _install_guard = InstallGuard {
+        installs: &state.installs,
+        id: &install_id,
+    };
+
+    let report = {
+        let install_id = install_id.clone();
+        move |current: u32, total: u32, current_name: &str| {
+            let _ = app.emit(
+                "install://progress",
+                InstallProgressEvent {
+                    install_id: install_id.clone(),
+                    current,
+                    total,
+                    current_name: current_name.to_string(),
+                },
+            );
+        }
+    };
+
+    let install_result = InstanceService::install_mod(
+        &state.db,
+        &state.config,
+        &state.modrinth,
+        &state.curseforge,
+        &instance_id,
+        &summary,
+        Some(preferred_source),
+        None,
+        &cancel,
+        &report,
+    )
+    .await;
+
+    match install_result {
+        Ok(mut result) => {
+            // A version bump almost always means a different filename — the
+            // old one is now dead weight. (The rare case where the resolved
+            // file happens to share the exact same name is left alone here
+            // rather than deleted-then-rewritten, since `install_mod` will
+            // already have overwritten it in place.)
+            if result.installed.as_ref().map(|m| m.file_name.as_str()) != Some(file_name.as_str()) {
+                if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
+                    let _ = std::fs::remove_file(root.join("mods").join(&file_name));
+                }
+            }
+            let _ = state.db.delete_content_meta_cache(&instance_id, "mod", &file_name);
+            result.instance = state
+                .db
+                .get_instance(&instance_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Instance not found after update.".to_string())?;
+            Ok(result)
+        }
+        Err(err) => {
+            // The update attempt failed and the old file is still on disk,
+            // untouched — restore its tracking row exactly as it was so it
+            // isn't left orphaned (invisible to "already installed" checks,
+            // no icon/version history) just because an update was attempted.
+            if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
+                let file_path = root.join("mods").join(&row.file_name).display().to_string();
+                let _ = state.db.insert_instance_mod(
+                    &instance_id,
+                    &row.mod_uid,
+                    &row.mod_name,
+                    row.source,
+                    &row.file_name,
+                    &file_path,
+                    row.icon_url.as_deref(),
+                );
+            }
+            Err(map_error(err))
+        }
+    }
 }
 
 /// Signals the in-flight install (if any) to stop at its next chunk/file

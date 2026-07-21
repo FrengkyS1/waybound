@@ -21,7 +21,7 @@ pub use launch::{
 pub use instances::{
     cancel_install, create_instance, delete_instance, duplicate_instance, install_mod_to_instance,
     list_instance_mods, list_instances, list_minecraft_versions, list_pending_missing_mods,
-    remove_mod_from_instance, rename_instance, set_instance_icon,
+    remove_mod_from_instance, rename_instance, set_instance_icon, update_mod_in_instance,
 };
 pub use missing_mods::{open_all_missing_mods_browsers, open_missing_mods_browser, watch_for_missing_mods};
 pub use project::{

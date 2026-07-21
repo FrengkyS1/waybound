@@ -5,7 +5,7 @@ use crate::dto::{
 };
 use crate::instances::ResolvedDownload;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const BASE_URL: &str = "https://api.modrinth.com/v2";
@@ -23,6 +23,18 @@ pub enum ModrinthError {
 
 pub struct ModrinthClient {
     http: Client,
+}
+
+/// A Modrinth project's own id + name + icon, resolved by content hash —
+/// the `.mrpack` index has none of these itself, just download URLs and
+/// hashes. `project_id` is what lets an `.mrpack`-installed mod be tracked
+/// against its real project afterward (for "check for updates"), instead of
+/// falling back to an untrackable bare-filename record.
+#[derive(Debug, Clone)]
+pub struct ModrinthProjectMeta {
+    pub project_id: String,
+    pub name: String,
+    pub icon: Option<String>,
 }
 
 impl ModrinthClient {
@@ -235,6 +247,83 @@ impl ModrinthClient {
         let versions = self.fetch_all_versions(project_id).await?;
         pick_mod_version(&versions, mc_version, loader)
             .ok_or(ModrinthError::NotFound)
+    }
+
+    /// Every file's own project name + icon, resolved by content hash —
+    /// used by the `.mrpack` importer, whose index carries only download
+    /// URLs and per-file hashes, no project id, name, or icon at all (unlike
+    /// CurseForge's manifest, which lists `projectID` directly). Two batch
+    /// calls total regardless of file count: hash -> project id, then
+    /// project id -> name/icon.
+    pub async fn project_meta_by_sha1(&self, sha1_hashes: &[String]) -> std::collections::HashMap<String, ModrinthProjectMeta> {
+        if sha1_hashes.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        #[derive(Serialize)]
+        struct HashLookupBody<'a> {
+            hashes: &'a [String],
+            algorithm: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct VersionFileLookup {
+            project_id: String,
+        }
+        #[derive(Deserialize)]
+        struct ProjectLookup {
+            id: String,
+            title: String,
+            icon_url: Option<String>,
+        }
+
+        let Ok(response) = self
+            .http
+            .post(format!("{BASE_URL}/version_files"))
+            .json(&HashLookupBody { hashes: sha1_hashes, algorithm: "sha1" })
+            .send()
+            .await
+        else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(by_hash) = response.json::<std::collections::HashMap<String, VersionFileLookup>>().await else {
+            return std::collections::HashMap::new();
+        };
+
+        let mut project_ids: Vec<&str> = by_hash.values().map(|v| v.project_id.as_str()).collect();
+        project_ids.sort_unstable();
+        project_ids.dedup();
+        if project_ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
+        let Ok(ids_json) = serde_json::to_string(&project_ids) else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(response) = self
+            .http
+            .get(format!("{BASE_URL}/projects"))
+            .query(&[("ids", ids_json.as_str())])
+            .send()
+            .await
+        else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(projects) = response.json::<Vec<ProjectLookup>>().await else {
+            return std::collections::HashMap::new();
+        };
+        let project_meta: std::collections::HashMap<String, ModrinthProjectMeta> = projects
+            .into_iter()
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    ModrinthProjectMeta { project_id: p.id, name: p.title, icon: p.icon_url },
+                )
+            })
+            .collect();
+
+        by_hash
+            .into_iter()
+            .filter_map(|(hash, v)| project_meta.get(&v.project_id).map(|meta| (hash, meta.clone())))
+            .collect()
     }
 
     pub(crate) async fn query_versions(

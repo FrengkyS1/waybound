@@ -25,13 +25,10 @@ interface BrowseState {
   setContentType: (contentType: ContentType | undefined) => void;
   setLoader: (loader: ModLoader | undefined) => void;
   setSort: (sort: SortIndex) => void;
-  setLimit: (limit: number) => void;
   nextPage: () => Promise<void>;
   prevPage: () => Promise<void>;
   search: (resetOffset?: boolean) => Promise<void>;
 }
-
-export const PAGE_SIZES = [25, 50, 100] as const;
 
 // Not store state on purpose — bumping it must never trigger a re-render, it
 // only exists to let an in-flight search() detect it's been superseded.
@@ -59,7 +56,7 @@ export const useBrowseStore = create<BrowseState>((set, get) => ({
   results: [],
   totalHits: 0,
   offset: 0,
-  limit: 25,
+  limit: 50,
   loading: false,
   error: null,
   warnings: [],
@@ -68,10 +65,6 @@ export const useBrowseStore = create<BrowseState>((set, get) => ({
   setContentType: (contentType) => set({ contentType }),
   setLoader: (loader) => set({ loader }),
   setSort: (sort) => set({ sort }),
-  setLimit: (limit) => {
-    set({ limit, offset: 0 });
-    void get().search(true);
-  },
 
   nextPage: async () => {
     const { offset, limit, totalHits } = get();

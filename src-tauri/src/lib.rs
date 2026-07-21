@@ -24,7 +24,7 @@ use commands::{
     microsoft_login, open_all_missing_mods_browsers, open_missing_mods_browser, remove_mod_from_instance, rename_instance, save_global_mc_options,
     save_instance_options, search_mods, set_curseforge_api_key, set_instance_icon,
     set_instance_launch_config, set_launch_settings, test_curseforge_api_key,
-    test_curseforge_docker_env_key, watch_for_missing_mods, AppState,
+    test_curseforge_docker_env_key, update_mod_in_instance, watch_for_missing_mods, AppState,
 };
 use config::ConfigStore;
 use db::Database;
@@ -95,6 +95,7 @@ pub fn run() {
             open_missing_mods_browser,
             open_all_missing_mods_browsers,
             watch_for_missing_mods,
+            update_mod_in_instance,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

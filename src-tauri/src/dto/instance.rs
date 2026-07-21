@@ -43,6 +43,13 @@ pub struct ContentEntry {
     /// False when the file is `.disabled` (present but not loaded by the game).
     pub enabled: bool,
     pub size_bytes: u64,
+    /// True when `name`/`icon` were already filled in from the on-disk
+    /// metadata cache (a prior `get_content_meta` call for this exact file,
+    /// unchanged since). Lets the frontend skip its per-row fetch entirely
+    /// for anything already resolved — including a file with no icon at all,
+    /// which would otherwise look identical to "not fetched yet".
+    #[serde(default)]
+    pub meta_resolved: bool,
 }
 
 /// All content in an instance, grouped by category.

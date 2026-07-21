@@ -682,7 +682,7 @@ async fn install_modpack(
 
     let import = if is_mrpack_bytes(&bytes) {
 
-        import_modrinth_mrpack_bytes(&bytes, &instance_root, cancel, report)
+        import_modrinth_mrpack_bytes(&bytes, &instance_root, modrinth, cancel, report)
 
             .await
 
@@ -729,7 +729,30 @@ async fn install_modpack(
 
 
 
-    sync_mods_folder(db, &instance.id, &instance_root.join("mods"), source, &import.icons)?;
+    sync_mods_folder(
+        db,
+        &instance.id,
+        &instance_root.join("mods"),
+        source,
+        &import.icons,
+        &import.project_uids,
+    )?;
+    seed_content_meta_cache(
+        db,
+        &instance.id,
+        &instance_root.join("resourcepacks"),
+        "resourcepack",
+        &import.icons,
+        &import.content_names,
+    );
+    seed_content_meta_cache(
+        db,
+        &instance.id,
+        &instance_root.join("shaderpacks"),
+        "shaderpack",
+        &import.icons,
+        &import.content_names,
+    );
 
 
 
@@ -840,6 +863,8 @@ fn sync_mods_folder(
 
     icons: &std::collections::HashMap<String, String>,
 
+    project_uids: &std::collections::HashMap<String, String>,
+
 ) -> Result<(), InstanceError> {
 
     if !mods_dir.exists() {
@@ -868,6 +893,44 @@ fn sync_mods_folder(
     let existing = db.list_instance_mods(instance_id).unwrap_or_default();
     let existing_filenames: std::collections::HashSet<&str> =
         existing.iter().map(|m| m.file_name.as_str()).collect();
+
+    // Catches up a row this scan already tracks on two things a later re-sync
+    // can know that an earlier one couldn't: (a) an icon it didn't have
+    // before (an older import, before hash-based icon lookup existed), and
+    // (b) — the bigger one — its real project id, when it's currently just
+    // an untrackable `file:<name>` record. Without (b), "check for updates"
+    // has nothing to re-resolve against for anything synced before this
+    // lookup existed, which is most of a typical modpack-installed library.
+    // The content-tab metadata cache is fingerprinted by the file's own
+    // size+mtime, so it has no way to know either of these side-channel
+    // changes happened — drop its cached row too, or the Content tab keeps
+    // showing the stale result forever even though the DB now has better data.
+    for row in &existing {
+        let icon = icons.get(&row.file_name).cloned().or_else(|| row.icon_url.clone());
+        let needs_icon_backfill = row.icon_url.is_none() && icon.is_some();
+        let real_uid = project_uids.get(&row.file_name).filter(|_| row.mod_uid.starts_with("file:"));
+
+        if !needs_icon_backfill && real_uid.is_none() {
+            continue;
+        }
+
+        if let Some(real_uid) = real_uid {
+            if let Ok(Some(file_path)) = db.delete_instance_mod(instance_id, &row.mod_uid) {
+                let _ = db.insert_instance_mod(
+                    instance_id,
+                    real_uid,
+                    &row.mod_name,
+                    source,
+                    &row.file_name,
+                    &file_path,
+                    icon.as_deref(),
+                );
+            }
+        } else if needs_icon_backfill {
+            let _ = db.update_instance_mod_icon(instance_id, &row.mod_uid, icon.as_deref().unwrap());
+        }
+        let _ = db.delete_content_meta_cache(instance_id, "mod", &row.file_name);
+    }
 
     let mut mods = Vec::new();
     let mut seen_filenames = std::collections::HashSet::new();
@@ -902,7 +965,10 @@ fn sync_mods_folder(
             continue;
         }
 
-        let mod_uid = format!("file:{file_name}");
+        let mod_uid = project_uids
+            .get(file_name)
+            .cloned()
+            .unwrap_or_else(|| format!("file:{file_name}"));
 
         let mod_name = file_name.trim_end_matches(".jar").to_string();
 
@@ -932,10 +998,58 @@ fn sync_mods_folder(
         let _ = db.delete_instance_mod_by_file(instance_id, &stale.file_name);
     }
 
-
-
     Ok(())
+}
 
+/// Seeds the Content tab's metadata cache for resource/shader packs a
+/// modpack import resolved. Unlike a mod jar, these have no embedded-name
+/// convention of their own (no `mods.toml` equivalent), so the source
+/// platform's project name/icon — already fetched during import, for
+/// exactly this reason — is the only real display data available for them.
+/// Without this they'd show their raw filename forever, since there's
+/// nothing inside the file itself to read.
+fn seed_content_meta_cache(
+    db: &Database,
+    instance_id: &str,
+    dir: &Path,
+    category: &str,
+    icons: &std::collections::HashMap<String, String>,
+    content_names: &std::collections::HashMap<String, String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let name = content_names.get(&file_name);
+        let icon = icons.get(&file_name);
+        if name.is_none() && icon.is_none() {
+            continue;
+        }
+        let mtime_unix = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = db.upsert_content_meta_cache(
+            instance_id,
+            category,
+            &file_name,
+            metadata.len(),
+            mtime_unix,
+            name.map(String::as_str),
+            icon.map(String::as_str),
+        );
+    }
 }
 
 

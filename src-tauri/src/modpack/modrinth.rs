@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use super::{ModpackError, ModpackImportResult};
 use crate::download::{download_bytes, http_client, safe_join, CancelToken, DOWNLOAD_CONCURRENCY};
+use crate::sources::modrinth::ModrinthClient;
 
 #[derive(Debug, Deserialize)]
 pub struct ModrinthPackIndex {
@@ -22,6 +23,17 @@ pub struct ModrinthPackFile {
     pub downloads: Vec<String>,
     #[serde(default)]
     pub env: Option<ModrinthPackEnv>,
+    #[serde(default)]
+    pub hashes: Option<ModrinthPackFileHashes>,
+}
+
+/// The `.mrpack` index carries a content hash per file but no project id or
+/// icon — unlike CurseForge's manifest, which lists `projectID` directly.
+/// `sha1` is what lets an installed file be matched back to its Modrinth
+/// project afterward, for an icon.
+#[derive(Debug, Deserialize)]
+pub struct ModrinthPackFileHashes {
+    pub sha1: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +47,7 @@ pub struct ModrinthPackEnv {
 pub async fn import_modrinth_mrpack_bytes(
     bytes: &[u8],
     instance_root: &Path,
+    modrinth: &ModrinthClient,
     cancel: &CancelToken,
     report: &impl Fn(u32, u32, &str),
 ) -> Result<ModpackImportResult, ModpackError> {
@@ -42,27 +55,33 @@ pub async fn import_modrinth_mrpack_bytes(
     let client = http_client()?;
     let client = &client;
 
-    // Fully-owned job per file (url + resolved dest) so downloads can run
-    // concurrently instead of one-at-a-time — a pack with hundreds of files
-    // downloading sequentially could take minutes; buffer_unordered caps
-    // concurrency the same way the launch pipeline's asset/library downloads
-    // already do.
-    let jobs: Vec<(String, PathBuf)> = index
+    // Fully-owned job per file (url + resolved dest + content hash, when the
+    // index carries one) so downloads can run concurrently instead of
+    // one-at-a-time — a pack with hundreds of files downloading sequentially
+    // could take minutes; buffer_unordered caps concurrency the same way the
+    // launch pipeline's asset/library downloads already do.
+    let jobs: Vec<(String, PathBuf, Option<String>)> = index
         .files
         .iter()
         .filter(|f| !should_skip_file(f))
         .filter_map(|file| {
             let url = file.downloads.first()?.clone();
-            Some((url, file.path.clone()))
+            let sha1 = file.hashes.as_ref().map(|h| h.sha1.clone());
+            Some((url, file.path.clone(), sha1))
         })
-        .map(|(url, path)| Ok::<_, ModpackError>((url, safe_join(instance_root, &path)?)))
+        .map(|(url, path, sha1)| Ok::<_, ModpackError>((url, safe_join(instance_root, &path)?, sha1)))
         .collect::<Result<Vec<_>, _>>()?;
 
     let total = jobs.len() as u32;
     let mut files_installed = 0u32;
+    // Every successfully-downloaded file's destination + hash — the hash is
+    // what lets a follow-up call resolve this exact file back to its
+    // Modrinth project, and hence its icon, since the mrpack index itself
+    // never carries a project id or icon (unlike CurseForge's manifest).
+    let mut downloaded: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(jobs.len());
     report(0, total, "");
 
-    let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, dest)| async move {
+    let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, dest, sha1)| async move {
         if cancel.is_cancelled() {
             return Err(ModpackError::from(crate::download::DownloadError::Cancelled));
         }
@@ -71,15 +90,38 @@ pub async fn import_modrinth_mrpack_bytes(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&dest, data)?;
-        Ok::<PathBuf, ModpackError>(dest)
+        Ok::<(PathBuf, Option<String>), ModpackError>((dest, sha1))
     }))
     .buffer_unordered(DOWNLOAD_CONCURRENCY);
 
     while let Some(result) = stream.next().await {
-        let dest = result?;
+        let (dest, sha1) = result?;
         files_installed += 1;
         let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
         report(files_installed, total, name);
+        downloaded.push((dest, sha1));
+    }
+
+    // One batched hash->project lookup for every downloaded file that had a
+    // hash, instead of a per-file API call — mirrors how the CurseForge
+    // importer batches its own lookup by project id.
+    let sha1_hashes: Vec<String> = downloaded.iter().filter_map(|(_, sha1)| sha1.clone()).collect();
+    let meta_by_hash = modrinth.project_meta_by_sha1(&sha1_hashes).await;
+    let mut icons: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut content_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut project_uids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (dest, sha1) in &downloaded {
+        let Some(meta) = sha1.as_ref().and_then(|h| meta_by_hash.get(h)) else {
+            continue;
+        };
+        let Some(filename) = dest.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        content_names.insert(filename.to_string(), meta.name.clone());
+        project_uids.insert(filename.to_string(), format!("modrinth:{}", meta.project_id));
+        if let Some(icon) = &meta.icon {
+            icons.insert(filename.to_string(), icon.clone());
+        }
     }
 
     // Runs on a blocking-pool thread (large packs' overrides can be many MB
@@ -106,7 +148,9 @@ pub async fn import_modrinth_mrpack_bytes(
             "Imported {label}: {files_installed} files downloaded, {overrides_applied} override files applied."
         ),
         has_skipped: false,
-        icons: std::collections::HashMap::new(),
+        icons,
+        content_names,
+        project_uids,
         missing_mods: Vec::new(),
     })
 }

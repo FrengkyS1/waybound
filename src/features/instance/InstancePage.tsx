@@ -7,6 +7,7 @@ import {
   fetchInstanceContent,
   removeContentFile,
   setContentEnabled,
+  updateModInInstance,
   type ContentCategory,
   type ContentEntry,
   type InstanceContent,
@@ -531,10 +532,14 @@ function ContentTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instance.id]);
 
-  function observeRow(category: ContentCategory, fileName: string) {
+  // `metaResolved` means the backend's on-disk cache already had this exact
+  // file's name/icon (or confirmed it has neither) — skip observing it
+  // entirely so a previously-seen instance's Content tab does zero fetches,
+  // not just fast ones.
+  function observeRow(category: ContentCategory, fileName: string, metaResolved: boolean) {
     return (el: HTMLLIElement | null) => {
       const key = `${category}:${fileName}`;
-      if (!el || fetchedRef.current.has(key)) return;
+      if (!el || metaResolved || fetchedRef.current.has(key)) return;
       targetsRef.current.set(el, { category, fileName });
       observerRef.current?.observe(el);
     };
@@ -597,6 +602,37 @@ function ContentTab({
       await fn();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      await load();
+    }
+  }
+
+  // Not optimistic like `act` above — an update can resolve to a different
+  // filename entirely (a version bump), so there's nothing sensible to patch
+  // in ahead of the result. Tracked per-file rather than via the shared
+  // `busy` prop so updating one mod doesn't freeze every other row's buttons.
+  const [updatingFiles, setUpdatingFiles] = useState<Set<string>>(new Set());
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function handleUpdate(fileName: string) {
+    setError(null);
+    setMessage(null);
+    setUpdatingFiles((prev) => new Set(prev).add(fileName));
+    const installId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+    try {
+      const result = await updateModInInstance(instance.id, fileName, installId);
+      setMessage(result.message);
+      setTimeout(() => setMessage(null), 6000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUpdatingFiles((prev) => {
+        const next = new Set(prev);
+        next.delete(fileName);
+        return next;
+      });
       await load();
     }
   }
@@ -666,6 +702,7 @@ function ContentTab({
       </div>
 
       {error && <p className={styles.error}>{error}</p>}
+      {message && <p className={styles.message}>{message}</p>}
 
       {visible.map((group) =>
         group.entries.length === 0 ? null : (
@@ -682,7 +719,7 @@ function ContentTab({
               {group.entries.map((entry) => (
                 <li
                   key={entry.fileName}
-                  ref={observeRow(group.category, entry.fileName)}
+                  ref={observeRow(group.category, entry.fileName, entry.metaResolved)}
                   className={`${styles.modRow} ${entry.enabled ? "" : styles.modRowDisabled}`}
                 >
                   <div className={styles.modIconWrap}>
@@ -709,6 +746,16 @@ function ContentTab({
                     </span>
                   </div>
                   <div className={styles.modActions}>
+                    {group.category === "mod" && (
+                      <button
+                        type="button"
+                        className={styles.updateBtn}
+                        disabled={busy || updatingFiles.has(entry.fileName)}
+                        onClick={() => void handleUpdate(entry.fileName)}
+                      >
+                        {updatingFiles.has(entry.fileName) ? "Updating…" : "Update"}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className={`${styles.toggleBtn} ${
@@ -770,7 +817,13 @@ function formatSize(bytes: number): string {
 }
 
 function humanizeFileName(fileName: string): string {
-  return fileName.replace(/\.jar$/i, "").replace(/[-_]+/g, " ");
+  return fileName
+    .replace(/\.(jar|zip)$/i, "")
+    // Minecraft formatting codes (§ + one char) — some shader packs bake
+    // these into the zip name itself so it renders colorfully in the
+    // in-game shader list; outside that context they're just noise.
+    .replace(/§./g, "")
+    .replace(/[-_]+/g, " ");
 }
 
 const LOG_ERROR_RE = /\b(ERROR|FATAL|Exception|Caused by)\b/;

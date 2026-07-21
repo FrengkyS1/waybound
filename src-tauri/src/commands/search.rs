@@ -141,8 +141,17 @@ pub async fn search_mods(
 
 
 
-    result = dedupe_with_stats(result);
+    result.hits = dedupe_mods(result.hits);
     result.hits = filter_by_loader(result.hits, normalized.loader);
+
+    // Merging two sources (each queried for a full page of `limit` hits)
+    // then deduping overlapping mods leaves anywhere from `limit` to
+    // `2 * limit` hits — filter_by_loader can trim further still. None of
+    // that respects the page size the user actually picked, so without this
+    // truncation "25 per page" could show 45, "50 per page" could show 81,
+    // exactly the counts one merge/dedupe pass happens to leave behind.
+    result.hits.truncate(normalized.limit as usize);
+    result.limit = normalized.limit;
 
     if let Err(error) = state.db.upsert_identities(&result.hits) {
 
@@ -193,30 +202,6 @@ fn filter_by_loader(hits: Vec<ModSummary>, loader: Option<crate::dto::ModLoader>
         None => hits,
     }
 }
-
-fn dedupe_with_stats(mut result: ModSearchResult) -> ModSearchResult {
-
-    let before = result.hits.len();
-
-    result.hits = dedupe_mods(result.hits);
-
-    let after = result.hits.len();
-
-    if before > after {
-
-        result.warnings.push(format!(
-
-            "Merged {before} results into {after} unique mods (cross-source dedup)."
-
-        ));
-
-    }
-
-    result
-
-}
-
-
 
 fn merge_results(mut modrinth: ModSearchResult, curseforge: ModSearchResult) -> ModSearchResult {
 

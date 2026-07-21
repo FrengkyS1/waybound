@@ -205,13 +205,34 @@ fn is_candidate_file(path: &Path) -> bool {
 /// progress comes through `missing-mods://placed` and `missing-mods://done`
 /// events, since a single grab can take the user several minutes across
 /// multiple mod pages.
+/// Same signal `sniff_is_shaderpack` in `modpack::curseforge` uses (a
+/// top-level `shaders/` directory) — needed here too because CurseForge's
+/// "missing mods" list carries no content-type info, just a filename and
+/// project id, and a plain `.zip` extension doesn't distinguish a shader pack
+/// from a resource pack.
+fn is_shaderpack_file(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    (0..archive.len()).any(|i| {
+        archive
+            .by_index(i)
+            .is_ok_and(|f| f.name().to_ascii_lowercase().starts_with("shaders/"))
+    })
+}
+
 #[tauri::command]
 pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<MissingMod>) -> Result<(), String> {
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
     let mods_dir = root.join("mods");
     let resourcepacks_dir = root.join("resourcepacks");
+    let shaderpacks_dir = root.join("shaderpacks");
     std::fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&resourcepacks_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&shaderpacks_dir).map_err(|e| e.to_string())?;
 
     let Some(downloads_dir) = dirs::download_dir() else {
         return Err("Could not locate your Downloads folder.".to_string());
@@ -273,7 +294,13 @@ pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<Mis
 
                 let Some(idx) = matched_index else { continue };
                 let is_jar = remaining[idx].1.filename.to_ascii_lowercase().ends_with(".jar");
-                let dest_dir = if is_jar { &mods_dir } else { &resourcepacks_dir };
+                let dest_dir = if is_jar {
+                    &mods_dir
+                } else if is_shaderpack_file(&source) {
+                    &shaderpacks_dir
+                } else {
+                    &resourcepacks_dir
+                };
                 // `filename` ultimately comes from CurseForge's API — never
                 // trust it as a bare path component. `safe_join` rejects any
                 // `..`/root/prefix component, same as every other write site

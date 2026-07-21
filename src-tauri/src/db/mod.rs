@@ -1,4 +1,5 @@
 mod instances;
+pub use instances::CachedContentMeta;
 
 use crate::dto::ModSummary;
 use rusqlite::{params, Connection};
@@ -86,6 +87,23 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_instance_mods_instance
                 ON instance_mods(instance_id);
+
+            -- Jar/zip metadata (display name + embedded icon) is expensive to
+            -- read (opening and parsing the archive) but never changes for a
+            -- given file's exact bytes, so it's cached here keyed by the
+            -- file's size+mtime fingerprint. A cache hit means the Content
+            -- tab never has to open that file again — instant name/icon on
+            -- every load after the first.
+            CREATE TABLE IF NOT EXISTS content_meta_cache (
+                instance_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                mtime_unix INTEGER NOT NULL,
+                name TEXT,
+                icon TEXT,
+                PRIMARY KEY (instance_id, category, file_name)
+            );
             ",
         )?;
 

@@ -18,22 +18,56 @@ use crate::sources::modrinth::ModrinthClient;
 // that's what needs a much smaller concurrency to avoid tripping the limit.
 const METADATA_FALLBACK_CONCURRENCY: usize = 2;
 
+/// A shader pack's defining trait — what Iris/OptiFine themselves key off of
+/// — is a top-level `shaders/` directory holding the actual shader programs;
+/// a plain resource pack has `assets/` instead. CurseForge's manifest files
+/// both under the same generic "file" entry with no type distinction, so the
+/// only reliable signal is the zip's own contents, not the filename or the
+/// manifest.
+fn sniff_is_shaderpack(bytes: &[u8]) -> bool {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    (0..archive.len()).any(|i| {
+        archive
+            .by_index(i)
+            .is_ok_and(|f| f.name().to_ascii_lowercase().starts_with("shaders/"))
+    })
+}
+
 /// Picks the right destination folder for a downloaded file by its own
-/// extension rather than trusting the manifest. Modpacks routinely list
-/// resource packs as regular required "files" (CurseForge doesn't
-/// distinguish mod jars from other content in `manifest.files`) — Forge
-/// only loads `.jar` from `mods/`, so anything else landing there is dead
-/// weight at best and a confusing load-order warning at worst.
-fn dest_dir_for(filename: &str, mods_dir: &Path, resourcepacks_dir: &Path) -> PathBuf {
+/// extension/contents rather than trusting the manifest. Modpacks routinely
+/// list resource packs and shader packs as regular required "files"
+/// (CurseForge doesn't distinguish mod jars from other content in
+/// `manifest.files`) — Forge only loads `.jar` from `mods/`, and Iris/OptiFine
+/// only find shaders in `shaderpacks/`, so anything landing in the wrong
+/// folder is dead weight at best and silently never loaded at worst.
+fn dest_dir_for(filename: &str, bytes: &[u8], mods_dir: &Path, resourcepacks_dir: &Path, shaderpacks_dir: &Path) -> PathBuf {
     if filename.to_ascii_lowercase().ends_with(".jar") {
         mods_dir.to_path_buf()
+    } else if sniff_is_shaderpack(bytes) {
+        shaderpacks_dir.to_path_buf()
     } else {
         resourcepacks_dir.to_path_buf()
     }
 }
 
-fn already_on_disk(filename: &str, mods_dir: &Path, resourcepacks_dir: &Path) -> bool {
-    safe_join(&dest_dir_for(filename, mods_dir, resourcepacks_dir), filename).is_ok_and(|p| p.exists())
+/// Locates a file that may have been placed in either resourcepacks/ or
+/// shaderpacks/ — used everywhere a caller only needs "is this already here"
+/// or "where is this so I can remove it" and doesn't have the file's bytes on
+/// hand to sniff its real type (nothing to download again, or the file
+/// already exists from some earlier run).
+fn find_existing(filename: &str, mods_dir: &Path, resourcepacks_dir: &Path, shaderpacks_dir: &Path) -> Option<PathBuf> {
+    if filename.to_ascii_lowercase().ends_with(".jar") {
+        return safe_join(mods_dir, filename).ok().filter(|p| p.exists());
+    }
+    [resourcepacks_dir, shaderpacks_dir].into_iter().find_map(|dir| {
+        safe_join(dir, filename).ok().filter(|p| p.exists())
+    })
+}
+
+fn already_on_disk(filename: &str, mods_dir: &Path, resourcepacks_dir: &Path, shaderpacks_dir: &Path) -> bool {
+    find_existing(filename, mods_dir, resourcepacks_dir, shaderpacks_dir).is_some()
 }
 
 /// One file this instance's CurseForge pack manifest wanted, as of the last
@@ -81,13 +115,13 @@ fn remove_files_pack_dropped(
     new_file_ids: &std::collections::HashSet<u32>,
     mods_dir: &Path,
     resourcepacks_dir: &Path,
+    shaderpacks_dir: &Path,
 ) {
     for entry in old_manifest {
         if new_file_ids.contains(&entry.file_id) {
             continue;
         }
-        let dest_dir = dest_dir_for(&entry.filename, mods_dir, resourcepacks_dir);
-        if let Ok(path) = safe_join(&dest_dir, &entry.filename) {
+        if let Some(path) = find_existing(&entry.filename, mods_dir, resourcepacks_dir, shaderpacks_dir) {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -114,9 +148,10 @@ pub(crate) fn curseforge_file_url(website_url: Option<&str>, fallback_slug: &str
 pub fn pending_missing_mods(instance_root: &Path) -> Vec<crate::dto::instance::MissingMod> {
     let mods_dir = instance_root.join("mods");
     let resourcepacks_dir = instance_root.join("resourcepacks");
+    let shaderpacks_dir = instance_root.join("shaderpacks");
     load_pack_manifest(instance_root)
         .into_iter()
-        .filter(|entry| !already_on_disk(&entry.filename, &mods_dir, &resourcepacks_dir))
+        .filter(|entry| !already_on_disk(&entry.filename, &mods_dir, &resourcepacks_dir, &shaderpacks_dir))
         .map(|entry| crate::dto::instance::MissingMod {
             project_id: entry.project_id,
             name: entry.name,
@@ -273,6 +308,9 @@ pub async fn import_curseforge_modpack_zip(
     let resourcepacks_dir = instance_root.join("resourcepacks");
     std::fs::create_dir_all(&resourcepacks_dir)?;
     let resourcepacks_dir = &resourcepacks_dir;
+    let shaderpacks_dir = instance_root.join("shaderpacks");
+    std::fs::create_dir_all(&shaderpacks_dir)?;
+    let shaderpacks_dir = &shaderpacks_dir;
 
     // Same concurrency fix as the Modrinth importer: this used to resolve and
     // download each mod strictly one at a time (three sequential round trips
@@ -326,7 +364,7 @@ pub async fn import_curseforge_modpack_zip(
     for (project_id, file_id) in &jobs {
         match file_meta.get(file_id) {
             Some((name, Some(url), sha1)) => {
-                let already_present = already_on_disk(name, mods_dir, resourcepacks_dir);
+                let already_present = already_on_disk(name, mods_dir, resourcepacks_dir, shaderpacks_dir);
                 resolved.insert(
                     *file_id,
                     (*project_id, name.clone(), (!already_present).then(|| url.clone()), sha1.clone()),
@@ -347,7 +385,7 @@ pub async fn import_curseforge_modpack_zip(
     let mut skipped_files: Vec<(u32, u32, String, Option<String>)> = Vec::new();
 
     for (project_id, file_id, name, sha1) in restricted {
-        if already_on_disk(&name, mods_dir, resourcepacks_dir) {
+        if already_on_disk(&name, mods_dir, resourcepacks_dir, shaderpacks_dir) {
             resolved.insert(file_id, (project_id, name, None, sha1));
         } else {
             skipped_files.push((project_id, file_id, name, sha1));
@@ -363,7 +401,7 @@ pub async fn import_curseforge_modpack_zip(
                 .file_meta(project_id, file_id, api_key)
                 .await
                 .unwrap_or_else(|_| (format!("mod-{project_id}-{file_id}.jar"), None));
-            if already_on_disk(&filename, mods_dir, resourcepacks_dir) {
+            if already_on_disk(&filename, mods_dir, resourcepacks_dir, shaderpacks_dir) {
                 return (project_id, file_id, filename, sha1, Some(None));
             }
             match cf.file_download_url(project_id, file_id, api_key).await {
@@ -396,17 +434,23 @@ pub async fn import_curseforge_modpack_zip(
     }
 
     // One pass over every resolved file (freshly downloaded or already on
-    // disk) to record its CurseForge icon, keyed by filename since that's
-    // how `sync_mods_folder` matches files back to DB rows after the fact.
-    let icons: HashMap<String, String> = resolved
-        .values()
-        .filter_map(|(project_id, filename, _, _)| {
-            mod_meta
-                .get(project_id)
-                .and_then(|(_, _, icon, _)| icon.clone())
-                .map(|icon| (filename.clone(), icon))
-        })
-        .collect();
+    // disk) to record its CurseForge icon and project name, keyed by
+    // filename since that's how `sync_mods_folder` matches files back to DB
+    // rows after the fact — and, for resource/shader packs (no embedded name
+    // convention of their own), the only source of a real display name at
+    // all.
+    let mut icons: HashMap<String, String> = HashMap::new();
+    let mut content_names: HashMap<String, String> = HashMap::new();
+    let mut project_uids: HashMap<String, String> = HashMap::new();
+    for (project_id, filename, _, _) in resolved.values() {
+        project_uids.insert(filename.clone(), format!("curseforge:{project_id}"));
+        if let Some((name, _, icon, _)) = mod_meta.get(project_id) {
+            content_names.insert(filename.clone(), name.clone());
+            if let Some(icon) = icon {
+                icons.insert(filename.clone(), icon.clone());
+            }
+        }
+    }
 
     let total = resolved.len() as u32;
     let mut files_installed = 0u32;
@@ -426,7 +470,7 @@ pub async fn import_curseforge_modpack_zip(
         };
         match download_bytes_with_retry(client, url, cancel).await {
             Ok(data) => {
-                let dest = dest_dir_for(filename, mods_dir, resourcepacks_dir);
+                let dest = dest_dir_for(filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
                 std::fs::write(safe_join(&dest, filename)?, data)?;
                 Ok((None, filename.clone()))
             }
@@ -501,7 +545,7 @@ pub async fn import_curseforge_modpack_zip(
         }
         match download_bytes_with_retry(client, &download.url, cancel).await {
             Ok(data) => {
-                let dest = dest_dir_for(&download.filename, mods_dir, resourcepacks_dir);
+                let dest = dest_dir_for(&download.filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
                 std::fs::write(safe_join(&dest, &download.filename)?, data)?;
                 files_installed += 1;
                 substituted.push(name.clone());
@@ -580,7 +624,7 @@ pub async fn import_curseforge_modpack_zip(
     let old_pack_manifest = load_pack_manifest(instance_root);
     if !old_pack_manifest.is_empty() {
         let new_file_ids: std::collections::HashSet<u32> = file_ids.iter().copied().collect();
-        remove_files_pack_dropped(&old_pack_manifest, &new_file_ids, mods_dir, resourcepacks_dir);
+        remove_files_pack_dropped(&old_pack_manifest, &new_file_ids, mods_dir, resourcepacks_dir, shaderpacks_dir);
     }
 
     // Persist this import's manifest for the *next* update to reconcile
@@ -632,6 +676,8 @@ pub async fn import_curseforge_modpack_zip(
         ),
         has_skipped,
         icons,
+        content_names,
+        project_uids,
         missing_mods,
     })
 }
@@ -706,6 +752,7 @@ mod pack_reconciliation_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("mods")).unwrap();
         fs::create_dir_all(dir.join("resourcepacks")).unwrap();
+        fs::create_dir_all(dir.join("shaderpacks")).unwrap();
         dir
     }
 
@@ -742,6 +789,7 @@ mod pack_reconciliation_tests {
         let dir = temp_instance_dir("removal");
         let mods_dir = dir.join("mods");
         let rp_dir = dir.join("resourcepacks");
+        let sp_dir = dir.join("shaderpacks");
         fs::write(mods_dir.join("dropped.jar"), b"old mod").unwrap();
         fs::write(mods_dir.join("kept.jar"), b"still wanted").unwrap();
 
@@ -749,7 +797,7 @@ mod pack_reconciliation_tests {
         // New manifest only still wants file_id 20 — 10 was dropped by the update.
         let new_file_ids: HashSet<u32> = [20].into_iter().collect();
 
-        remove_files_pack_dropped(&old_manifest, &new_file_ids, &mods_dir, &rp_dir);
+        remove_files_pack_dropped(&old_manifest, &new_file_ids, &mods_dir, &rp_dir, &sp_dir);
 
         assert!(!mods_dir.join("dropped.jar").exists(), "dropped file should be removed");
         assert!(mods_dir.join("kept.jar").exists(), "still-wanted file must survive");
@@ -760,6 +808,7 @@ mod pack_reconciliation_tests {
         let dir = temp_instance_dir("user-added");
         let mods_dir = dir.join("mods");
         let rp_dir = dir.join("resourcepacks");
+        let sp_dir = dir.join("shaderpacks");
         // Simulates a mod the user installed via Browse after the pack import —
         // it was never part of any manifest, so it can't appear in `old_manifest`.
         fs::write(mods_dir.join("user-added.jar"), b"manually installed").unwrap();
@@ -767,7 +816,7 @@ mod pack_reconciliation_tests {
         let old_manifest = vec![test_entry(1, 10, "something-else.jar")];
         let new_file_ids: HashSet<u32> = HashSet::new(); // pack update drops everything it had
 
-        remove_files_pack_dropped(&old_manifest, &new_file_ids, &mods_dir, &rp_dir);
+        remove_files_pack_dropped(&old_manifest, &new_file_ids, &mods_dir, &rp_dir, &sp_dir);
 
         assert!(mods_dir.join("user-added.jar").exists(), "untracked file must never be removed");
     }
@@ -785,6 +834,49 @@ mod pack_reconciliation_tests {
 
         assert_eq!(pending.len(), 1, "only the file not yet on disk should be reported");
         assert_eq!(pending[0].filename, "absent.jar");
+    }
+
+    fn zip_with_entries(names: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for name in names {
+                writer.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn shaderpack_zip_is_sniffed_correctly() {
+        let shader_zip = zip_with_entries(&["shaders/composite.fsh", "shaders.properties"]);
+        assert!(super::sniff_is_shaderpack(&shader_zip));
+
+        let resourcepack_zip = zip_with_entries(&["assets/minecraft/textures/foo.png", "pack.mcmeta"]);
+        assert!(!super::sniff_is_shaderpack(&resourcepack_zip));
+    }
+
+    #[test]
+    fn dest_dir_for_routes_by_extension_and_content() {
+        let dir = temp_instance_dir("dest-routing");
+        let mods_dir = dir.join("mods");
+        let rp_dir = dir.join("resourcepacks");
+        let sp_dir = dir.join("shaderpacks");
+
+        assert_eq!(super::dest_dir_for("Foo.jar", b"", &mods_dir, &rp_dir, &sp_dir), mods_dir);
+
+        let shader_zip = zip_with_entries(&["shaders/composite.fsh"]);
+        assert_eq!(
+            super::dest_dir_for("Shader.zip", &shader_zip, &mods_dir, &rp_dir, &sp_dir),
+            sp_dir
+        );
+
+        let resourcepack_zip = zip_with_entries(&["assets/minecraft/textures/foo.png"]);
+        assert_eq!(
+            super::dest_dir_for("Pack.zip", &resourcepack_zip, &mods_dir, &rp_dir, &sp_dir),
+            rp_dir
+        );
     }
 }
 

@@ -37,6 +37,9 @@ export interface ContentEntry {
   icon?: string;
   enabled: boolean;
   sizeBytes: number;
+  /** True when `name`/`icon` came from the backend's on-disk metadata cache
+   * already — no need to fetch this row's metadata again. */
+  metaResolved: boolean;
 }
 
 export interface InstanceContent {
@@ -78,6 +81,18 @@ export async function removeContentFile(
   fileName: string,
 ): Promise<void> {
   await invoke("remove_content_file", { instanceId, category, fileName });
+}
+
+/** Re-resolves a mod already on disk against its own CurseForge/Modrinth
+ * project and installs whatever the instance's version+loader currently
+ * resolve to. Rejects with a clear error for a file with no tracked project
+ * (a modpack-dropped or manually-added jar). */
+export async function updateModInInstance(
+  instanceId: string,
+  fileName: string,
+  installId: string,
+): Promise<import("../browse/detailTypes").InstallModResult> {
+  return invoke("update_mod_in_instance", { instanceId, fileName, installId });
 }
 
 export async function setInstanceIcon(
