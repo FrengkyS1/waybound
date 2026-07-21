@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { ModSummary } from "./features/browse/types";
 import { BrowsePage } from "./features/browse/BrowsePage";
 import { HomePage } from "./features/home/HomePage";
+import type { Tab as InstanceTab } from "./features/instance/InstancePage";
 import type { InstanceInstallTarget } from "./features/navigation/types";
 import { SettingsPage } from "./features/settings/SettingsPage";
 import type { InstanceSummary } from "./features/instances/types";
@@ -23,6 +24,10 @@ function App() {
   const [installTarget, setInstallTarget] = useState<InstanceInstallTarget | null>(null);
   const [browseMod, setBrowseMod] = useState<ModSummary | null>(null);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
+  // Lifted here (not HomePage) since HomePage itself unmounts on every trip
+  // to Browse — this is the only component that survives that navigation,
+  // so it's the only place "stay on Content when I come back" can live.
+  const [instanceTab, setInstanceTab] = useState<InstanceTab>("overview");
 
   function openBrowseForInstance(instance: InstanceSummary) {
     setBrowseMod(null);
@@ -116,6 +121,8 @@ function App() {
             onReopenConsumed={() => setInstallTarget(null)}
             selectedId={selectedInstanceId}
             onSelectId={setSelectedInstanceId}
+            instanceTab={instanceTab}
+            onInstanceTabChange={setInstanceTab}
           />
         )}
         {view === "browse" && (

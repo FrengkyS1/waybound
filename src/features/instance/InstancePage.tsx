@@ -5,6 +5,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import {
   fetchContentMeta,
   fetchInstanceContent,
+  fetchModSummaryForContent,
   removeContentFile,
   setContentEnabled,
   updateModInInstance,
@@ -13,6 +14,7 @@ import {
   type InstanceContent,
 } from "../instances/api";
 import type { InstanceSummary } from "../instances/types";
+import type { ModSummary } from "../browse/types";
 import { fileToIconDataUrl } from "../home/imageIcon";
 import { PlayButton } from "../play/PlayButton";
 import { usePlayStore } from "../play/store";
@@ -20,7 +22,7 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { LaunchOverrides } from "./LaunchOverrides";
 import styles from "./InstancePage.module.css";
 
-type Tab = "overview" | "content" | "logs" | "settings";
+export type Tab = "overview" | "content" | "logs" | "settings";
 
 // Stable reference so the store selector doesn't return a new array each render
 // (which would loop useSyncExternalStore and blank the screen).
@@ -36,6 +38,15 @@ interface InstancePageProps {
   onAddMods: () => void;
   onChangeImage: (icon: string | null) => void;
   onRename: (name: string) => Promise<void>;
+  /** Opens a mod's project page in Browse — omitted, the Content tab's rows
+   * just aren't clickable. */
+  onOpenMod?: (summary: ModSummary) => void;
+  /** Which tab is showing, lifted to the app shell so it survives navigating
+   * away (e.g. to a mod's page in Browse) and back — InstancePage itself
+   * remounts on every return, so anything kept in its own state would reset
+   * to "overview" every time. */
+  tab: Tab;
+  onTabChange: (tab: Tab) => void;
 }
 
 const LAUNCHABLE = new Set(["vanilla", "fabric", "forge", "neoforge"]);
@@ -50,8 +61,10 @@ export function InstancePage({
   onAddMods,
   onChangeImage,
   onRename,
+  onOpenMod,
+  tab,
+  onTabChange: setTab,
 }: InstancePageProps) {
-  const [tab, setTab] = useState<Tab>("overview");
   const [menuOpen, setMenuOpen] = useState(false);
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -335,7 +348,7 @@ export function InstancePage({
           />
         )}
         {tab === "content" && (
-          <ContentTab instance={instance} busy={busy} onAddMods={onAddMods} />
+          <ContentTab instance={instance} busy={busy} onAddMods={onAddMods} onOpenMod={onOpenMod} />
         )}
         {tab === "logs" && (
           <LogsTab
@@ -459,10 +472,12 @@ function ContentTab({
   instance,
   busy,
   onAddMods,
+  onOpenMod,
 }: {
   instance: InstanceSummary;
   busy: boolean;
   onAddMods: () => void;
+  onOpenMod?: (summary: ModSummary) => void;
 }) {
   const [content, setContent] = useState<InstanceContent | null>(null);
   const [filter, setFilter] = useState<ContentFilter>("all");
@@ -637,6 +652,25 @@ function ContentTab({
     }
   }
 
+  const [openingFile, setOpeningFile] = useState<string | null>(null);
+
+  async function handleOpenMod(entry: ContentEntry) {
+    if (!onOpenMod) return;
+    setError(null);
+    setOpeningFile(entry.fileName);
+    try {
+      const summary = await fetchModSummaryForContent(instance.id, entry.fileName);
+      // The DB's stored name is filename-derived (whatever `sync_mods_folder`
+      // saw at import time), but the Content row has already resolved the
+      // jar's own real display name — prefer that over the backend's guess.
+      onOpenMod(entry.name ? { ...summary, name: entry.name } : summary);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setOpeningFile(null);
+    }
+  }
+
   const term = search.trim().toLowerCase();
   const visible = groups
     .filter((g) => filter === "all" || g.category === filter)
@@ -716,35 +750,56 @@ function ContentTab({
               className={styles.modList}
               aria-label={CATEGORY_LABEL[group.category]}
             >
-              {group.entries.map((entry) => (
+              {group.entries.map((entry) => {
+                const iconAndInfo = (
+                  <>
+                    <div className={styles.modIconWrap}>
+                      {entry.icon ? (
+                        <img
+                          src={entry.icon}
+                          alt=""
+                          className={styles.modIcon}
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className={styles.modIconFallback} aria-hidden />
+                      )}
+                    </div>
+                    <div className={styles.modInfo}>
+                      <span className={styles.modName}>
+                        {entry.name ?? humanizeFileName(entry.fileName)}
+                      </span>
+                      <span
+                        className={styles.modMeta}
+                        title={formatSize(entry.sizeBytes)}
+                      >
+                        {entry.fileName}
+                      </span>
+                    </div>
+                  </>
+                );
+                // Only "mod" rows can be resolved back to a tracked project
+                // right now — a resourcepack/shaderpack has no equivalent
+                // lookup, so its row stays non-interactive.
+                const canOpen = Boolean(onOpenMod) && group.category === "mod";
+                return (
                 <li
                   key={entry.fileName}
                   ref={observeRow(group.category, entry.fileName, entry.metaResolved)}
                   className={`${styles.modRow} ${entry.enabled ? "" : styles.modRowDisabled}`}
                 >
-                  <div className={styles.modIconWrap}>
-                    {entry.icon ? (
-                      <img
-                        src={entry.icon}
-                        alt=""
-                        className={styles.modIcon}
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className={styles.modIconFallback} aria-hidden />
-                    )}
-                  </div>
-                  <div className={styles.modInfo}>
-                    <span className={styles.modName}>
-                      {entry.name ?? humanizeFileName(entry.fileName)}
-                    </span>
-                    <span
-                      className={styles.modMeta}
-                      title={formatSize(entry.sizeBytes)}
+                  {canOpen ? (
+                    <button
+                      type="button"
+                      className={styles.modOpen}
+                      disabled={openingFile === entry.fileName}
+                      onClick={() => void handleOpenMod(entry)}
                     >
-                      {entry.fileName}
-                    </span>
-                  </div>
+                      {iconAndInfo}
+                    </button>
+                  ) : (
+                    iconAndInfo
+                  )}
                   <div className={styles.modActions}>
                     {group.category === "mod" && (
                       <button
@@ -801,7 +856,8 @@ function ContentTab({
                     </button>
                   </div>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           </section>
         ),

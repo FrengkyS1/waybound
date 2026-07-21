@@ -236,6 +236,71 @@ pub async fn install_mod_to_instance(
     Ok(result)
 }
 
+/// Builds a `ModSummary` good enough to identify the project (uid, source,
+/// ids) and show something reasonable immediately (name, icon) from a
+/// tracked content row — without any network round trip, since everything
+/// needed already lives in `instance_mods`. Errs for a row with no real
+/// project behind it (an internal `file:<name>` record — a modpack-dropped
+/// or manually-added file Waybound never resolved to a CurseForge/Modrinth
+/// project).
+fn mod_summary_from_row(row: &InstalledMod, not_tracked_msg: &str) -> Result<ModSummary, String> {
+    let Some((source_str, id_str)) = row.mod_uid.split_once(':') else {
+        return Err(not_tracked_msg.to_string());
+    };
+
+    let mut summary = ModSummary {
+        uid: row.mod_uid.clone(),
+        slug: String::new(),
+        name: row.mod_name.clone(),
+        description: String::new(),
+        author: String::new(),
+        icon_url: row.icon_url.clone(),
+        downloads: 0,
+        project_type: ContentType::Mod,
+        loaders: Vec::new(),
+        sources: Vec::new(),
+        updated_at: String::new(),
+        curseforge_id: None,
+        modrinth_id: None,
+    };
+    match source_str {
+        "curseforge" => {
+            let id: u32 = id_str
+                .parse()
+                .map_err(|_| "Invalid CurseForge id on record for this mod.".to_string())?;
+            summary.curseforge_id = Some(id);
+            summary.sources.push(ModSource::Curseforge);
+        }
+        "modrinth" => {
+            summary.modrinth_id = Some(id_str.to_string());
+            summary.sources.push(ModSource::Modrinth);
+        }
+        _ => return Err(not_tracked_msg.to_string()),
+    };
+    Ok(summary)
+}
+
+/// Resolves a Content-tab file back to a `ModSummary` so the frontend can
+/// open its project page — the same "isn't tracked from Browse" rejection
+/// as `update_mod_in_instance`, for the same reason (a `file:` record has no
+/// real project to open a page for).
+#[tauri::command]
+pub fn get_mod_summary_for_content(
+    state: State<'_, AppState>,
+    instance_id: String,
+    file_name: String,
+) -> Result<ModSummary, String> {
+    let existing = state.db.list_instance_mods(&instance_id).map_err(|e| e.to_string())?;
+    let row = existing
+        .into_iter()
+        .find(|m| m.file_name == file_name)
+        .ok_or_else(|| format!("'{file_name}' is not tracked in this instance."))?;
+    mod_summary_from_row(
+        &row,
+        "This file isn't tracked from Browse, so there's no project page to open.",
+    )
+}
+
 /// Re-resolves a Content-tab mod against its own project and installs
 /// whatever the instance's Minecraft version + loader currently resolve to
 /// — the same thing Browse's install button does, just re-triggered for a
@@ -257,49 +322,11 @@ pub async fn update_mod_in_instance(
         .find(|m| m.file_name == file_name)
         .ok_or_else(|| format!("'{file_name}' is not tracked in this instance."))?;
 
-    let Some((source_str, id_str)) = row.mod_uid.split_once(':') else {
-        return Err(
-            "This file isn't tracked from Browse, so there's nothing to check for updates against."
-                .to_string(),
-        );
-    };
-
-    let mut summary = ModSummary {
-        uid: row.mod_uid.clone(),
-        slug: String::new(),
-        name: row.mod_name.clone(),
-        description: String::new(),
-        author: String::new(),
-        icon_url: row.icon_url.clone(),
-        downloads: 0,
-        project_type: ContentType::Mod,
-        loaders: Vec::new(),
-        sources: Vec::new(),
-        updated_at: String::new(),
-        curseforge_id: None,
-        modrinth_id: None,
-    };
-    let preferred_source = match source_str {
-        "curseforge" => {
-            let id: u32 = id_str
-                .parse()
-                .map_err(|_| "Invalid CurseForge id on record for this mod.".to_string())?;
-            summary.curseforge_id = Some(id);
-            summary.sources.push(ModSource::Curseforge);
-            ModSource::Curseforge
-        }
-        "modrinth" => {
-            summary.modrinth_id = Some(id_str.to_string());
-            summary.sources.push(ModSource::Modrinth);
-            ModSource::Modrinth
-        }
-        _ => {
-            return Err(
-                "This file isn't tracked from Browse, so there's nothing to check for updates against."
-                    .to_string(),
-            )
-        }
-    };
+    let summary = mod_summary_from_row(
+        &row,
+        "This file isn't tracked from Browse, so there's nothing to check for updates against.",
+    )?;
+    let preferred_source = summary.sources[0];
 
     // Only the DB row is dropped here, not the file — `install_mod` refuses
     // to touch a project it already sees tracked (`AlreadyInstalled`), so

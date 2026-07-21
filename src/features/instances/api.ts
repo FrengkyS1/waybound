@@ -95,6 +95,16 @@ export async function updateModInInstance(
   return invoke("update_mod_in_instance", { instanceId, fileName, installId });
 }
 
+/** Resolves a Content-tab mod back to a `ModSummary` for opening its project
+ * page in Browse. Rejects for a file with no tracked project (a
+ * modpack-dropped or manually-added jar has nothing to open). */
+export async function fetchModSummaryForContent(
+  instanceId: string,
+  fileName: string,
+): Promise<import("../browse/types").ModSummary> {
+  return invoke("get_mod_summary_for_content", { instanceId, fileName });
+}
+
 export async function setInstanceIcon(
   instanceId: string,
   icon: string | null,

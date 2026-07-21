@@ -279,6 +279,20 @@ impl Database {
         Ok(())
     }
 
+    /// Overwrites a row's stored name with the project's real one — unlike
+    /// the icon backfill, this isn't gated on the old value being empty: the
+    /// pre-fix default was always a filename-derived guess (`"the-mod"` from
+    /// `the-mod.jar`), which is always worth replacing with a real resolved
+    /// name, not just when nothing was stored at all.
+    pub fn update_instance_mod_name(&self, instance_id: &str, mod_uid: &str, name: &str) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instance_mods SET mod_name = ?1 WHERE instance_id = ?2 AND mod_uid = ?3",
+            params![name, instance_id, mod_uid],
+        )?;
+        Ok(())
+    }
+
     /// Just the icon for one mod file, without materializing every other
     /// mod row in the instance. The Content tab's per-row metadata fetch
     /// used to call `list_instance_mods` (the whole table) here — fine for

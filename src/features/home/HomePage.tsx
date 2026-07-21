@@ -19,7 +19,7 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
 import { CreateInstanceDialog } from "./CreateInstanceDialog";
 import { InstanceCard } from "./InstanceCard";
-import { InstancePage } from "../instance/InstancePage";
+import { InstancePage, type Tab as InstanceTab } from "../instance/InstancePage";
 import { usePlayStore } from "../play/store";
 import { useInstallStore } from "../install/installStore";
 import styles from "./HomePage.module.css";
@@ -40,15 +40,20 @@ interface HomePageProps {
   onReopenConsumed?: () => void;
   selectedId: string | null;
   onSelectId: (id: string | null) => void;
+  instanceTab: InstanceTab;
+  onInstanceTabChange: (tab: InstanceTab) => void;
 }
 
 export function HomePage({
   onAddMods,
+  onOpenMod,
   onOpenSettings,
   reopenInstanceId = null,
   onReopenConsumed,
   selectedId,
   onSelectId: setSelectedId,
+  instanceTab,
+  onInstanceTabChange,
 }: HomePageProps) {
   const [instances, setInstances] = useState<InstanceSummary[]>([]);
   const [versions, setVersions] = useState<string[]>([]);
@@ -280,6 +285,9 @@ export function HomePage({
         onAddMods={() => onAddMods(selected)}
         onChangeImage={(icon) => void handleChangeIcon(selected.id, icon)}
         onRename={(name) => handleRename(selected.id, name)}
+        onOpenMod={onOpenMod}
+        tab={instanceTab}
+        onTabChange={onInstanceTabChange}
       />
     );
   }

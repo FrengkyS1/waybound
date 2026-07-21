@@ -83,23 +83,48 @@ pub async fn import_modrinth_mrpack_bytes(
 
     let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, dest, sha1)| async move {
         if cancel.is_cancelled() {
-            return Err(ModpackError::from(crate::download::DownloadError::Cancelled));
+            return (dest, sha1, Err(ModpackError::from(crate::download::DownloadError::Cancelled)));
         }
-        let data = download_bytes(client, &url, cancel).await?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+        let result: Result<(), ModpackError> = async {
+            let data = download_bytes(client, &url, cancel).await?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, data)?;
+            Ok(())
         }
-        std::fs::write(&dest, data)?;
-        Ok::<(PathBuf, Option<String>), ModpackError>((dest, sha1))
+        .await;
+        (dest, sha1, result)
     }))
     .buffer_unordered(DOWNLOAD_CONCURRENCY);
 
-    while let Some(result) = stream.next().await {
-        let (dest, sha1) = result?;
-        files_installed += 1;
-        let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        report(files_installed, total, name);
-        downloaded.push((dest, sha1));
+    // A dead mirror or one deleted file shouldn't fail the whole import when
+    // the other ~100 files installed fine — CurseForge's importer already
+    // tolerates per-file failures this way (`skipped_files`); this brings
+    // the Modrinth importer up to the same standard instead of aborting the
+    // entire pack on the first bad download.
+    let mut failed_files: Vec<String> = Vec::new();
+
+    while let Some((dest, sha1, result)) = stream.next().await {
+        if cancel.is_cancelled() {
+            return Err(ModpackError::from(crate::download::DownloadError::Cancelled));
+        }
+        match result {
+            Ok(()) => {
+                files_installed += 1;
+                let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                report(files_installed, total, name);
+                downloaded.push((dest, sha1));
+            }
+            Err(_) => {
+                let name = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown file")
+                    .to_string();
+                failed_files.push(name);
+            }
+        }
     }
 
     // One batched hash->project lookup for every downloaded file that had a
@@ -143,11 +168,21 @@ pub async fn import_modrinth_mrpack_bytes(
         format!("{} {}", index.name, index.version_id)
     };
 
+    let mut message = format!(
+        "Imported {label}: {files_installed} files downloaded, {overrides_applied} override files applied."
+    );
+    let has_skipped = !failed_files.is_empty();
+    if has_skipped {
+        message.push_str(&format!(
+            "\n\n{} file(s) failed to download and were skipped: {}",
+            failed_files.len(),
+            failed_files.join(", ")
+        ));
+    }
+
     Ok(ModpackImportResult {
-        message: format!(
-            "Imported {label}: {files_installed} files downloaded, {overrides_applied} override files applied."
-        ),
-        has_skipped: false,
+        message,
+        has_skipped,
         icons,
         content_names,
         project_uids,

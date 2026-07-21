@@ -735,6 +735,7 @@ async fn install_modpack(
         &instance_root.join("mods"),
         source,
         &import.icons,
+        &import.content_names,
         &import.project_uids,
     )?;
     seed_content_meta_cache(
@@ -863,6 +864,8 @@ fn sync_mods_folder(
 
     icons: &std::collections::HashMap<String, String>,
 
+    content_names: &std::collections::HashMap<String, String>,
+
     project_uids: &std::collections::HashMap<String, String>,
 
 ) -> Result<(), InstanceError> {
@@ -894,6 +897,26 @@ fn sync_mods_folder(
     let existing_filenames: std::collections::HashSet<&str> =
         existing.iter().map(|m| m.file_name.as_str()).collect();
 
+    // A project whose pinned version just changed resolves to a new
+    // filename this import — CurseForge's importer tracks a project-keyed
+    // manifest specifically to delete the file that superseded, but the
+    // Modrinth importer had no equivalent at all, and this scan is the one
+    // place both paths meet. Without this, an old jar for the same project
+    // (a stale duplicate of whatever `.jar` name the last version happened
+    // to use) is silently never removed and stays loaded by Forge/NeoForge
+    // right alongside the new one.
+    let uid_to_new_filename: std::collections::HashMap<&str, &str> =
+        project_uids.iter().map(|(fname, uid)| (uid.as_str(), fname.as_str())).collect();
+    for row in &existing {
+        let Some(&new_filename) = uid_to_new_filename.get(row.mod_uid.as_str()) else {
+            continue;
+        };
+        if new_filename == row.file_name {
+            continue;
+        }
+        let _ = std::fs::remove_file(mods_dir.join(&row.file_name));
+    }
+
     // Catches up a row this scan already tracks on two things a later re-sync
     // can know that an earlier one couldn't: (a) an icon it didn't have
     // before (an older import, before hash-based icon lookup existed), and
@@ -907,10 +930,16 @@ fn sync_mods_folder(
     // showing the stale result forever even though the DB now has better data.
     for row in &existing {
         let icon = icons.get(&row.file_name).cloned().or_else(|| row.icon_url.clone());
+        let resolved_name = content_names.get(&row.file_name);
+        let name = resolved_name.cloned().unwrap_or_else(|| row.mod_name.clone());
         let needs_icon_backfill = row.icon_url.is_none() && icon.is_some();
+        // The pre-fix default was always the filename with `.jar` stripped —
+        // a real resolved name is always worth taking over that, not just
+        // when the row had none at all.
+        let needs_name_backfill = resolved_name.is_some_and(|n| n != &row.mod_name);
         let real_uid = project_uids.get(&row.file_name).filter(|_| row.mod_uid.starts_with("file:"));
 
-        if !needs_icon_backfill && real_uid.is_none() {
+        if !needs_icon_backfill && !needs_name_backfill && real_uid.is_none() {
             continue;
         }
 
@@ -919,15 +948,20 @@ fn sync_mods_folder(
                 let _ = db.insert_instance_mod(
                     instance_id,
                     real_uid,
-                    &row.mod_name,
+                    &name,
                     source,
                     &row.file_name,
                     &file_path,
                     icon.as_deref(),
                 );
             }
-        } else if needs_icon_backfill {
-            let _ = db.update_instance_mod_icon(instance_id, &row.mod_uid, icon.as_deref().unwrap());
+        } else {
+            if needs_icon_backfill {
+                let _ = db.update_instance_mod_icon(instance_id, &row.mod_uid, icon.as_deref().unwrap());
+            }
+            if needs_name_backfill {
+                let _ = db.update_instance_mod_name(instance_id, &row.mod_uid, &name);
+            }
         }
         let _ = db.delete_content_meta_cache(instance_id, "mod", &row.file_name);
     }
@@ -970,7 +1004,10 @@ fn sync_mods_folder(
             .cloned()
             .unwrap_or_else(|| format!("file:{file_name}"));
 
-        let mod_name = file_name.trim_end_matches(".jar").to_string();
+        let mod_name = content_names
+            .get(file_name)
+            .cloned()
+            .unwrap_or_else(|| file_name.trim_end_matches(".jar").to_string());
 
         mods.push((
 
