@@ -14,6 +14,15 @@ platforms but has never been tested there.
 
 ![Waybound screenshot](.readme-assets/screenshot.png)
 
+<details>
+<summary>More screenshots (blank state, Browse, instance detail)</summary>
+
+|                     Blank state                     |                       Browse                       |                     Instance detail                     |
+| :--------------------------------------------------: | :-------------------------------------------------: | :--------------------------------------------------: |
+| ![My Instances, empty](.readme-assets/screenshot-blank.png) | ![Browse mods](.readme-assets/screenshot-browse.png) | ![Instance overview](.readme-assets/screenshot-instance.png) |
+
+</details>
+
 ## Install
 
 Download the latest installer from the
