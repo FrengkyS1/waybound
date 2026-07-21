@@ -19,6 +19,7 @@ import { fileToIconDataUrl } from "../home/imageIcon";
 import { PlayButton } from "../play/PlayButton";
 import { usePlayStore } from "../play/store";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { ConfigEditorModal } from "./ConfigEditorModal";
 import { LaunchOverrides } from "./LaunchOverrides";
 import styles from "./InstancePage.module.css";
 
@@ -671,6 +672,10 @@ function ContentTab({
     }
   }
 
+  const [configTarget, setConfigTarget] = useState<{ fileName: string; label: string } | null>(
+    null,
+  );
+
   const term = search.trim().toLowerCase();
   const visible = groups
     .filter((g) => filter === "all" || g.category === filter)
@@ -801,6 +806,20 @@ function ContentTab({
                     iconAndInfo
                   )}
                   <div className={styles.modActions}>
+                    {group.category === "mod" && entry.hasConfig && (
+                      <button
+                        type="button"
+                        className={styles.configBtn}
+                        onClick={() =>
+                          setConfigTarget({
+                            fileName: entry.fileName,
+                            label: entry.name ?? humanizeFileName(entry.fileName),
+                          })
+                        }
+                      >
+                        Config
+                      </button>
+                    )}
                     {group.category === "mod" && (
                       <button
                         type="button"
@@ -861,6 +880,15 @@ function ContentTab({
             </ul>
           </section>
         ),
+      )}
+
+      {configTarget && (
+        <ConfigEditorModal
+          instanceId={instance.id}
+          fileName={configTarget.fileName}
+          modLabel={configTarget.label}
+          onClose={() => setConfigTarget(null)}
+        />
       )}
     </div>
   );

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 
 use crate::download::safe_join;
-use crate::dto::instance::{ContentEntry, ContentMeta, InstanceContent};
+use crate::dto::instance::{ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent};
 use crate::instances::paths::instance_root;
 use tauri::State;
 
@@ -243,10 +243,18 @@ fn scan_dir(dir: &Path, expected_ext: &str) -> Vec<ScannedFile> {
 /// or has changed since it was last cached is left unresolved for the
 /// existing per-row lazy fetch to pick up (which then populates the cache
 /// for next time).
+///
+/// `config_top_entries`/`db_names` are `Some` only for the "mod" category —
+/// resource/shader packs have no per-file config convention to match
+/// against. Both are computed once per `list_instance_content` call and
+/// shared across every row, not fetched per-row, the same reasoning as the
+/// metadata cache itself.
 fn apply_cache(
     files: Vec<ScannedFile>,
     category: &str,
     cache: &std::collections::HashMap<(String, String), crate::db::CachedContentMeta>,
+    config_top_entries: Option<&[ConfigTopEntry]>,
+    db_names: &std::collections::HashMap<String, String>,
 ) -> Vec<ContentEntry> {
     files
         .into_iter()
@@ -254,16 +262,136 @@ fn apply_cache(
             let hit = cache
                 .get(&(category.to_string(), f.file_name.clone()))
                 .filter(|c| c.size_bytes == f.size_bytes && c.mtime_unix == f.mtime_unix);
+            let name = hit.and_then(|c| c.name.clone());
+            let has_config = config_top_entries.is_some_and(|entries| {
+                let mut terms = vec![normalize_for_match(&file_stem(&f.file_name))];
+                if let Some(n) = &name {
+                    terms.push(normalize_for_match(n));
+                }
+                if let Some(n) = db_names.get(&f.file_name) {
+                    terms.push(normalize_for_match(n));
+                }
+                entries.iter().any(|e| config_entry_matches(&e.normalized, &terms))
+            });
             ContentEntry {
                 file_name: f.file_name,
-                name: hit.and_then(|c| c.name.clone()),
+                name,
                 icon: hit.and_then(|c| c.icon.clone()),
                 enabled: f.enabled,
                 size_bytes: f.size_bytes,
                 meta_resolved: hit.is_some(),
+                has_config,
             }
         })
         .collect()
+}
+
+fn file_stem(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string())
+}
+
+/// Extensions plain-text enough to open in the in-app config editor.
+/// Deliberately excludes binaries (`.png`, `.zip`, `.jar`) even though some
+/// mods bundle a resourcepack or preview image right alongside their real
+/// config in the same folder.
+const TEXT_CONFIG_EXTENSIONS: &[&str] = &[
+    "toml", "json", "json5", "yaml", "yml", "cfg", "conf", "ini", "properties", "txt", "snbt",
+    "lang", "mcmeta",
+];
+
+fn is_text_config_file(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| TEXT_CONFIG_EXTENSIONS.iter().any(|ext| ext.eq_ignore_ascii_case(e)))
+}
+
+/// Strips everything but ASCII letters/digits and lowercases — the common
+/// ground between a mod's declared name ("Nature's Compass"), its jar
+/// filename ("NaturesCompass-1.21.1-3.0.3-neoforge.jar"), and its config
+/// entry ("naturescompass.toml" / "naturescompass/"), each using completely
+/// different punctuation, casing, and versioning for the same mod.
+fn normalize_for_match(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether a config entry's normalized name plausibly belongs to a mod
+/// identified by `terms` (its resolved name and/or jar filename, each
+/// already normalized). Matches on substring containment either direction —
+/// a mod's declared name is often a superset or subset of its actual modid
+/// (e.g. "Nature's Compass" vs config folder "naturescompass") — gated by a
+/// minimum length so a short common substring doesn't false-positive across
+/// unrelated mods.
+fn config_entry_matches(entry_norm: &str, terms: &[String]) -> bool {
+    const MIN_MATCH_LEN: usize = 4;
+    if entry_norm.is_empty() {
+        return false;
+    }
+    terms.iter().any(|term| {
+        if term.is_empty() {
+            return false;
+        }
+        if term.len() < MIN_MATCH_LEN || entry_norm.len() < MIN_MATCH_LEN {
+            return term == entry_norm;
+        }
+        entry_norm.contains(term.as_str()) || term.contains(entry_norm)
+    })
+}
+
+/// One top-level entry directly inside `config/`, fingerprinted for
+/// matching once per `list_instance_content`/`list_mod_configs` call instead
+/// of re-reading the directory for every mod.
+struct ConfigTopEntry {
+    raw_name: String,
+    is_dir: bool,
+    normalized: String,
+}
+
+fn scan_config_top_level(config_dir: &Path) -> Vec<ConfigTopEntry> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(config_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let raw_name = entry.file_name().to_string_lossy().to_string();
+        if raw_name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // A directory's whole name is its identity; a file's is its name
+        // minus extension — config files essentially never carry version
+        // numbers the way mod jars do, so no further stripping is needed.
+        let stem = if is_dir { raw_name.clone() } else { file_stem(&raw_name) };
+        out.push(ConfigTopEntry { raw_name, is_dir, normalized: normalize_for_match(&stem) });
+    }
+    out
+}
+
+/// Recursively collects every text-editable config file under `dir`,
+/// building `relative_prefix`-prefixed paths relative to `config/` itself —
+/// what the frontend passes back to `read_config_file`/`write_config_file`.
+fn collect_text_configs_recursive(dir: &Path, relative_prefix: &str, out: &mut Vec<ConfigFileEntry>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let relative = format!("{relative_prefix}/{name}");
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_text_configs_recursive(&entry.path(), &relative, out);
+        } else if is_text_config_file(&name) {
+            out.push(ConfigFileEntry { relative_path: relative.clone(), display_name: relative });
+        }
+    }
 }
 
 #[tauri::command]
@@ -278,14 +406,46 @@ pub async fn list_instance_content(
         .into_iter()
         .map(|c| ((c.category.clone(), c.file_name.clone()), c))
         .collect();
+    // For the "has this mod got a config?" check below — a mod's tracked
+    // display name is a better match term than a not-yet-cache-resolved
+    // row's filename alone, and this is one query for the whole instance,
+    // not one per mod.
+    let db_names: std::collections::HashMap<String, String> = state
+        .db
+        .list_instance_mods(&instance_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.file_name, m.mod_name))
+        .collect();
 
     // Directory listing + cache join — no jar/zip parsing for anything
     // already seen before — so this stays fast no matter how big the pack
     // is. Still off the async runtime since it's real disk + DB I/O.
-    let result = tauri::async_runtime::spawn_blocking(move || InstanceContent {
-        mods: apply_cache(scan_dir(&root.join("mods"), ".jar"), "mod", &cache),
-        resource_packs: apply_cache(scan_dir(&root.join("resourcepacks"), ".zip"), "resourcepack", &cache),
-        shader_packs: apply_cache(scan_dir(&root.join("shaderpacks"), ".zip"), "shaderpack", &cache),
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let config_top_entries = scan_config_top_level(&root.join("config"));
+        InstanceContent {
+            mods: apply_cache(
+                scan_dir(&root.join("mods"), ".jar"),
+                "mod",
+                &cache,
+                Some(&config_top_entries),
+                &db_names,
+            ),
+            resource_packs: apply_cache(
+                scan_dir(&root.join("resourcepacks"), ".zip"),
+                "resourcepack",
+                &cache,
+                None,
+                &db_names,
+            ),
+            shader_packs: apply_cache(
+                scan_dir(&root.join("shaderpacks"), ".zip"),
+                "shaderpack",
+                &cache,
+                None,
+                &db_names,
+            ),
+        }
     })
     .await
     .map_err(|e| e.to_string());
@@ -462,6 +622,77 @@ pub fn remove_content_file(
     Ok(())
 }
 
+/// Every editable config file that plausibly belongs to one mod — a single
+/// top-level match returns just that file; a matched folder returns every
+/// text-config file inside it (recursively), flattened with paths relative
+/// to `config/`. Empty (not an error) when nothing matches, which the
+/// frontend reads as "no Config button for this mod".
+#[tauri::command]
+pub fn list_mod_configs(
+    state: State<'_, AppState>,
+    instance_id: String,
+    file_name: String,
+) -> Result<Vec<ConfigFileEntry>, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let config_dir = root.join("config");
+
+    let mut terms = vec![normalize_for_match(&file_stem(&file_name))];
+    if let Ok(mods) = state.db.list_instance_mods(&instance_id) {
+        if let Some(m) = mods.into_iter().find(|m| m.file_name == file_name) {
+            terms.push(normalize_for_match(&m.mod_name));
+        }
+    }
+
+    let mut results = Vec::new();
+    for entry in scan_config_top_level(&config_dir) {
+        if !config_entry_matches(&entry.normalized, &terms) {
+            continue;
+        }
+        let entry_path = config_dir.join(&entry.raw_name);
+        if entry.is_dir {
+            collect_text_configs_recursive(&entry_path, &entry.raw_name, &mut results);
+        } else if is_text_config_file(&entry.raw_name) {
+            results.push(ConfigFileEntry {
+                relative_path: entry.raw_name.clone(),
+                display_name: entry.raw_name,
+            });
+        }
+    }
+    results.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(results)
+}
+
+/// Config files are typically a few KB; this is generous headroom for a
+/// verbose one while still refusing anything a plain textarea shouldn't
+/// try to hold in memory and diff on every keystroke.
+const MAX_EDITABLE_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
+
+#[tauri::command]
+pub fn read_config_file(instance_id: String, relative_path: String) -> Result<String, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let path = safe_join(&root.join("config"), &relative_path).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_EDITABLE_CONFIG_BYTES {
+        return Err(format!(
+            "This file is {:.1} MB — too large to edit in-app. Use \"Open folder\" and a text editor instead.",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    fs::read_to_string(&path)
+        .map_err(|_| "Couldn't read this file as text — it may not be a plain-text config.".to_string())
+}
+
+#[tauri::command]
+pub fn write_config_file(
+    instance_id: String,
+    relative_path: String,
+    contents: String,
+) -> Result<(), String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let path = safe_join(&root.join("config"), &relative_path).map_err(|e| e.to_string())?;
+    fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod content_meta_cache_tests {
     use super::{apply_cache, ScannedFile};
@@ -493,7 +724,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "Foo.jar", 100, 1000, Some("Foo Mod"), Some("data:image/png;base64,x")),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache);
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
 
         assert!(entries[0].meta_resolved, "matching size+mtime should count as a cache hit");
         assert_eq!(entries[0].name.as_deref(), Some("Foo Mod"));
@@ -514,7 +745,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "Foo.jar", 100, 1000, Some("Foo Mod"), None),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache);
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
 
         assert!(!entries[0].meta_resolved, "a changed file must not be served stale cached metadata");
         assert_eq!(entries[0].name, None);
@@ -537,7 +768,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "NoIcon.jar", 50, 500, Some("No Icon Mod"), None),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache);
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
 
         assert!(entries[0].meta_resolved);
         assert_eq!(entries[0].icon, None);
@@ -551,10 +782,61 @@ mod content_meta_cache_tests {
             size_bytes: 10,
             mtime_unix: 10,
         }];
-        let entries = apply_cache(scanned, "mod", &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &HashMap::new(), None, &HashMap::new());
 
         assert!(!entries[0].meta_resolved);
         assert_eq!(entries[0].name, None);
         assert_eq!(entries[0].icon, None);
+    }
+}
+
+#[cfg(test)]
+mod config_matching_tests {
+    use super::{config_entry_matches, is_text_config_file, normalize_for_match};
+
+    #[test]
+    fn normalize_strips_punctuation_case_and_keeps_digits() {
+        assert_eq!(normalize_for_match("Nature's Compass"), "naturescompass");
+        assert_eq!(normalize_for_match("map_atlases-client"), "mapatlasesclient");
+        assert_eq!(normalize_for_match("jade"), "jade");
+    }
+
+    #[test]
+    fn real_mod_name_matches_its_real_config_entry() {
+        // Cases pulled directly from an actual instance's config/ folder.
+        let jade = normalize_for_match("jade");
+        assert!(config_entry_matches(&normalize_for_match("jade"), &[jade]));
+
+        let compass = normalize_for_match("Nature's Compass");
+        assert!(config_entry_matches(&normalize_for_match("naturescompass"), &[compass]));
+
+        let map_atlases = normalize_for_match("map_atlases");
+        assert!(config_entry_matches(
+            &normalize_for_match("map_atlases-client"),
+            &[map_atlases]
+        ));
+    }
+
+    #[test]
+    fn short_unrelated_names_do_not_false_positive() {
+        // "js" (a hypothetical short modid) must not match "starterkit" just
+        // because it's a short substring floating around somewhere.
+        let short_term = normalize_for_match("js");
+        assert!(!config_entry_matches(&normalize_for_match("starterkit"), &[short_term]));
+    }
+
+    #[test]
+    fn unrelated_mod_and_config_entry_do_not_match() {
+        let sodium = normalize_for_match("Sodium");
+        assert!(!config_entry_matches(&normalize_for_match("starterkit"), &[sodium]));
+    }
+
+    #[test]
+    fn text_config_extensions_recognized_binary_ones_excluded() {
+        assert!(is_text_config_file("common.toml"));
+        assert!(is_text_config_file("settings.json"));
+        assert!(is_text_config_file("plugins.yaml"));
+        assert!(!is_text_config_file("icon.png"));
+        assert!(!is_text_config_file("resourcepack.zip"));
     }
 }

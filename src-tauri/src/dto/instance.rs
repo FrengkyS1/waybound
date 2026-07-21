@@ -50,6 +50,13 @@ pub struct ContentEntry {
     /// which would otherwise look identical to "not fetched yet".
     #[serde(default)]
     pub meta_resolved: bool,
+    /// True when at least one file/folder under `config/` looks like it
+    /// belongs to this mod — computed once per `list_instance_content` call
+    /// (one scan of `config/`'s top level shared across every mod row)
+    /// rather than per-row, so showing the "Config" button doesn't cost a
+    /// separate lookup for each of a few hundred mods.
+    #[serde(default)]
+    pub has_config: bool,
 }
 
 /// All content in an instance, grouped by category.
@@ -59,6 +66,17 @@ pub struct InstanceContent {
     pub mods: Vec<ContentEntry>,
     pub resource_packs: Vec<ContentEntry>,
     pub shader_packs: Vec<ContentEntry>,
+}
+
+/// One config file a mod's "Config" button can open — `relative_path` is
+/// relative to the instance's `config/` folder and is the stable identifier
+/// used to read/write it (safe_join'd against `config/`, never trusted as a
+/// literal filesystem path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigFileEntry {
+    pub relative_path: String,
+    pub display_name: String,
 }
 
 /// A single entry's display name + icon, resolved on demand (opening and

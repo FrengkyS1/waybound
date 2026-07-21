@@ -40,6 +40,9 @@ export interface ContentEntry {
   /** True when `name`/`icon` came from the backend's on-disk metadata cache
    * already — no need to fetch this row's metadata again. */
   metaResolved: boolean;
+  /** True when at least one file/folder under `config/` looks like it
+   * belongs to this mod — gates showing the Config button at all. */
+  hasConfig: boolean;
 }
 
 export interface InstanceContent {
@@ -103,6 +106,37 @@ export async function fetchModSummaryForContent(
   fileName: string,
 ): Promise<import("../browse/types").ModSummary> {
   return invoke("get_mod_summary_for_content", { instanceId, fileName });
+}
+
+export interface ConfigFileEntry {
+  /** Relative to the instance's config/ folder — pass straight back to
+   * readConfigFile/writeConfigFile, never construct a path yourself. */
+  relativePath: string;
+  displayName: string;
+}
+
+/** Every editable config file that plausibly belongs to one mod. Empty
+ * (not an error) when nothing matches. */
+export async function listModConfigs(
+  instanceId: string,
+  fileName: string,
+): Promise<ConfigFileEntry[]> {
+  return invoke("list_mod_configs", { instanceId, fileName });
+}
+
+export async function readConfigFile(
+  instanceId: string,
+  relativePath: string,
+): Promise<string> {
+  return invoke("read_config_file", { instanceId, relativePath });
+}
+
+export async function writeConfigFile(
+  instanceId: string,
+  relativePath: string,
+  contents: string,
+): Promise<void> {
+  await invoke("write_config_file", { instanceId, relativePath, contents });
 }
 
 export async function setInstanceIcon(

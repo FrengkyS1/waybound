@@ -9,7 +9,10 @@ pub mod search;
 pub mod settings;
 
 pub use auth::{get_account, logout, microsoft_login};
-pub use content::{get_content_meta, list_instance_content, remove_content_file, set_content_enabled};
+pub use content::{
+    get_content_meta, list_instance_content, list_mod_configs, read_config_file,
+    remove_content_file, set_content_enabled, write_config_file,
+};
 pub use config::{
     clear_curseforge_api_key, get_curseforge_status, import_curseforge_api_key_from_env_file,
     set_curseforge_api_key, test_curseforge_api_key, test_curseforge_docker_env_key,
