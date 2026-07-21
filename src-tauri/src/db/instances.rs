@@ -315,6 +315,28 @@ impl Database {
         .map_err(DbError::from)
     }
 
+    /// The cached jar-parsed display name for one mod file, when it's been
+    /// resolved before — this is often a better config-matching term than
+    /// the tracked project's own `mod_name` (a CurseForge/Modrinth listing
+    /// title like "BisectHosting Server Integration Menu [FORGE]" can read
+    /// nothing like the config folder's actual modid, e.g. "bhmenu", while
+    /// the jar's own embedded name usually does).
+    pub fn get_content_meta_name_by_file(
+        &self,
+        instance_id: &str,
+        file_name: &str,
+    ) -> Result<Option<String>, DbError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT name FROM content_meta_cache WHERE instance_id = ?1 AND category = 'mod' AND file_name = ?2 LIMIT 1",
+            params![instance_id, file_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(DbError::from)
+    }
+
     pub fn get_instance_mod(&self, instance_id: &str, mod_uid: &str) -> Result<Option<(InstalledMod, String)>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(

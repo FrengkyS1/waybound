@@ -12,6 +12,14 @@ const BASE_URL: &str = "https://api.curseforge.com/v1";
 const MINECRAFT_GAME_ID: u32 = 432;
 const USER_AGENT: &str = "Waybound/0.1.0 (Minecraft mod manager; personal use)";
 
+/// CurseForge doesn't document a hard cap on `/mods` or `/mods/files` batch
+/// body size, but a single request for a whole large modpack's worth of ids
+/// (300+) was observed silently coming back short — some ids' names/icons
+/// just never appear in `data`, with no error, no matter which ids they are.
+/// Chunking keeps every request well under any plausible undocumented limit;
+/// `mods_batch`/`files_batch` log if the merged result is still short.
+const BATCH_CHUNK_SIZE: usize = 200;
+
 #[derive(Debug, Error)]
 pub enum CurseForgeError {
     #[error("network error: {0}")]
@@ -370,6 +378,29 @@ impl CurseForgeClient {
         if file_ids.is_empty() {
             return std::collections::HashMap::new();
         }
+        let mut merged = std::collections::HashMap::new();
+        for chunk in file_ids.chunks(BATCH_CHUNK_SIZE) {
+            merged.extend(self.files_batch_chunk(chunk, api_key).await);
+        }
+        if merged.len() < file_ids.len() {
+            crate::activity::append_log(
+                &format!(
+                    "CurseForge files_batch: requested {} file ids, got metadata for {} — some downloads may fall back to individual lookups",
+                    file_ids.len(),
+                    merged.len()
+                ),
+                "warn",
+                None,
+            );
+        }
+        merged
+    }
+
+    async fn files_batch_chunk(
+        &self,
+        file_ids: &[u32],
+        api_key: &str,
+    ) -> std::collections::HashMap<u32, (String, Option<String>, Option<String>)> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -423,6 +454,29 @@ impl CurseForgeClient {
         if mod_ids.is_empty() {
             return std::collections::HashMap::new();
         }
+        let mut merged = std::collections::HashMap::new();
+        for chunk in mod_ids.chunks(BATCH_CHUNK_SIZE) {
+            merged.extend(self.mods_batch_chunk(chunk, api_key).await);
+        }
+        if merged.len() < mod_ids.len() {
+            crate::activity::append_log(
+                &format!(
+                    "CurseForge mods_batch: requested {} project ids, got metadata for {} — some names/icons may fall back to filenames",
+                    mod_ids.len(),
+                    merged.len()
+                ),
+                "warn",
+                None,
+            );
+        }
+        merged
+    }
+
+    async fn mods_batch_chunk(
+        &self,
+        mod_ids: &[u32],
+        api_key: &str,
+    ) -> std::collections::HashMap<u32, (String, String, Option<String>, Option<String>)> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {

@@ -271,7 +271,10 @@ fn apply_cache(
                 if let Some(n) = db_names.get(&f.file_name) {
                     terms.push(normalize_for_match(n));
                 }
-                entries.iter().any(|e| config_entry_matches(&e.normalized, &terms))
+                entries.iter().any(|e| {
+                    config_entry_matches(&e.normalized, &terms)
+                        && (e.is_dir || is_text_config_file(&e.raw_name))
+                })
             });
             ContentEntry {
                 file_name: f.file_name,
@@ -299,7 +302,7 @@ fn file_stem(file_name: &str) -> String {
 /// config in the same folder.
 const TEXT_CONFIG_EXTENSIONS: &[&str] = &[
     "toml", "json", "json5", "yaml", "yml", "cfg", "conf", "ini", "properties", "txt", "snbt",
-    "lang", "mcmeta",
+    "lang", "mcmeta", "omniconf",
 ];
 
 fn is_text_config_file(file_name: &str) -> bool {
@@ -642,6 +645,9 @@ pub fn list_mod_configs(
             terms.push(normalize_for_match(&m.mod_name));
         }
     }
+    if let Ok(Some(name)) = state.db.get_content_meta_name_by_file(&instance_id, &file_name) {
+        terms.push(normalize_for_match(&name));
+    }
 
     let mut results = Vec::new();
     for entry in scan_config_top_level(&config_dir) {
@@ -815,6 +821,16 @@ mod config_matching_tests {
             &normalize_for_match("map_atlases-client"),
             &[map_atlases]
         ));
+
+        let enigmatic_legacy = normalize_for_match("Enigmatic Legacy");
+        assert!(config_entry_matches(
+            &normalize_for_match("enigmaticlegacy-client"),
+            &[enigmatic_legacy.clone()]
+        ));
+        assert!(config_entry_matches(
+            &normalize_for_match("enigmaticlegacy-common"),
+            &[enigmatic_legacy]
+        ));
     }
 
     #[test]
@@ -836,6 +852,7 @@ mod config_matching_tests {
         assert!(is_text_config_file("common.toml"));
         assert!(is_text_config_file("settings.json"));
         assert!(is_text_config_file("plugins.yaml"));
+        assert!(is_text_config_file("enigmaticlegacy-client.omniconf"));
         assert!(!is_text_config_file("icon.png"));
         assert!(!is_text_config_file("resourcepack.zip"));
     }
