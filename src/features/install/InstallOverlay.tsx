@@ -38,6 +38,7 @@ export function InstallOverlay() {
   const startMissingModsDownload = useInstallStore((s) => s.startMissingModsDownload);
   const stepMissingMods = useInstallStore((s) => s.stepMissingMods);
   const openAllMissingMods = useInstallStore((s) => s.openAllMissingMods);
+  const dismissMissingMod = useInstallStore((s) => s.dismissMissingMod);
 
   if (installs.length === 0 && notifications.length === 0) return null;
 
@@ -93,6 +94,9 @@ export function InstallOverlay() {
               {entry.status === "done" && entry.missingMods && remainingMissingMods.length > 0 && (
                 entry.missingModsIndex === undefined ? (
                   <div className={styles.missingModsActions}>
+                    {remainingMissingMods.length === 1 && (
+                      <span className={styles.missingModsLabel}>{remainingMissingMods[0].name}</span>
+                    )}
                     <button
                       type="button"
                       className={styles.missingModsButton}
@@ -107,6 +111,15 @@ export function InstallOverlay() {
                         onClick={() => openAllMissingMods(entry.id)}
                       >
                         Open all ({remainingMissingMods.length})
+                      </button>
+                    )}
+                    {remainingMissingMods.length === 1 && (
+                      <button
+                        type="button"
+                        className={styles.missingModsDismiss}
+                        onClick={() => dismissMissingMod(entry.id, remainingMissingMods[0].projectId)}
+                      >
+                        Not installing this
                       </button>
                     )}
                   </div>
@@ -133,6 +146,13 @@ export function InstallOverlay() {
                       aria-label="Next mod"
                     >
                       ›
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.missingModsDismiss}
+                      onClick={() => dismissMissingMod(entry.id, entry.missingMods![entry.missingModsIndex!].projectId)}
+                    >
+                      Not installing this
                     </button>
                   </div>
                 )

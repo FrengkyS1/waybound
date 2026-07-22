@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ModSummary } from "./features/browse/types";
 import { BrowsePage } from "./features/browse/BrowsePage";
 import { HomePage } from "./features/home/HomePage";
@@ -29,6 +29,38 @@ function App() {
   // so it's the only place "stay on Content when I come back" can live.
   const [instanceTab, setInstanceTab] = useState<InstanceTab>("overview");
 
+  // The instance page's own content pane (not <main>) is what scrolls, and
+  // it fully unmounts along with the rest of HomePage on every trip to
+  // Browse — so its scrollTop is gone, not just hidden, by the time we're
+  // back. Captured on the way out by selector (the element doesn't exist yet
+  // to hold a ref to), reapplied once the tab's content has regrown tall
+  // enough to actually hold that offset.
+  const pendingScrollRestore = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (view !== "home" || pendingScrollRestore.current == null) return;
+    const target = pendingScrollRestore.current;
+    let raf = 0;
+    let attempts = 0;
+    // Bails after ~2s (120 frames) — e.g. the user switched to a tab that
+    // will never grow tall enough — rather than polling for the rest of
+    // the session.
+    const MAX_ATTEMPTS = 120;
+    const tryRestore = () => {
+      attempts += 1;
+      const el = document.querySelector<HTMLElement>('[data-scroll-container="instance-page"]');
+      if (el && el.scrollHeight - el.clientHeight >= target) {
+        el.scrollTop = target;
+        pendingScrollRestore.current = null;
+        return;
+      }
+      if (attempts < MAX_ATTEMPTS) raf = requestAnimationFrame(tryRestore);
+      else pendingScrollRestore.current = null;
+    };
+    raf = requestAnimationFrame(tryRestore);
+    return () => cancelAnimationFrame(raf);
+  }, [view]);
+
   function openBrowseForInstance(instance: InstanceSummary) {
     setBrowseMod(null);
     setInstallTarget({
@@ -41,6 +73,8 @@ function App() {
   }
 
   function openModInBrowse(summary: ModSummary) {
+    const el = document.querySelector<HTMLElement>('[data-scroll-container="instance-page"]');
+    if (el) pendingScrollRestore.current = el.scrollTop;
     setInstallTarget(null);
     setBrowseMod(summary);
     setView("browse");

@@ -165,9 +165,16 @@ export function ProjectDetailPage({
   return (
     <div className={styles.page}>
       <div className={styles.pageInner}>
-        <button type="button" className={styles.backBtn} onClick={onBack}>
-          ← Back to browse
-        </button>
+        <div className={styles.backRow}>
+          <button type="button" className={styles.backBtn} onClick={onBack}>
+            ← Back to browse
+          </button>
+          {onReturnToInstance && (
+            <button type="button" className={styles.backBtn} onClick={onReturnToInstance}>
+              ← Back to instance
+            </button>
+          )}
+        </div>
 
         {loading && <p className={styles.status}>Loading project…</p>}
         {error && <p className={styles.error}>{error}</p>}

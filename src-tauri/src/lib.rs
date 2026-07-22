@@ -14,7 +14,7 @@ mod activity;
 
 use commands::{
     apply_global_mc_options_to_all_instances, cancel_install, cancel_launch, clear_curseforge_api_key, create_instance,
-    add_play_time, delete_instance, duplicate_instance, get_account, get_activity_logs, get_curseforge_status,
+    add_play_time, delete_instance, dismiss_missing_mod, duplicate_instance, get_account, get_activity_logs, get_curseforge_status,
     get_content_meta, get_mod_summary_for_content, list_instance_content, list_mod_configs,
     read_config_file, remove_content_file, set_content_enabled, write_config_file,
     get_global_mc_options, get_instance_launch_config, get_instance_options, get_launch_settings,
@@ -59,6 +59,7 @@ pub fn run() {
             import_curseforge_api_key_from_env_file,
             list_instances,
             list_pending_missing_mods,
+            dismiss_missing_mod,
             create_instance,
             rename_instance,
             set_instance_icon,

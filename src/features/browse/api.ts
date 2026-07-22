@@ -78,3 +78,11 @@ export async function watchForMissingMods(
 ): Promise<void> {
   return invoke<void>("watch_for_missing_mods", { instanceId, mods });
 }
+
+/** Permanently stops tracking one project as missing for this instance — for
+ * a mod the user has decided not to get, not one they haven't gotten to yet.
+ * Without this, "missing" is decided purely by file presence, so an
+ * opted-out mod would nag again on every restart. */
+export async function dismissMissingMod(instanceId: string, projectId: number): Promise<void> {
+  return invoke<void>("dismiss_missing_mod", { instanceId, projectId });
+}

@@ -3,6 +3,7 @@ import { create } from "zustand";
 
 import {
   cancelInstall,
+  dismissMissingMod as dismissMissingModApi,
   fetchPendingMissingMods,
   installMod,
   openAllMissingModsBrowsers,
@@ -14,6 +15,15 @@ import type { InstallModInput, MissingMod } from "../browse/detailTypes";
 export type InstallStatus = "installing" | "done" | "error" | "cancelled";
 
 const CANCELLED_MESSAGE = "Install cancelled";
+
+// Names only, comma-separated, capped so a pack with a long tail of missing
+// mods still reads as a sentence instead of a wall of text.
+function describeMissingMods(mods: MissingMod[]): string {
+  const MAX_NAMED = 3;
+  const names = mods.slice(0, MAX_NAMED).map((m) => m.name);
+  const rest = mods.length - names.length;
+  return rest > 0 ? `${names.join(", ")}, +${rest} more` : names.join(", ");
+}
 
 export interface InstallEntry {
   id: string;
@@ -86,6 +96,9 @@ interface InstallStore {
   /** Opens every missing mod's page at once (each its own window) and starts
    * watching Downloads for all of them. */
   openAllMissingMods: (id: string) => void;
+  /** Marks one missing mod as "not getting this" — removed from the list for
+   * good (persisted backend-side), not just hidden until the next restart. */
+  dismissMissingMod: (id: string, projectId: number) => void;
 }
 
 export const useInstallStore = create<InstallStore>((set, get) => ({
@@ -182,6 +195,32 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
     void openAllMissingModsBrowsers(entry.missingMods.map((m) => m.url)).catch(() => {});
     void watchForMissingMods(entry.instanceId, entry.missingMods).catch(() => {});
   },
+
+  dismissMissingMod: (id, projectId) => {
+    const entry = get().installs.find((e) => e.id === id);
+    if (!entry?.missingMods?.length || !entry.instanceId) return;
+    const stillHasIt = entry.missingMods.some((m) => m.projectId === projectId);
+    if (!stillHasIt) return;
+    const nextMissingMods = entry.missingMods.filter((m) => m.projectId !== projectId);
+
+    set((s) => ({
+      // Nothing left to act on for this entry once its last missing mod is
+      // dismissed — same as the watcher placing the final one.
+      installs:
+        nextMissingMods.length === 0
+          ? s.installs.filter((e) => e.id !== id)
+          : s.installs.map((e) => {
+              if (e.id !== id) return e;
+              const index = e.missingModsIndex;
+              return {
+                ...e,
+                missingMods: nextMissingMods,
+                missingModsIndex: index === undefined ? undefined : Math.min(index, nextMissingMods.length - 1),
+              };
+            }),
+    }));
+    void dismissMissingModApi(entry.instanceId, projectId).catch(() => {});
+  },
 }));
 
 void listen<InstallProgressEvent>("install://progress", (event) => {
@@ -267,7 +306,7 @@ void fetchPendingMissingMods()
           id: `pending-missing-mods-${instanceId}`,
           name: instanceName,
           status: "done" as const,
-          message: `${missingMods.length} mod(s) from a previous import still need a manual download.`,
+          message: `${missingMods.length} mod(s) from a previous import still need a manual download: ${describeMissingMods(missingMods)}`,
           instanceId,
           missingMods,
         })),

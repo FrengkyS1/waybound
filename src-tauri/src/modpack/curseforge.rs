@@ -106,6 +106,21 @@ fn save_pack_manifest(instance_root: &Path, entries: &[PackManifestEntry]) {
     }
 }
 
+/// Drops one project from the pack's tracked manifest — for a mod the user
+/// has decided not to grab (its author blocks automatic download and the
+/// user doesn't want it manually either). Membership in `pending_missing_mods`
+/// is decided purely by "does the manifest still list this file," so without
+/// this, a mod the user explicitly opted out of nags forever on every
+/// restart, indistinguishable from one they just haven't gotten to yet.
+pub fn remove_pack_manifest_entry(instance_root: &Path, project_id: u32) {
+    let entries = load_pack_manifest(instance_root);
+    if !entries.iter().any(|e| e.project_id == project_id) {
+        return;
+    }
+    let kept: Vec<PackManifestEntry> = entries.into_iter().filter(|e| e.project_id != project_id).collect();
+    save_pack_manifest(instance_root, &kept);
+}
+
 /// Removes files the pack dropped since the last import of this same
 /// instance — the ones this update's manifest no longer lists by file id.
 /// Never touches anything not in `old_manifest`, so a mod the user added
@@ -834,6 +849,21 @@ mod pack_reconciliation_tests {
 
         assert_eq!(pending.len(), 1, "only the file not yet on disk should be reported");
         assert_eq!(pending[0].filename, "absent.jar");
+    }
+
+    #[test]
+    fn dismissed_mod_stops_appearing_as_pending() {
+        let dir = temp_instance_dir("dismiss");
+        save_pack_manifest(
+            &dir,
+            &[test_entry(1, 10, "absent-a.jar"), test_entry(2, 20, "absent-b.jar")],
+        );
+
+        super::remove_pack_manifest_entry(&dir, 1);
+        let pending = super::pending_missing_mods(&dir);
+
+        assert_eq!(pending.len(), 1, "dismissed project should no longer be tracked as missing");
+        assert_eq!(pending[0].filename, "absent-b.jar");
     }
 
     fn zip_with_entries(names: &[&str]) -> Vec<u8> {

@@ -4,7 +4,7 @@ mod preview;
 
 pub use curseforge::import_curseforge_modpack_zip;
 pub use curseforge::is_curseforge_modpack_zip;
-pub(crate) use curseforge::{curseforge_file_url, pending_missing_mods};
+pub(crate) use curseforge::{curseforge_file_url, pending_missing_mods, remove_pack_manifest_entry};
 pub use modrinth::import_modrinth_mrpack_bytes;
 pub use modrinth::is_mrpack_bytes;
 pub use preview::{preview_curseforge_modpack, preview_modrinth_modpack};

@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use super::search::AppState;
 use crate::instances::{InstanceError, InstanceService};
-use crate::modpack::pending_missing_mods;
+use crate::modpack::{pending_missing_mods, remove_pack_manifest_entry};
 
 /// Emitted while a modpack downloads its files, so the frontend can show
 /// "X / Y files" instead of an indeterminate spinner.
@@ -69,6 +69,18 @@ pub fn list_pending_missing_mods(state: State<'_, AppState>) -> Result<Vec<Pendi
             }
         })
         .collect())
+}
+
+/// Permanently stops tracking one project as missing for this instance — for
+/// a mod the user has decided not to get, not one they just haven't gotten to
+/// yet. `pending_missing_mods` otherwise has no way to tell those two cases
+/// apart: it only ever looks at "does the file exist on disk," so an opted-out
+/// mod would nag on every restart forever without this.
+#[tauri::command]
+pub fn dismiss_missing_mod(instance_id: String, project_id: u32) -> Result<(), String> {
+    let root = crate::instances::paths::instance_root(&instance_id).map_err(|e| e.to_string())?;
+    remove_pack_manifest_entry(&root, project_id);
+    Ok(())
 }
 
 #[tauri::command]

@@ -151,6 +151,22 @@
   color: var(--color-on-accent);
 }
 
+.missingModsDismiss {
+  align-self: flex-start;
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  margin-top: var(--space-1);
+  background: transparent;
+  border: none;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.missingModsDismiss:hover {
+  color: var(--color-text-secondary);
+}
+
 .missingModsProgress {
   display: flex;
   align-items: center;

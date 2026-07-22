@@ -340,7 +340,7 @@ export function InstancePage({
         </button>
       </nav>
 
-      <div className={styles.content}>
+      <div className={styles.content} data-scroll-container="instance-page">
         {tab === "overview" && (
           <OverviewTab
             instance={instance}
