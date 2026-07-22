@@ -113,7 +113,7 @@ impl Database {
             params![
                 id,
                 config.java_path,
-                config.max_memory_mb.map(|v| v as i64),
+                config.max_memory_mb.map(|v| v.clamp(512, 32768) as i64),
                 config.jvm_args,
             ],
         )?;
@@ -423,14 +423,15 @@ impl Database {
     ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO content_meta_cache (instance_id, category, file_name, size_bytes, mtime_unix, name, icon)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO content_meta_cache (instance_id, category, file_name, size_bytes, mtime_unix, name, icon, written_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(instance_id, category, file_name) DO UPDATE SET
                size_bytes = excluded.size_bytes,
                mtime_unix = excluded.mtime_unix,
                name = excluded.name,
-               icon = excluded.icon",
-            params![instance_id, category, file_name, size_bytes as i64, mtime_unix, name, icon],
+               icon = excluded.icon,
+               written_version = excluded.written_version",
+            params![instance_id, category, file_name, size_bytes as i64, mtime_unix, name, icon, crate::db::APP_VERSION],
         )?;
         Ok(())
     }

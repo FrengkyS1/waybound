@@ -469,6 +469,12 @@ fn serialize_options(options: &McOptions) -> String {
                 NarratorMode::System => 3,
             }
         ),
+        // Vanilla shows its "Welcome to Minecraft! Would you like to enable
+        // Narrator..." first-run prompt on any options.txt that's missing
+        // this flag — which is every instance Waybound creates, since it
+        // never wrote it. Not a real user preference (nobody wants to see
+        // this on purpose), so it's just always marked dismissed.
+        "onboardAccessibility:false".to_string(),
     ];
     let mut binding_keys: Vec<_> = options.key_bindings.keys().collect();
     binding_keys.sort();

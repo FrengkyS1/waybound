@@ -18,6 +18,7 @@ import type { ModSummary } from "../browse/types";
 import { fileToIconDataUrl } from "../home/imageIcon";
 import { PlayButton } from "../play/PlayButton";
 import { usePlayStore } from "../play/store";
+import { useInstallStore } from "../install/installStore";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { SegmentGroup } from "../../components/SegmentGroup";
 import { ConfigEditorModal } from "./ConfigEditorModal";
@@ -688,6 +689,28 @@ function ContentTab({
     null,
   );
 
+  const [removeTarget, setRemoveTarget] = useState<{
+    category: ContentCategory;
+    fileName: string;
+  } | null>(null);
+
+  function confirmRemove() {
+    if (!removeTarget) return;
+    const { category, fileName } = removeTarget;
+    setRemoveTarget(null);
+    void act(
+      () => dropEntry(category, fileName),
+      async () => {
+        await removeContentFile(instance.id, category, fileName);
+        // The instance's own mod-count stat (Overview page, My Instances
+        // card) is a separate fetch keyed off this same tick elsewhere in
+        // the app — without bumping it here, Remove looked like it silently
+        // failed to update anything outside this list until a full reload.
+        useInstallStore.setState((s) => ({ refreshTick: s.refreshTick + 1 }));
+      },
+    );
+  }
+
   const term = search.trim().toLowerCase();
   const visible = groups
     .filter((g) => filter === "all" || g.category === filter)
@@ -880,15 +903,7 @@ function ContentTab({
                       disabled={busy}
                       aria-label={`Remove ${entry.fileName}`}
                       onClick={() =>
-                        void act(
-                          () => dropEntry(group.category, entry.fileName),
-                          () =>
-                            removeContentFile(
-                              instance.id,
-                              group.category,
-                              entry.fileName,
-                            ),
-                        )
+                        setRemoveTarget({ category: group.category, fileName: entry.fileName })
                       }
                     >
                       Remove
@@ -908,6 +923,17 @@ function ContentTab({
           fileName={configTarget.fileName}
           modLabel={configTarget.label}
           onClose={() => setConfigTarget(null)}
+        />
+      )}
+
+      {removeTarget && (
+        <ConfirmDialog
+          title="Remove this?"
+          message={`Remove "${removeTarget.fileName}"? This deletes the file from the instance.`}
+          confirmLabel="Remove"
+          danger
+          onConfirm={confirmRemove}
+          onCancel={() => setRemoveTarget(null)}
         />
       )}
     </div>

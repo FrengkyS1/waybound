@@ -9,6 +9,13 @@ import {
 } from "../play/api";
 import styles from "./InstancePage.module.css";
 
+// Matches the backend's own clamp bounds for the global setting — a typed
+// value bigger than u32::MAX fails at the Tauri IPC boundary itself (before
+// any backend clamp runs), so this needs to happen before the value is ever
+// sent.
+const MIN_MEMORY_MB = 512;
+const MAX_MEMORY_MB = 32768;
+
 interface LaunchOverridesProps {
   instanceId: string;
 }
@@ -50,7 +57,9 @@ export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
     try {
       await setInstanceLaunchConfig(instanceId, {
         javaPath: javaChoice === "global" ? null : javaChoice,
-        maxMemoryMb: memory.trim() ? Number(memory) : null,
+        maxMemoryMb: memory.trim()
+          ? Math.min(Math.max(Number(memory), MIN_MEMORY_MB), MAX_MEMORY_MB)
+          : null,
         jvmArgs: jvmArgs.trim() || null,
       });
       showMessage("Instance launch overrides saved.");

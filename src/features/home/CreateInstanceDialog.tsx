@@ -126,6 +126,7 @@ export function CreateInstanceDialog({
                 autoFocus
                 required
                 minLength={2}
+                maxLength={100}
               />
             </label>
           </div>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FilterBar } from "./components/FilterBar";
 import { ModRow } from "./components/ModRow";
 import { ProjectDetailPage } from "./components/ProjectDetailPage";
@@ -44,6 +44,16 @@ export function BrowsePage({
   const nextPage = useBrowseStore((s) => s.nextPage);
   const prevPage = useBrowseStore((s) => s.prevPage);
   const [selected, setSelected] = useState<ModSummary | null>(initialMod);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Without this, Next/Prev swapped in a new page while the list stayed
+  // scrolled wherever it was — landing the user mid-list on the new page
+  // instead of its top, and (since the rows use native `loading="lazy"`)
+  // leaving images that never crossed into view via an actual scroll
+  // permanently undetected by the browser's lazy-load heuristic.
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: 0 });
+  }, [offset]);
 
   const pageStart = totalHits === 0 ? 0 : offset + 1;
   // Cross-source dedup can merge two full pages' worth of hits into fewer
@@ -146,7 +156,7 @@ export function BrowsePage({
         </div>
       )}
 
-      <div className={styles.list} role="list">
+      <div className={styles.list} role="list" ref={listRef}>
         {!loading && results.length === 0 && !error && (
           <div className={styles.empty}>
             <p className={styles.emptyTitle}>No results</p>

@@ -3,7 +3,7 @@ pub use instances::CachedContentMeta;
 
 use crate::dto::ModSummary;
 use rusqlite::{params, Connection};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -35,6 +35,34 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
+        match Self::open_at(&path) {
+            Ok(db) => Ok(db),
+            Err(err) => {
+                // A corrupted library.db (crash mid-write, truncated file,
+                // disk full, ...) used to `?` straight out of here into an
+                // `.expect()` in lib.rs, panicking before any window ever
+                // opened — a GUI app's console output goes nowhere, so the
+                // user just saw it silently fail to launch. There's no way
+                // to automatically salvage a genuinely corrupt SQLite file,
+                // so back it up (in case manual recovery is ever worth
+                // attempting) and start fresh instead of refusing to launch.
+                let mut backup = path.as_os_str().to_os_string();
+                backup.push(".bak");
+                let _ = std::fs::rename(&path, PathBuf::from(&backup));
+                crate::activity::append_log(
+                    &format!(
+                        "library.db was unreadable ({err}) — backed up to {} and started a fresh database",
+                        PathBuf::from(&backup).display()
+                    ),
+                    "warn",
+                    None,
+                );
+                Self::open_at(&path)
+            }
+        }
+    }
+
+    fn open_at(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "
@@ -117,9 +145,24 @@ impl Database {
             "ALTER TABLE instances ADD COLUMN last_played INTEGER",
             "ALTER TABLE instances ADD COLUMN total_play_seconds INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE instance_mods ADD COLUMN icon_url TEXT",
+            "ALTER TABLE content_meta_cache ADD COLUMN written_version TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = conn.execute(stmt, []);
         }
+
+        // Every cache row this version writes is prefixed/tagged with its
+        // own version (see `cache_key_prefix`/`APP_VERSION`) — anything left
+        // over from a previous version was computed by different processing
+        // logic and is never read back under the new version anyway, so it
+        // would just sit here forever without this.
+        let _ = conn.execute(
+            "DELETE FROM search_cache WHERE cache_key NOT LIKE ?1",
+            params![format!("{}%", cache_key_prefix())],
+        );
+        let _ = conn.execute(
+            "DELETE FROM content_meta_cache WHERE written_version != ?1",
+            params![APP_VERSION],
+        );
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -253,6 +296,19 @@ impl CachedSearch {
     }
 }
 
+/// Shared by every cache that stores the *result of Waybound's own
+/// processing* of upstream/on-disk data (icon resolution, jar metadata
+/// parsing, field mapping, ...) rather than a plain copy of it — a bug fix
+/// to that processing can't take effect for anything already cached until
+/// it expires (or, for a cache with no TTL at all, never). Tagging cache
+/// rows with the version that wrote them means a version bump can never
+/// read back a previous version's differently-processed rows.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn cache_key_prefix() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), ":")
+}
+
 pub fn build_search_cache_key(query: &crate::dto::ModSearchQuery, modrinth_only: bool) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -265,7 +321,7 @@ pub fn build_search_cache_key(query: &crate::dto::ModSearchQuery, modrinth_only:
     query.offset.hash(&mut hasher);
     query.limit.hash(&mut hasher);
     modrinth_only.hash(&mut hasher);
-    format!("search:{:x}", hasher.finish())
+    format!("{}search:{:x}", cache_key_prefix(), hasher.finish())
 }
 
 fn db_path() -> Result<PathBuf, DbError> {

@@ -180,7 +180,12 @@ fn probe_java(path: &Path) -> Option<JavaRuntime> {
     let first_line = text.lines().next().unwrap_or("").trim().to_string();
     let major = parse_major_version(&text)?;
     Some(JavaRuntime {
-        path: path.to_string_lossy().to_string(),
+        // A `JAVA_HOME` set with forward slashes (common even on Windows)
+        // combines with this module's own `.join()` calls' native backslash
+        // separator into a visibly inconsistent path — re-collecting through
+        // `Component`s normalizes every separator to the platform's own,
+        // since `Path` treats both as equivalent boundaries when parsing.
+        path: path.components().collect::<PathBuf>().to_string_lossy().to_string(),
         major_version: major,
         version_string: first_line,
     })

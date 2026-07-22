@@ -500,9 +500,7 @@ impl CurseForgeClient {
             .data
             .into_iter()
             .map(|m| {
-                let icon = m
-                    .logo
-                    .and_then(|logo| logo.thumbnail_url.or(logo.url));
+                let icon = logo_icon_url(m.logo);
                 let website_url = m.links.and_then(|l| l.website_url);
                 (m.id, (m.name, m.slug, icon, website_url))
             })
@@ -563,6 +561,26 @@ impl CurseForgeClient {
             .error_for_status()?;
         let payload: CurseForgeApiResponse<CurseForgeModDetail> = response.json().await?;
         let item = payload.data;
+
+        // The mod-info endpoint above only ever carries `summary` (a one-line
+        // tagline) — CurseForge's actual long-form description lives behind
+        // this separate endpoint entirely. Best-effort: falling back to the
+        // tagline here just means a shorter Overview, not a failed page load.
+        let full_description = async {
+            let response = self
+                .http
+                .get(format!("{BASE_URL}/mods/{mod_id}/description"))
+                .header("x-api-key", api_key)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let payload: CurseForgeApiResponse<String> = response.json().await.ok()?;
+            Some(payload.data).filter(|d| !d.is_empty())
+        }
+        .await;
 
         let files_response = self
             .http
@@ -627,7 +645,7 @@ impl CurseForgeClient {
 
         Ok(ModDetail {
             summary: updated_summary.clone(),
-            body: item.description,
+            body: full_description.unwrap_or(item.description),
             body_format: BodyFormat::Html,
             categories: item
                 .categories
@@ -1027,7 +1045,7 @@ fn map_mod(item: CurseForgeMod) -> ModSummary {
             .first()
             .map(|author| author.name.clone())
             .unwrap_or_else(|| "Unknown".to_string()),
-        icon_url: item.logo.and_then(|logo| logo.thumbnail_url.or(logo.url)),
+        icon_url: logo_icon_url(item.logo),
         downloads: item.download_count as u64,
         project_type: content_type_from_class_id(item.class_id),
         loaders: ModLoader::from_curseforge_categories(&item.categories),
@@ -1254,6 +1272,15 @@ struct CurseForgeLogo {
     thumbnail_url: Option<String>,
 }
 
+/// Prefers the thumbnail, falling back to the full-size logo — but some
+/// CurseForge projects (mostly modpacks, seen so far) report `thumbnailUrl`
+/// as `Some("")` rather than `null`, and a plain `.or()` only falls through
+/// on `None`. Without filtering the empty string out first, those projects'
+/// icons resolve to an unusable blank string instead of the real `url`.
+fn logo_icon_url(logo: Option<CurseForgeLogo>) -> Option<String> {
+    logo.and_then(|l| l.thumbnail_url.filter(|s| !s.is_empty()).or(l.url))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeAuthor {
@@ -1311,5 +1338,41 @@ mod distribution_restriction_tests {
     #[test]
     fn empty_hash_list_returns_none() {
         assert_eq!(sha1_of(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod logo_icon_url_tests {
+    use super::{logo_icon_url, CurseForgeLogo};
+
+    #[test]
+    fn prefers_thumbnail_when_present() {
+        let logo = CurseForgeLogo {
+            url: Some("https://example.com/full.png".to_string()),
+            thumbnail_url: Some("https://example.com/thumb.png".to_string()),
+        };
+        assert_eq!(logo_icon_url(Some(logo)).as_deref(), Some("https://example.com/thumb.png"));
+    }
+
+    #[test]
+    fn falls_back_to_full_logo_when_thumbnail_is_empty_string() {
+        // Real shape seen from CurseForge for some modpacks: thumbnailUrl is
+        // `""`, not `null` — a plain `.or()` never falls through for that.
+        let logo = CurseForgeLogo {
+            url: Some("https://example.com/full.png".to_string()),
+            thumbnail_url: Some(String::new()),
+        };
+        assert_eq!(logo_icon_url(Some(logo)).as_deref(), Some("https://example.com/full.png"));
+    }
+
+    #[test]
+    fn falls_back_to_full_logo_when_thumbnail_is_absent() {
+        let logo = CurseForgeLogo { url: Some("https://example.com/full.png".to_string()), thumbnail_url: None };
+        assert_eq!(logo_icon_url(Some(logo)).as_deref(), Some("https://example.com/full.png"));
+    }
+
+    #[test]
+    fn no_logo_returns_none() {
+        assert_eq!(logo_icon_url(None), None);
     }
 }

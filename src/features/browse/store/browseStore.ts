@@ -102,9 +102,21 @@ export const useBrowseStore = create<BrowseState>((set, get) => ({
       // more-recent results.
       if (requestId !== latestSearchId) return;
 
+      // `totalHits` is the sum of both sources' *raw* result counts, computed
+      // before cross-source dedupe and the loader filter both thin the
+      // actual hits down — paging toward the end of a filtered search can
+      // land on a page the backend correctly reports as empty while that
+      // inflated total still claims more pages exist. Once that happens,
+      // clamp the total down to here so "Next" correctly disables instead
+      // of offering another guaranteed-empty page.
+      const totalHits =
+        result.hits.length === 0 && result.offset > 0
+          ? result.offset
+          : result.totalHits;
+
       set({
         results: result.hits,
-        totalHits: result.totalHits,
+        totalHits,
         offset: result.offset,
         limit: result.limit,
         loading: false,

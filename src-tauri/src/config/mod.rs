@@ -84,7 +84,31 @@ impl ConfigStore {
         let path = config_path()?;
         let inner = if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            toml::from_str(&raw).map_err(|err| ConfigError::Parse(err.to_string()))?
+            match toml::from_str(&raw) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    // A truncated/corrupted config.toml (crash mid-write, disk
+                    // full, antivirus lock, ...) used to `?` straight out of
+                    // here into an `.expect()` in lib.rs, panicking before any
+                    // window ever opened — a GUI app's console output goes
+                    // nowhere, so the user just saw it silently fail to
+                    // launch, with no way back short of manually finding and
+                    // deleting this file. Back it up (in case anything in it
+                    // is worth recovering by hand) and start fresh instead.
+                    let mut backup = path.as_os_str().to_os_string();
+                    backup.push(".bak");
+                    let _ = fs::rename(&path, PathBuf::from(&backup));
+                    crate::activity::append_log(
+                        &format!(
+                            "config.toml was invalid ({err}) — backed up to {} and reset to defaults",
+                            PathBuf::from(&backup).display()
+                        ),
+                        "warn",
+                        None,
+                    );
+                    AppConfigFile::default()
+                }
+            }
         } else {
             AppConfigFile::default()
         };

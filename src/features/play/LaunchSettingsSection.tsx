@@ -14,6 +14,13 @@ import styles from "./LaunchSettingsSection.module.css";
 // Flat sensible default for the global setting; modpack installs auto-scale
 // past this based on mod count (see recommended_memory_mb on the Rust side).
 const RECOMMENDED_MEMORY_MB = 4096;
+// Matches the backend's own clamp in config/mod.rs — that clamp runs after
+// Tauri's IPC layer has already deserialized this into a Rust `u32`, so a
+// value bigger than u32::MAX (e.g. 20 typed digits) fails at the IPC
+// boundary itself with a raw serde error, before the backend ever gets a
+// chance to clamp it. Clamping here first means that path is never reached.
+const MIN_MEMORY_MB = 512;
+const MAX_MEMORY_MB = 32768;
 
 export function LaunchSettingsSection() {
   const account = usePlayStore((s) => s.account);
@@ -49,7 +56,7 @@ export function LaunchSettingsSection() {
     try {
       await saveLaunchSettings(
         javaChoice === "auto" ? null : javaChoice,
-        Number(memory) || RECOMMENDED_MEMORY_MB,
+        Math.min(Math.max(Number(memory) || RECOMMENDED_MEMORY_MB, MIN_MEMORY_MB), MAX_MEMORY_MB),
         jvmArgs.trim() || null,
       );
       await refresh();

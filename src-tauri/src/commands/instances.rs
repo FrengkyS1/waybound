@@ -3,6 +3,7 @@ use crate::dto::instance::{
     InstanceSummary, MissingMod,
 };
 use crate::dto::{ContentType, ModSource, ModSummary};
+use crate::download::safe_join;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
@@ -111,6 +112,12 @@ pub fn rename_instance(
     let name = name.trim();
     if name.len() < 2 {
         return Err("Instance name must be at least 2 characters.".to_string());
+    }
+    if name.chars().count() > crate::instances::MAX_INSTANCE_NAME_LEN {
+        return Err(format!(
+            "Instance name must be {} characters or fewer.",
+            crate::instances::MAX_INSTANCE_NAME_LEN
+        ));
     }
     state.db.rename_instance(&instance_id, name).map_err(|err| {
         // The name column is UNIQUE; surface a clear message on collision.
@@ -405,7 +412,9 @@ pub async fn update_mod_in_instance(
             // already have overwritten it in place.)
             if result.installed.as_ref().map(|m| m.file_name.as_str()) != Some(file_name.as_str()) {
                 if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
-                    let _ = std::fs::remove_file(root.join("mods").join(&file_name));
+                    if let Ok(old_path) = safe_join(&root.join("mods"), &file_name) {
+                        let _ = std::fs::remove_file(old_path);
+                    }
                 }
             }
             let _ = state.db.delete_content_meta_cache(&instance_id, "mod", &file_name);

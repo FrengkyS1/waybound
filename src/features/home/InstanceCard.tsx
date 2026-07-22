@@ -117,6 +117,7 @@ export function InstanceCard({
             className={styles.nameInput}
             value={nameDraft}
             autoFocus
+            maxLength={100}
             aria-label="Instance name"
             onClick={(e) => e.stopPropagation()}
             onChange={(e) => setNameDraft(e.target.value)}

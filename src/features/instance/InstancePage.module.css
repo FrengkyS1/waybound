@@ -159,6 +159,11 @@
   letter-spacing: -0.02em;
   text-align: left;
   cursor: text;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transition: border-color var(--transition-fast), background var(--transition-fast);
 }
 .name:hover {

@@ -143,6 +143,12 @@ fn project_id_from_download(url: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+// Modrinth documents no hard cap on `/projects?ids=[...]`, but a whole large
+// modpack's worth of ids in one request is exactly the shape that silently
+// lost data on CurseForge's batch endpoints — chunk it the same way rather
+// than assume Modrinth is immune (see BATCH_CHUNK_SIZE in sources/curseforge.rs).
+const PROJECT_LOOKUP_CHUNK_SIZE: usize = 200;
+
 async fn fetch_names_by_ids(
     http: &reqwest::Client,
     ids: &[String],
@@ -150,22 +156,32 @@ async fn fetch_names_by_ids(
     if ids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let ids_json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string());
-    let Ok(response) = http
-        .get(format!("{BASE_URL}/projects"))
-        .query(&[("ids", ids_json.as_str())])
-        .send()
-        .await
-    else {
-        return std::collections::HashMap::new();
-    };
-    let Ok(projects) = response.json::<Vec<ModrinthProjectBrief>>().await else {
-        return std::collections::HashMap::new();
-    };
-    projects
-        .into_iter()
-        .map(|project| (project.id, project.title))
-        .collect()
+    let mut names = std::collections::HashMap::new();
+    for chunk in ids.chunks(PROJECT_LOOKUP_CHUNK_SIZE) {
+        let Ok(ids_json) = serde_json::to_string(chunk) else { continue };
+        let Ok(response) = http
+            .get(format!("{BASE_URL}/projects"))
+            .query(&[("ids", ids_json.as_str())])
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(projects) = response.json::<Vec<ModrinthProjectBrief>>().await else { continue };
+        names.extend(projects.into_iter().map(|project| (project.id, project.title)));
+    }
+    if names.len() < ids.len() {
+        crate::activity::append_log(
+            &format!(
+                "Modrinth project name lookup: requested {} ids, got {} back",
+                ids.len(),
+                names.len()
+            ),
+            "warn",
+            None,
+        );
+    }
+    names
 }
 
 fn items_from_dependencies(
@@ -217,25 +233,7 @@ async fn fetch_project_names(
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    if ids.is_empty() {
-        return std::collections::HashMap::new();
-    }
-    let ids_json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
-    let Ok(response) = http
-        .get(format!("{BASE_URL}/projects"))
-        .query(&[("ids", ids_json.as_str())])
-        .send()
-        .await
-    else {
-        return std::collections::HashMap::new();
-    };
-    let Ok(projects) = response.json::<Vec<ModrinthProjectBrief>>().await else {
-        return std::collections::HashMap::new();
-    };
-    projects
-        .into_iter()
-        .map(|project| (project.id, project.title))
-        .collect()
+    fetch_names_by_ids(http, &ids).await
 }
 
 fn humanize_file_name(file_name: &str) -> String {

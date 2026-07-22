@@ -275,18 +275,28 @@ impl ModrinthClient {
             icon_url: Option<String>,
         }
 
-        let Ok(response) = self
-            .http
-            .post(format!("{BASE_URL}/version_files"))
-            .json(&HashLookupBody { hashes: sha1_hashes, algorithm: "sha1" })
-            .send()
-            .await
-        else {
-            return std::collections::HashMap::new();
-        };
-        let Ok(by_hash) = response.json::<std::collections::HashMap<String, VersionFileLookup>>().await else {
-            return std::collections::HashMap::new();
-        };
+        // Modrinth documents no hard cap on either endpoint below, but a
+        // single request for a whole large modpack's worth of hashes/ids is
+        // exactly the shape that silently lost data on CurseForge's batch
+        // endpoints (see BATCH_CHUNK_SIZE in sources/curseforge.rs) — chunk
+        // both requests the same way rather than assume Modrinth is immune.
+        const CHUNK_SIZE: usize = 200;
+
+        let mut by_hash: std::collections::HashMap<String, VersionFileLookup> = std::collections::HashMap::new();
+        for chunk in sha1_hashes.chunks(CHUNK_SIZE) {
+            let Ok(response) = self
+                .http
+                .post(format!("{BASE_URL}/version_files"))
+                .json(&HashLookupBody { hashes: chunk, algorithm: "sha1" })
+                .send()
+                .await
+            else {
+                continue;
+            };
+            if let Ok(part) = response.json::<std::collections::HashMap<String, VersionFileLookup>>().await {
+                by_hash.extend(part);
+            }
+        }
 
         let mut project_ids: Vec<&str> = by_hash.values().map(|v| v.project_id.as_str()).collect();
         project_ids.sort_unstable();
@@ -295,30 +305,38 @@ impl ModrinthClient {
             return std::collections::HashMap::new();
         }
 
-        let Ok(ids_json) = serde_json::to_string(&project_ids) else {
-            return std::collections::HashMap::new();
-        };
-        let Ok(response) = self
-            .http
-            .get(format!("{BASE_URL}/projects"))
-            .query(&[("ids", ids_json.as_str())])
-            .send()
-            .await
-        else {
-            return std::collections::HashMap::new();
-        };
-        let Ok(projects) = response.json::<Vec<ProjectLookup>>().await else {
-            return std::collections::HashMap::new();
-        };
-        let project_meta: std::collections::HashMap<String, ModrinthProjectMeta> = projects
-            .into_iter()
-            .map(|p| {
+        let mut project_meta: std::collections::HashMap<String, ModrinthProjectMeta> = std::collections::HashMap::new();
+        for chunk in project_ids.chunks(CHUNK_SIZE) {
+            let Ok(ids_json) = serde_json::to_string(chunk) else { continue };
+            let Ok(response) = self
+                .http
+                .get(format!("{BASE_URL}/projects"))
+                .query(&[("ids", ids_json.as_str())])
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(projects) = response.json::<Vec<ProjectLookup>>().await else { continue };
+            project_meta.extend(projects.into_iter().map(|p| {
                 (
                     p.id.clone(),
                     ModrinthProjectMeta { project_id: p.id, name: p.title, icon: p.icon_url },
                 )
-            })
-            .collect();
+            }));
+        }
+
+        if project_meta.len() < project_ids.len() {
+            crate::activity::append_log(
+                &format!(
+                    "Modrinth project_meta_by_sha1: requested {} project ids, got metadata for {} — some names/icons may fall back to filenames",
+                    project_ids.len(),
+                    project_meta.len()
+                ),
+                "warn",
+                None,
+            );
+        }
 
         by_hash
             .into_iter()
@@ -401,7 +419,7 @@ fn sort_to_index(sort: SortIndex) -> &'static str {
         SortIndex::Relevance => "relevance",
         SortIndex::Downloads => "downloads",
         SortIndex::Updated => "updated",
-        SortIndex::New => "new",
+        SortIndex::New => "newest",
     }
 }
 

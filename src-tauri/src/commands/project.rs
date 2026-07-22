@@ -1,4 +1,5 @@
 use crate::activity;
+use crate::db::cache_key_prefix;
 use crate::dto::project_detail::{
     ActivityLogEntry, ModDetail, ModpackContentResponse,
 };
@@ -99,7 +100,7 @@ async fn get_modpack_content_inner(
         // A published version's file list never changes, so cache it
         // indefinitely — repeat views (the slow part is downloading the whole
         // .mrpack just to read its file index) become instant.
-        let cache_key = format!("modpackcontent:{}:{version}", summary.uid);
+        let cache_key = format!("{}modpackcontent:{}:{version}", cache_key_prefix(), summary.uid);
         if let Ok(Some((json, _))) = state.db.get_cached_json(&cache_key) {
             if let Ok(cached) = serde_json::from_str(&json) {
                 return Ok(cached);
@@ -135,7 +136,7 @@ async fn get_modpack_content_inner(
             }
         };
 
-        let cache_key = format!("modpackcontent:{}:{file_id}", summary.uid);
+        let cache_key = format!("{}modpackcontent:{}:{file_id}", cache_key_prefix(), summary.uid);
         if let Ok(Some((json, _))) = state.db.get_cached_json(&cache_key) {
             if let Ok(cached) = serde_json::from_str(&json) {
                 return Ok(cached);

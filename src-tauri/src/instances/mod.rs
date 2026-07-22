@@ -19,6 +19,13 @@ use crate::download::{
 };
 use base64::Engine;
 
+/// An instance's display name (not the on-disk slug, which is separately
+/// truncated to 60 chars) had no upper bound at all — a several-hundred
+/// character name overflowed the instance header, the install-confirmation
+/// toast, and the instance picker dropdown. 100 is generous for any real
+/// pack/profile name while keeping every one of those layouts intact.
+pub(crate) const MAX_INSTANCE_NAME_LEN: usize = 100;
+
 use crate::dto::instance::{InstallModResult, InstalledMod, InstanceSummary};
 
 use crate::dto::{ContentType, ModLoader, ModSource, ModSummary};
@@ -173,7 +180,7 @@ impl InstanceService {
 
         let name = name.trim();
 
-        if name.len() < 2 {
+        if name.len() < 2 || name.chars().count() > MAX_INSTANCE_NAME_LEN {
 
             return Err(InstanceError::InvalidName);
 
