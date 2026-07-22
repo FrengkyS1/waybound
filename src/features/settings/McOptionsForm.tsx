@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 
 import type { McOptions } from "./types";
 import { KEY_BINDING_LABELS } from "./mcOptionsDefaults";
@@ -55,6 +55,8 @@ export function SliderField({
   disabled?: boolean;
   display?: string;
 }) {
+  const percent = max > min ? ((value - min) / (max - min)) * 100 : 0;
+
   return (
     <label className={styles.sliderRow}>
       <div className={styles.sliderHead}>
@@ -68,6 +70,7 @@ export function SliderField({
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(Number(e.target.value))}
+        style={{ "--fill": `${percent}%` } as CSSProperties}
       />
     </label>
   );

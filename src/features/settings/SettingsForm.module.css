@@ -87,7 +87,11 @@
   height: 4px;
   appearance: none;
   border-radius: 999px;
-  background: var(--color-border);
+  background: linear-gradient(
+    to right,
+    var(--color-accent) var(--fill, 0%),
+    var(--color-border) var(--fill, 0%)
+  );
   accent-color: var(--color-accent);
 }
 

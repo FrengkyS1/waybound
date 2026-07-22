@@ -22,9 +22,21 @@
   min-width: 0;
 }
 
+/* The right column (global game settings) runs far longer than the left
+   (account/launch/CurseForge) — pin the left column in view instead of
+   leaving a tall empty gap beneath it once its own content ends. */
+.left {
+  position: sticky;
+  top: var(--space-4);
+}
+
 @media (max-width: 860px) {
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .left {
+    position: static;
   }
 }
 
