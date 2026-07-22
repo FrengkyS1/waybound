@@ -16,7 +16,7 @@ use tauri::State;
 
 use super::search::AppState;
 
-const DISABLED_SUFFIX: &str = ".disabled";
+pub(crate) const DISABLED_SUFFIX: &str = ".disabled";
 
 /// A mod's own declared display name and embedded icon, read from its jar
 /// metadata in one pass. Best-effort: any missing/unreadable/malformed

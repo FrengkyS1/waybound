@@ -6,6 +6,7 @@ use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::{ModpackError, ModpackImportResult};
+use crate::commands::content::DISABLED_SUFFIX;
 use crate::download::{download_bytes_with_retry, http_client, safe_join, CancelToken, DOWNLOAD_CONCURRENCY};
 use crate::dto::{ContentType, ModLoader, ModSearchQuery, SortIndex};
 use crate::sources::curseforge::CurseForgeClient;
@@ -57,12 +58,22 @@ fn dest_dir_for(filename: &str, bytes: &[u8], mods_dir: &Path, resourcepacks_dir
 /// or "where is this so I can remove it" and doesn't have the file's bytes on
 /// hand to sniff its real type (nothing to download again, or the file
 /// already exists from some earlier run).
+/// Checks both the enabled filename and its `.disabled`-suffixed form — a
+/// mod the user toggled off is renamed on disk, not removed, so treating
+/// only the bare name as "present" made every disabled file look identical
+/// to one that was never installed at all (see `pending_missing_mods`).
 fn find_existing(filename: &str, mods_dir: &Path, resourcepacks_dir: &Path, shaderpacks_dir: &Path) -> Option<PathBuf> {
-    if filename.to_ascii_lowercase().ends_with(".jar") {
-        return safe_join(mods_dir, filename).ok().filter(|p| p.exists());
-    }
-    [resourcepacks_dir, shaderpacks_dir].into_iter().find_map(|dir| {
-        safe_join(dir, filename).ok().filter(|p| p.exists())
+    let disabled_name = format!("{filename}{DISABLED_SUFFIX}");
+    let dirs: &[&Path] = if filename.to_ascii_lowercase().ends_with(".jar") {
+        &[mods_dir]
+    } else {
+        &[resourcepacks_dir, shaderpacks_dir]
+    };
+    dirs.iter().find_map(|dir| {
+        safe_join(dir, filename)
+            .ok()
+            .filter(|p| p.exists())
+            .or_else(|| safe_join(dir, &disabled_name).ok().filter(|p| p.exists()))
     })
 }
 
@@ -849,6 +860,17 @@ mod pack_reconciliation_tests {
 
         assert_eq!(pending.len(), 1, "only the file not yet on disk should be reported");
         assert_eq!(pending[0].filename, "absent.jar");
+    }
+
+    #[test]
+    fn pending_missing_mods_excludes_disabled_files() {
+        let dir = temp_instance_dir("pending-disabled");
+        fs::write(dir.join("mods").join("disabled.jar.disabled"), b"toggled off").unwrap();
+        save_pack_manifest(&dir, &[test_entry(1, 10, "disabled.jar")]);
+
+        let pending = super::pending_missing_mods(&dir);
+
+        assert!(pending.is_empty(), "a merely-disabled mod must not be reported as missing");
     }
 
     #[test]

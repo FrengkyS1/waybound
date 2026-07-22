@@ -19,6 +19,7 @@ import { fileToIconDataUrl } from "../home/imageIcon";
 import { PlayButton } from "../play/PlayButton";
 import { usePlayStore } from "../play/store";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { SegmentGroup } from "../../components/SegmentGroup";
 import { ConfigEditorModal } from "./ConfigEditorModal";
 import { LaunchOverrides } from "./LaunchOverrides";
 import styles from "./InstancePage.module.css";
@@ -462,6 +463,7 @@ function OverviewTab({
 }
 
 type ContentFilter = "all" | "mod" | "resourcepack" | "shaderpack";
+type EnabledFilter = "all" | "enabled" | "disabled";
 
 const CATEGORY_LABEL: Record<ContentCategory, string> = {
   mod: "Mods",
@@ -482,6 +484,7 @@ function ContentTab({
 }) {
   const [content, setContent] = useState<InstanceContent | null>(null);
   const [filter, setFilter] = useState<ContentFilter>("all");
+  const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>("all");
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -576,6 +579,15 @@ function ContentTab({
     shaderpack: content?.shaderPacks.length ?? 0,
   };
   const total = counts.mod + counts.resourcepack + counts.shaderpack;
+
+  // Scoped to the active type filter so switching between Mods/Resource
+  // packs/Shaders keeps these numbers accurate to what's actually on screen.
+  const typeScoped = groups.filter((g) => filter === "all" || g.category === filter).flatMap((g) => g.entries);
+  const enabledCounts = {
+    all: typeScoped.length,
+    enabled: typeScoped.filter((e) => e.enabled).length,
+    disabled: typeScoped.filter((e) => !e.enabled).length,
+  };
 
   const categoryKey: Record<ContentCategory, "mods" | "resourcePacks" | "shaderPacks"> = {
     mod: "mods",
@@ -681,9 +693,11 @@ function ContentTab({
     .filter((g) => filter === "all" || g.category === filter)
     .map((g) => ({
       ...g,
-      entries: term
-        ? g.entries.filter((e) => e.fileName.toLowerCase().includes(term))
-        : g.entries,
+      entries: g.entries
+        .filter((e) =>
+          enabledFilter === "all" ? true : enabledFilter === "enabled" ? e.enabled : !e.enabled,
+        )
+        .filter((e) => (term ? e.fileName.toLowerCase().includes(term) : true)),
     }));
 
   if (content && total === 0) {
@@ -709,26 +723,32 @@ function ContentTab({
   return (
     <div>
       <div className={styles.contentToolbar}>
-        <div
-          className={styles.contentFilters}
-          role="group"
-          aria-label="Filter content by type"
-        >
-          {(
-            ["all", "mod", "resourcepack", "shaderpack"] as ContentFilter[]
-          ).map((f) => (
-            <button
-              key={f}
-              type="button"
-              className={`${styles.chip} ${filter === f ? styles.chipActive : ""}`}
-              aria-pressed={filter === f}
-              onClick={() => setFilter(f)}
-            >
-              {f === "all"
-                ? `All (${total})`
-                : `${CATEGORY_LABEL[f]} (${counts[f]})`}
-            </button>
-          ))}
+        <div className={styles.contentSegments}>
+          <SegmentGroup
+            label="Type"
+            value={filter}
+            options={(["all", "mod", "resourcepack", "shaderpack"] as ContentFilter[]).map((f) => ({
+              value: f,
+              label: f === "all" ? `All (${total})` : `${CATEGORY_LABEL[f]} (${counts[f]})`,
+            }))}
+            onChange={setFilter}
+            compact
+          />
+          <SegmentGroup
+            label="Status"
+            value={enabledFilter}
+            options={(["all", "enabled", "disabled"] as EnabledFilter[]).map((f) => ({
+              value: f,
+              label:
+                f === "all"
+                  ? `All (${enabledCounts.all})`
+                  : f === "enabled"
+                    ? `Enabled (${enabledCounts.enabled})`
+                    : `Disabled (${enabledCounts.disabled})`,
+            }))}
+            onChange={setEnabledFilter}
+            compact
+          />
         </div>
         <input
           type="search"

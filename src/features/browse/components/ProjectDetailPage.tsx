@@ -11,6 +11,7 @@ import { useInstallStore } from "../../install/installStore";
 import type { InstanceInstallTarget } from "../../navigation/types";
 import { isInstallableType, installVerb } from "../detailTypes";
 import type { VersionPrefill } from "../../settings/types";
+import { GalleryLightbox } from "./GalleryLightbox";
 import { InstallTargetDialog } from "./InstallTargetDialog";
 import { MarkdownBody } from "./MarkdownBody";
 import { OverviewBody } from "./OverviewBody";
@@ -76,6 +77,7 @@ export function ProjectDetailPage({
   >();
   const [changelogBody, setChangelogBody] = useState<string | null>(null);
   const [changelogLoading, setChangelogLoading] = useState(false);
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [activityLogs, setActivityLogs] = useState<
     Awaited<ReturnType<typeof fetchActivityLogs>>
   >([]);
@@ -355,13 +357,17 @@ export function ProjectDetailPage({
                           key={`${item.url}-${index}`}
                           className={styles.galleryItem}
                         >
-                          <a href={item.url} target="_blank" rel="noreferrer">
+                          <button
+                            type="button"
+                            className={styles.galleryThumbButton}
+                            onClick={() => setLightboxIndex(index)}
+                          >
                             <img
                               src={item.thumbnailUrl ?? item.url}
                               alt={item.title ?? "Screenshot"}
                               loading="lazy"
                             />
-                          </a>
+                          </button>
                           {(item.title || item.description) && (
                             <figcaption>
                               {item.title && <strong>{item.title}</strong>}
@@ -372,6 +378,14 @@ export function ProjectDetailPage({
                       ))}
                     </div>
                   )}
+
+                {lightboxIndex !== null && (detail?.gallery ?? []).length > 0 && (
+                  <GalleryLightbox
+                    items={detail!.gallery}
+                    initialIndex={lightboxIndex}
+                    onClose={() => setLightboxIndex(null)}
+                  />
+                )}
 
                 {tab === "versions" && (
                   <div className={styles.versionList}>
