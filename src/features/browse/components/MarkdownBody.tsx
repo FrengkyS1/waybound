@@ -1,6 +1,7 @@
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { MarkdownLink } from "./MarkdownLink";
 import styles from "./MarkdownBody.module.css";
 
 interface MarkdownBodyProps {
@@ -16,7 +17,7 @@ export function MarkdownBody({
 
   return (
     <div className={styles.prose}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins} components={{ a: MarkdownLink }}>
         {content}
       </ReactMarkdown>
     </div>

@@ -3,6 +3,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import type { BodyFormat } from "../detailTypes";
+import { MarkdownLink } from "./MarkdownLink";
 import styles from "./MarkdownBody.module.css";
 
 // Mod/modpack descriptions are third-party HTML/markdown from CurseForge and
@@ -54,7 +55,7 @@ function MarkdownBodyInner({
   const rehypePlugins = allowHtml ? [rehypeRaw, rehypeSanitize] : [];
 
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins} components={{ a: MarkdownLink }}>
       {content}
     </ReactMarkdown>
   );
