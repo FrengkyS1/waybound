@@ -358,3 +358,116 @@ mod tests {
         assert_ne!(a, b);
     }
 }
+
+/// Schema-level behaviour of `open_at`: the ALTER TABLE migrations and the
+/// version-based cache pruning that both run on every open. Always against a
+/// throwaway file in the temp dir — never the real `library.db`.
+#[cfg(test)]
+mod schema_tests {
+    use super::{cache_key_prefix, Database, APP_VERSION};
+    use rusqlite::params;
+
+    struct TempDb {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("waybound-schema-test-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.dir.join("library.db")
+        }
+
+        fn open(&self) -> Database {
+            Database::open_at(&self.path()).unwrap()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn migrations_are_idempotent_across_reopens() {
+        let temp = TempDb::new("idempotent");
+        {
+            let db = temp.open();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO instances
+                   (id, name, minecraft_version, loader, root_path, created_at, modpack_version_label)
+                 VALUES ('i1', 'One', '1.20.1', 'forge', 'C:/nowhere', 1, 'Pack 1.0')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Every reopen re-runs the `ALTER TABLE ... ADD COLUMN` migrations,
+        // which are expected to fail harmlessly once the columns exist —
+        // and must not disturb the data already there.
+        for _ in 0..2 {
+            let db = temp.open();
+            let conn = db.conn().unwrap();
+            let label: Option<String> = conn
+                .query_row("SELECT modpack_version_label FROM instances WHERE id = 'i1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(label.as_deref(), Some("Pack 1.0"));
+        }
+    }
+
+    #[test]
+    fn stale_version_cache_rows_are_pruned_on_open() {
+        let temp = TempDb::new("prune");
+        let current_key = format!("{}search:keepme", cache_key_prefix());
+        {
+            let db = temp.open();
+            db.put_cached_json(&current_key, "{\"fresh\":true}").unwrap();
+
+            let conn = db.conn().unwrap();
+            // A row written by some earlier app version: different key prefix,
+            // different written_version.
+            conn.execute(
+                "INSERT INTO search_cache (cache_key, payload_json, fetched_at) VALUES (?1, ?2, ?3)",
+                params!["0.0.0-old:search:dropme", "{}", 0i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_meta_cache
+                   (instance_id, category, file_name, size_bytes, mtime_unix, name, icon, written_version, mod_id)
+                 VALUES ('inst', 'mod', 'stale.jar', 1, 1, 'Stale', NULL, '0.0.0-old', 'stale')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_meta_cache
+                   (instance_id, category, file_name, size_bytes, mtime_unix, name, icon, written_version, mod_id)
+                 VALUES ('inst', 'mod', 'fresh.jar', 1, 1, 'Fresh', NULL, ?1, 'fresh')",
+                params![APP_VERSION],
+            )
+            .unwrap();
+        }
+
+        let db = temp.open();
+        assert!(
+            db.get_cached_json(&current_key).unwrap().is_some(),
+            "current-version search_cache row must survive"
+        );
+        assert!(
+            db.get_cached_json("0.0.0-old:search:dropme").unwrap().is_none(),
+            "previous-version search_cache row must be pruned"
+        );
+
+        let cached = db.get_content_meta_cache("inst").unwrap();
+        let names: Vec<&str> = cached.iter().map(|c| c.file_name.as_str()).collect();
+        assert_eq!(names, vec!["fresh.jar"], "only the current version's rows survive");
+    }
+}

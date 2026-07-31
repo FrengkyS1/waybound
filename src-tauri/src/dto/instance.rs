@@ -215,3 +215,88 @@ impl ModLoader {
         }
     }
 }
+
+#[cfg(test)]
+mod loader_mapping_tests {
+    use super::*;
+
+    const ALL: [ModLoader; 5] = [
+        ModLoader::Fabric,
+        ModLoader::Forge,
+        ModLoader::NeoForge,
+        ModLoader::Quilt,
+        ModLoader::Vanilla,
+    ];
+
+    #[test]
+    fn every_loader_round_trips_through_the_modrinth_slug() {
+        for loader in ALL {
+            assert_eq!(
+                ModLoader::from_modrinth(loader.as_modrinth()),
+                Some(loader),
+                "{loader:?} did not survive as_modrinth -> from_modrinth"
+            );
+        }
+    }
+
+    #[test]
+    fn modrinth_slugs_are_the_exact_strings_the_api_expects() {
+        // These are wire values, not display strings: changing one silently
+        // breaks every Modrinth facet query built from it.
+        assert_eq!(ModLoader::Fabric.as_modrinth(), "fabric");
+        assert_eq!(ModLoader::Forge.as_modrinth(), "forge");
+        assert_eq!(ModLoader::NeoForge.as_modrinth(), "neoforge");
+        assert_eq!(ModLoader::Quilt.as_modrinth(), "quilt");
+        // Vanilla is "minecraft" on Modrinth, not "vanilla".
+        assert_eq!(ModLoader::Vanilla.as_modrinth(), "minecraft");
+    }
+
+    #[test]
+    fn from_modrinth_is_case_sensitive_and_rejects_unknown_slugs() {
+        assert_eq!(ModLoader::from_modrinth("Fabric"), None);
+        assert_eq!(ModLoader::from_modrinth("FABRIC"), None);
+        assert_eq!(ModLoader::from_modrinth("NeoForge"), None);
+        // "vanilla" is the frontend's word, never Modrinth's.
+        assert_eq!(ModLoader::from_modrinth("vanilla"), None);
+        assert_eq!(ModLoader::from_modrinth(""), None);
+        assert_eq!(ModLoader::from_modrinth(" fabric"), None);
+        assert_eq!(ModLoader::from_modrinth("fabric "), None);
+        assert_eq!(ModLoader::from_modrinth("liteloader"), None);
+    }
+
+    #[test]
+    fn curseforge_loader_type_ids_match_the_documented_enum() {
+        assert_eq!(ModLoader::Forge.as_curseforge_loader_type(), 1);
+        assert_eq!(ModLoader::Fabric.as_curseforge_loader_type(), 4);
+        assert_eq!(ModLoader::Quilt.as_curseforge_loader_type(), 5);
+        assert_eq!(ModLoader::NeoForge.as_curseforge_loader_type(), 6);
+        // 0 = "Any" in CurseForge's modLoaderType enum, which is what a
+        // vanilla instance wants: no loader filter at all.
+        assert_eq!(ModLoader::Vanilla.as_curseforge_loader_type(), 0);
+    }
+
+    #[test]
+    fn curseforge_loader_type_ids_are_distinct_per_loader() {
+        let mut ids: Vec<u32> = ALL.iter().map(|l| l.as_curseforge_loader_type()).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "two loaders share a CurseForge type id");
+    }
+
+    #[test]
+    fn loader_serde_representation_is_lowercase() {
+        // The frontend sends/receives these; `neoforge` must not become
+        // `neoForge` if the enum ever gains a rename attribute.
+        for (loader, json) in [
+            (ModLoader::Fabric, "\"fabric\""),
+            (ModLoader::Forge, "\"forge\""),
+            (ModLoader::NeoForge, "\"neoforge\""),
+            (ModLoader::Quilt, "\"quilt\""),
+            (ModLoader::Vanilla, "\"vanilla\""),
+        ] {
+            assert_eq!(serde_json::to_string(&loader).unwrap(), json);
+            assert_eq!(serde_json::from_str::<ModLoader>(json).unwrap(), loader);
+        }
+    }
+}

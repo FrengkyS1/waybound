@@ -206,3 +206,82 @@ fn make_link(path: &Path, target: &str) -> std::io::Result<()> {
 fn make_link(_path: &Path, _target: &str) -> std::io::Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod java_runtime_manifest_tests {
+    use super::{AllManifest, FilesManifest, java_exe_name, os_key};
+
+    #[test]
+    fn os_key_and_exe_name_agree_on_the_build_target() {
+        // These two are derived from the same cfg! flags but in separate
+        // functions — a platform added to one and not the other would
+        // silently download a runtime whose executable is then looked up
+        // under the wrong name.
+        let key = os_key();
+        if cfg!(windows) {
+            assert!(key.starts_with("windows-"), "unexpected key {key}");
+            assert_eq!(java_exe_name(), "java.exe");
+        } else {
+            assert!(!key.starts_with("windows-"), "unexpected key {key}");
+            assert_eq!(java_exe_name(), "java");
+        }
+    }
+
+    #[test]
+    fn parses_all_json_shape_mojang_actually_serves() {
+        // Trimmed to the two fields this code reads, but the nesting
+        // (os -> component -> array) is the real shape.
+        let raw = r#"{
+            "windows-x64": {
+                "java-runtime-delta": [
+                    { "manifest": { "url": "https://example.invalid/delta.json" } }
+                ],
+                "java-runtime-gamma": []
+            }
+        }"#;
+
+        let all: AllManifest = serde_json::from_str(raw).expect("should parse");
+        let delta = &all["windows-x64"]["java-runtime-delta"];
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].manifest.url, "https://example.invalid/delta.json");
+        // A component present but with no builds for this OS is normal, not
+        // an error — the caller has to treat it as "not available here".
+        assert!(all["windows-x64"]["java-runtime-gamma"].is_empty());
+    }
+
+    #[test]
+    fn file_entry_defaults_cover_directories_and_links() {
+        // Directory and link entries legitimately omit `downloads`, and most
+        // file entries omit `executable`. Missing != malformed here; if
+        // these stopped defaulting, every runtime download would fail to
+        // parse partway through.
+        let raw = r#"{
+            "files": {
+                "bin": { "type": "directory" },
+                "bin/java": {
+                    "type": "file",
+                    "executable": true,
+                    "downloads": {
+                        "raw": { "url": "https://example.invalid/java", "sha1": "abc123" }
+                    }
+                },
+                "lib/link": { "type": "link", "target": "../real" }
+            }
+        }"#;
+
+        let manifest: FilesManifest = serde_json::from_str(raw).expect("should parse");
+
+        let dir = &manifest.files["bin"];
+        assert_eq!(dir.kind, "directory");
+        assert!(dir.downloads.is_none());
+        assert!(!dir.executable, "absent `executable` must default to false");
+        assert!(dir.target.is_none());
+
+        let exe = &manifest.files["bin/java"];
+        assert!(exe.executable);
+        let raw_dl = &exe.downloads.as_ref().expect("file entry has downloads").raw;
+        assert_eq!(raw_dl.sha1, "abc123");
+
+        assert_eq!(manifest.files["lib/link"].target.as_deref(), Some("../real"));
+    }
+}

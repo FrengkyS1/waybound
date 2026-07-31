@@ -618,3 +618,73 @@ fn apply_global_mc_options_if_configured(state: &AppState, instance_id: &str) {
 fn map_error(error: InstanceError) -> String {
     error.to_string()
 }
+
+#[cfg(test)]
+mod mod_summary_from_row_tests {
+    use super::mod_summary_from_row;
+    use crate::dto::instance::InstalledMod;
+    use crate::dto::{ContentType, ModSource};
+
+    const NOT_TRACKED: &str = "not tracked";
+
+    fn row(mod_uid: &str) -> InstalledMod {
+        InstalledMod {
+            id: 1,
+            instance_id: "inst".to_string(),
+            mod_uid: mod_uid.to_string(),
+            mod_name: "Some Mod".to_string(),
+            source: ModSource::Curseforge,
+            file_name: "somemod.jar".to_string(),
+            installed_at: 0,
+            icon_url: Some("https://example.invalid/icon.png".to_string()),
+        }
+    }
+
+    #[test]
+    fn resolves_a_curseforge_row_to_its_numeric_project_id() {
+        let summary = mod_summary_from_row(&row("curseforge:238222"), NOT_TRACKED).unwrap();
+        assert_eq!(summary.curseforge_id, Some(238222));
+        assert_eq!(summary.modrinth_id, None);
+        assert_eq!(summary.sources, vec![ModSource::Curseforge]);
+        assert_eq!(summary.project_type, ContentType::Mod);
+        assert_eq!(summary.name, "Some Mod");
+        assert_eq!(summary.icon_url.as_deref(), Some("https://example.invalid/icon.png"));
+    }
+
+    #[test]
+    fn resolves_a_modrinth_row_keeping_its_id_as_an_opaque_string() {
+        // Modrinth ids are base62, not numbers — parsing them would break
+        // every project whose id happens not to be all digits.
+        let summary = mod_summary_from_row(&row("modrinth:AABBccdd"), NOT_TRACKED).unwrap();
+        assert_eq!(summary.modrinth_id.as_deref(), Some("AABBccdd"));
+        assert_eq!(summary.curseforge_id, None);
+        assert_eq!(summary.sources, vec![ModSource::Modrinth]);
+    }
+
+    #[test]
+    fn rejects_untracked_and_unknown_sources_with_the_callers_message() {
+        // `file:` is what a modpack-dropped or hand-added jar is recorded
+        // as; it has no project page, and the caller supplies the wording.
+        for uid in ["file:somemod.jar", "steam:12345", "no-separator"] {
+            let err = mod_summary_from_row(&row(uid), NOT_TRACKED).unwrap_err();
+            assert_eq!(err, NOT_TRACKED, "uid {uid} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_a_curseforge_row_whose_id_is_not_a_number() {
+        // Distinct from "not tracked": the record claims CurseForge but is
+        // corrupt, so the user gets a different, accurate message.
+        let err = mod_summary_from_row(&row("curseforge:not-a-number"), NOT_TRACKED).unwrap_err();
+        assert_ne!(err, NOT_TRACKED);
+        assert!(err.contains("Invalid CurseForge id"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn keeps_only_the_first_separator_so_ids_containing_colons_survive() {
+        // `split_once` (not `split`) matters: a Modrinth id is opaque and a
+        // future one containing ':' must not be silently truncated.
+        let summary = mod_summary_from_row(&row("modrinth:ab:cd"), NOT_TRACKED).unwrap();
+        assert_eq!(summary.modrinth_id.as_deref(), Some("ab:cd"));
+    }
+}

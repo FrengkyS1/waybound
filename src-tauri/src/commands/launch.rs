@@ -482,3 +482,45 @@ struct LaunchExitedEvent {
     instance_id: String,
     code: Option<i32>,
 }
+
+#[cfg(test)]
+mod pid_liveness_tests {
+    use super::is_pid_alive;
+
+    #[test]
+    fn reports_the_current_process_as_alive() {
+        // The one PID we can assert about with certainty: our own. If this
+        // regresses, every instance looks dead on startup and Waybound
+        // happily allows a second concurrent launch into the same world.
+        assert!(is_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn reports_an_exited_process_as_dead() {
+        // Spawn something trivial, reap it, then ask. The inverse failure
+        // (a dead process reported alive) permanently wedges the Play
+        // button on "Running" with no way back short of editing the DB.
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit"]).spawn()
+        } else {
+            std::process::Command::new("true").spawn()
+        }
+        .expect("spawning a trivial process should work");
+
+        let pid = child.id();
+        child.wait().expect("child should exit");
+
+        // Not asserted as a hard invariant of the OS — PIDs are reusable in
+        // principle — but reuse this fast is vanishingly unlikely, and a
+        // flake here still points at something worth looking at.
+        assert!(!is_pid_alive(pid), "pid {pid} was reaped but still reads as alive");
+    }
+
+    #[test]
+    fn treats_an_implausible_pid_as_dead_rather_than_erroring() {
+        // The lookup shells out; a failure to run it must degrade to
+        // "not running" instead of propagating, or startup breaks entirely
+        // on a machine where the helper isn't available.
+        assert!(!is_pid_alive(u32::MAX));
+    }
+}

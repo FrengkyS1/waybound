@@ -261,3 +261,101 @@ pub fn is_mrpack_bytes(bytes: &[u8]) -> bool {
     false
 }
 
+#[cfg(test)]
+mod mrpack_index_tests {
+    use super::{is_mrpack_bytes, read_mrpack_index, should_skip_file};
+    use std::io::Write;
+
+    /// Builds a `.mrpack` in memory — same zip-fixture approach the
+    /// CurseForge importer's tests use, extended to write entry contents.
+    fn mrpack_with(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for (name, contents) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(contents.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    const INDEX_JSON: &str = r#"{
+      "formatVersion": 1,
+      "game": "minecraft",
+      "versionId": "2.1.0",
+      "name": "Ascendra",
+      "files": [
+        {
+          "path": "mods/sodium.jar",
+          "hashes": { "sha1": "aabbcc", "sha512": "ignored" },
+          "downloads": ["https://cdn.modrinth.com/data/AANobbMI/versions/x/sodium.jar"],
+          "fileSize": 123
+        },
+        {
+          "path": "mods/server-only.jar",
+          "downloads": ["https://example.com/s.jar"],
+          "env": { "client": "unsupported", "server": "required" }
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn index_json_round_trips_out_of_an_mrpack() {
+        let bytes = mrpack_with(&[
+            ("modrinth.index.json", INDEX_JSON),
+            ("overrides/config/foo.toml", "a = 1"),
+        ]);
+
+        let index = read_mrpack_index(&bytes).unwrap();
+        assert_eq!(index.name, "Ascendra");
+        assert_eq!(index.version_id, "2.1.0", "`versionId` is what becomes ModpackImportResult::version_label");
+        assert_eq!(index.files.len(), 2);
+        assert_eq!(index.files[0].path, "mods/sodium.jar");
+        assert_eq!(index.files[0].hashes.as_ref().unwrap().sha1, "aabbcc");
+        assert!(index.files[1].hashes.is_none(), "a file with no hashes block is still valid");
+        assert_eq!(index.files[1].env.as_ref().unwrap().client, "unsupported");
+    }
+
+    #[test]
+    fn index_without_optional_fields_still_parses() {
+        let bytes = mrpack_with(&[(
+            "modrinth.index.json",
+            r#"{ "files": [ { "path": "mods/a.jar", "downloads": [] } ] }"#,
+        )]);
+        let index = read_mrpack_index(&bytes).unwrap();
+        assert_eq!(index.name, "");
+        assert_eq!(index.version_id, "", "an absent versionId leaves version_label empty, not an error");
+        assert!(index.files[0].env.is_none());
+    }
+
+    #[test]
+    fn client_unsupported_files_are_skipped() {
+        let index = read_mrpack_index(&mrpack_with(&[("modrinth.index.json", INDEX_JSON)])).unwrap();
+        assert!(!should_skip_file(&index.files[0]), "a file with no env block installs");
+        assert!(should_skip_file(&index.files[1]), "client-unsupported files are server-side only");
+    }
+
+    #[test]
+    fn mrpack_detection_requires_the_index_entry() {
+        assert!(is_mrpack_bytes(&mrpack_with(&[("modrinth.index.json", "{}")])));
+        assert!(!is_mrpack_bytes(&mrpack_with(&[("manifest.json", "{}")])), "a CurseForge pack is not an mrpack");
+        assert!(!is_mrpack_bytes(b"not a zip at all"));
+    }
+
+    #[test]
+    fn a_pack_without_an_index_is_an_error_not_a_panic() {
+        let bytes = mrpack_with(&[("manifest.json", "{}")]);
+        assert!(read_mrpack_index(&bytes).is_err());
+    }
+
+    #[test]
+    fn malformed_index_json_is_an_error() {
+        let bytes = mrpack_with(&[("modrinth.index.json", "{ not json")]);
+        assert!(read_mrpack_index(&bytes).is_err());
+    }
+}
+

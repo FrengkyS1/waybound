@@ -49,3 +49,51 @@ pub fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod account_tests {
+    use super::{now_secs, Account};
+
+    fn account(expires_at: u64) -> Account {
+        Account {
+            uuid: "0123456789abcdef0123456789abcdef".to_string(),
+            username: "Player".to_string(),
+            minecraft_token: "SECRET_MC_TOKEN".to_string(),
+            msa_refresh_token: "SECRET_REFRESH_TOKEN".to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn public_projection_carries_no_credentials() {
+        // `to_public` is the boundary between the stored account and
+        // anything the frontend can see. Asserting on the serialized form
+        // (not just the struct's fields) is deliberate: adding a token
+        // field to `AccountPublic` later would slip past a field-by-field
+        // check but not past this.
+        let public = account(u64::MAX).to_public();
+        let json = serde_json::to_string(&public).expect("serializes");
+
+        assert!(!json.contains("SECRET_MC_TOKEN"), "leaked minecraft token: {json}");
+        assert!(!json.contains("SECRET_REFRESH_TOKEN"), "leaked refresh token: {json}");
+        assert!(json.contains("Player"));
+        assert!(json.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn token_expiring_within_the_minute_counts_as_expired() {
+        // The 60s margin exists so a token that is technically still valid
+        // when checked can't expire mid-launch. Treating it as valid here
+        // is the failure that surfaces as a random "session expired"
+        // partway through starting the game.
+        let now = now_secs();
+        assert!(account(now + 30).is_token_expired(), "30s of validity must not be trusted");
+        assert!(account(now).is_token_expired());
+        assert!(account(now.saturating_sub(3600)).is_token_expired(), "long-past token");
+    }
+
+    #[test]
+    fn comfortably_future_token_is_not_expired() {
+        assert!(!account(now_secs() + 3600).is_token_expired());
+    }
+}

@@ -98,3 +98,120 @@ pub fn merge_onto_parent(child: VersionJson, parent: VersionJson) -> VersionJson
 
     merged
 }
+
+#[cfg(test)]
+mod profile_merge_tests {
+    use super::*;
+    use crate::launch::manifest::{ArgValue, Argument};
+
+    fn json(raw: &str) -> VersionJson {
+        serde_json::from_str(raw).expect("fixture is valid version JSON")
+    }
+
+    fn vanilla() -> VersionJson {
+        json(r#"{
+            "id": "1.20.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+            "assetIndex": { "id": "5", "url": "https://example.invalid/5.json", "sha1": "abc" },
+            "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "deadbeef" } },
+            "libraries": [{ "name": "com.mojang:logging:1.1.1" }],
+            "arguments": { "game": ["--username", "${auth_player_name}"], "jvm": ["-cp", "${classpath}"] }
+        }"#)
+    }
+
+    fn fabric_profile() -> VersionJson {
+        json(r#"{
+            "id": "fabric-loader-0.15.7-1.20.1",
+            "inheritsFrom": "1.20.1",
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "libraries": [
+                { "name": "net.fabricmc:fabric-loader:0.15.7", "url": "https://maven.fabricmc.net/" }
+            ],
+            "arguments": { "game": [], "jvm": ["-DFabricMcEmu=net.minecraft.client.main.Main"] }
+        }"#)
+    }
+
+    #[test]
+    fn the_merged_profile_takes_the_childs_identity_and_stops_inheriting() {
+        let merged = merge_onto_parent(fabric_profile(), vanilla());
+        assert_eq!(merged.id, "fabric-loader-0.15.7-1.20.1");
+        assert!(
+            merged.inherits_from.is_none(),
+            "a merged profile must not be resolved a second time"
+        );
+        assert_eq!(
+            merged.main_class.as_deref(),
+            Some("net.fabricmc.loader.impl.launch.knot.KnotClient")
+        );
+    }
+
+    #[test]
+    fn assets_client_download_and_java_version_still_come_from_vanilla() {
+        let merged = merge_onto_parent(fabric_profile(), vanilla());
+        assert_eq!(merged.asset_index.as_ref().unwrap().id, "5");
+        assert_eq!(
+            merged.downloads.as_ref().unwrap().client.as_ref().unwrap().sha1.as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(merged.java_version.as_ref().unwrap().major_version, Some(17));
+        // The child declared no `type`, so vanilla's survives.
+        assert_eq!(merged.version_type.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn loader_libraries_are_listed_before_vanilla_ones() {
+        let merged = merge_onto_parent(fabric_profile(), vanilla());
+        let names: Vec<&str> = merged.libraries.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["net.fabricmc:fabric-loader:0.15.7", "com.mojang:logging:1.1.1"]);
+    }
+
+    #[test]
+    fn arguments_from_both_sides_are_concatenated_parent_first() {
+        let merged = merge_onto_parent(fabric_profile(), vanilla());
+        let args = merged.arguments.as_ref().unwrap();
+        let jvm: Vec<String> = args
+            .jvm
+            .iter()
+            .map(|a| match a {
+                Argument::Plain(s) => s.clone(),
+                Argument::Conditional { value: ArgValue::Single(s), .. } => s.clone(),
+                Argument::Conditional { value: ArgValue::Many(v), .. } => v.join(" "),
+            })
+            .collect();
+        assert_eq!(jvm, ["-cp", "${classpath}", "-DFabricMcEmu=net.minecraft.client.main.Main"]);
+        assert_eq!(args.game.len(), 2, "vanilla's game args must survive an empty child list");
+    }
+
+    #[test]
+    fn a_child_without_arguments_keeps_the_parents_untouched() {
+        let child = json(r#"{ "id": "child", "inheritsFrom": "1.20.1" }"#);
+        let merged = merge_onto_parent(child, vanilla());
+        let args = merged.arguments.as_ref().unwrap();
+        assert_eq!(args.game.len(), 2);
+        assert_eq!(args.jvm.len(), 2);
+        // No mainClass on the child means vanilla's stays in place.
+        assert_eq!(merged.main_class.as_deref(), Some("net.minecraft.client.main.Main"));
+    }
+
+    #[test]
+    fn a_child_with_arguments_over_a_legacy_parent_without_them_supplies_them() {
+        let parent = json(r#"{ "id": "1.12.2", "minecraftArguments": "--username ${auth_player_name}" }"#);
+        let merged = merge_onto_parent(fabric_profile(), parent);
+        assert!(merged.arguments.is_some());
+        // The parent's legacy string is untouched when the child has none.
+        assert_eq!(
+            merged.minecraft_arguments.as_deref(),
+            Some("--username ${auth_player_name}")
+        );
+    }
+
+    #[test]
+    fn a_childs_legacy_argument_string_replaces_the_parents_wholesale() {
+        let parent = json(r#"{ "id": "1.12.2", "minecraftArguments": "--username ${auth_player_name}" }"#);
+        let child = json(r#"{ "id": "1.12.2-forge", "minecraftArguments": "--tweakClass forge" }"#);
+        let merged = merge_onto_parent(child, parent);
+        assert_eq!(merged.minecraft_arguments.as_deref(), Some("--tweakClass forge"));
+    }
+}

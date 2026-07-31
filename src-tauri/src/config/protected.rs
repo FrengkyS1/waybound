@@ -127,4 +127,24 @@ mod tests {
         assert!(!is_protected("legacy-plain"));
         assert_eq!(reveal("legacy-plain").as_deref(), Some("legacy-plain"));
     }
+
+    #[test]
+    fn a_damaged_blob_reveals_nothing_instead_of_panicking() {
+        // A config.toml edited by hand, truncated, or copied from another
+        // machine: every failure mode must degrade to "no secret stored".
+        assert!(is_protected("dpapi:not-base64!!"));
+        assert_eq!(reveal("dpapi:not-base64!!"), None);
+        assert_eq!(reveal("dpapi:"), None, "empty ciphertext must not decrypt");
+        assert_eq!(reveal("dpapi:AAAAAAAAAAA="), None, "foreign bytes must not decrypt");
+    }
+
+    #[test]
+    fn each_protect_call_produces_a_fresh_blob_for_the_same_secret() {
+        // DPAPI salts every call, so an attacker cannot tell two configs hold
+        // the same key by comparing the stored strings.
+        let a = protect("same-secret").unwrap();
+        let b = protect("same-secret").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(reveal(&a), reveal(&b));
+    }
 }

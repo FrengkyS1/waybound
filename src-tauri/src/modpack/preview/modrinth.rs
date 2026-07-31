@@ -247,3 +247,134 @@ struct ModrinthProjectBrief {
     id: String,
     title: String,
 }
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::sources::modrinth::ModrinthVersionDependency;
+
+    /// Download URLs deliberately carry no `/data/<projectId>/` segment, so
+    /// `build_items_from_index` resolves zero project ids and
+    /// `fetch_names_by_ids` returns early without any HTTP call — everything
+    /// here stays offline.
+    fn index_from_json(json: &str) -> crate::modpack::modrinth::ModrinthPackIndex {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn project_id_is_extracted_from_cdn_download_urls() {
+        assert_eq!(
+            project_id_from_download("https://cdn.modrinth.com/data/P7dR8mSH/versions/abc/fabric-api.jar")
+                .as_deref(),
+            Some("P7dR8mSH")
+        );
+        assert!(project_id_from_download("https://example.com/mods/thing.jar").is_none());
+        assert!(project_id_from_download("https://cdn.modrinth.com/data//versions/x").is_none());
+        assert!(project_id_from_download("").is_none());
+    }
+
+    #[test]
+    fn file_names_are_humanized_when_no_project_name_resolves() {
+        assert_eq!(humanize_file_name("sodium-fabric-0.5.jar"), "sodium fabric 0.5");
+        assert_eq!(humanize_file_name("some_mod.jar"), "some mod");
+        assert_eq!(humanize_file_name("plain.zip"), "plain.zip");
+    }
+
+    #[tokio::test]
+    async fn items_are_built_from_the_index_with_dedupe_and_skips() {
+        let index = index_from_json(
+            r#"{
+              "name": "Test Pack",
+              "versionId": "1.2.3",
+              "files": [
+                { "path": "mods/alpha.jar", "downloads": ["https://example.com/alpha.jar"] },
+                { "path": "mods/ALPHA.jar", "downloads": ["https://example.com/alpha2.jar"] },
+                { "path": "shaderpacks/bsl.zip", "downloads": ["https://example.com/bsl.zip"] },
+                { "path": "resourcepacks/faithful.zip", "downloads": ["https://example.com/f.zip"],
+                  "env": { "client": "optional", "server": "unsupported" } },
+                { "path": "mods/server-only.jar", "downloads": ["https://example.com/s.jar"],
+                  "env": { "client": "unsupported", "server": "required" } },
+                { "path": "overrides/config/foo.toml", "downloads": ["https://example.com/foo.toml"] },
+                { "path": "nested.mrpack", "downloads": ["https://example.com/nested.mrpack"] },
+                { "path": "", "downloads": ["https://example.com/empty"] }
+              ]
+            }"#,
+        );
+
+        let http = http_client().unwrap();
+        let items = build_items_from_index(&http, "ver1", &index).await;
+
+        let names: Vec<&str> = items.iter().map(|i| i.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha.jar", "bsl.zip", "faithful.zip"],
+            "case-insensitive dedupe, plus skips for overrides/unsupported/.mrpack/empty paths"
+        );
+
+        assert_eq!(items[0].kind, ModpackContentKind::Mod);
+        assert_eq!(items[1].kind, ModpackContentKind::Shader);
+        assert_eq!(items[2].kind, ModpackContentKind::Resourcepack);
+
+        // No project id resolvable from these URLs -> humanized filename.
+        assert_eq!(items[0].name, "alpha");
+        assert_eq!(items[0].id, "ver1-file-0", "id keeps the index position, not the item position");
+
+        assert!(items[0].required, "no env block means required");
+        assert!(!items[2].required, "env.client = optional means not required");
+        assert_eq!(items[2].env_client.as_deref(), Some("optional"));
+        assert_eq!(items[2].env_server.as_deref(), Some("unsupported"));
+
+        let counts = count_by_kind(&items);
+        assert_eq!((counts.mods, counts.shaders, counts.resourcepacks), (1, 1, 1));
+    }
+
+    #[test]
+    fn dependency_fallback_only_maps_embedded_entries() {
+        let deps = vec![
+            ModrinthVersionDependency {
+                project_id: Some("AABBCCDD".to_string()),
+                dependency_type: "embedded".to_string(),
+                file_name: Some("sodium.jar".to_string()),
+            },
+            ModrinthVersionDependency {
+                project_id: Some("EEFFGGHH".to_string()),
+                dependency_type: "required".to_string(),
+                file_name: Some("ignored.jar".to_string()),
+            },
+            ModrinthVersionDependency {
+                project_id: None,
+                dependency_type: "embedded".to_string(),
+                file_name: None,
+            },
+        ];
+        let mut names = std::collections::HashMap::new();
+        names.insert("AABBCCDD".to_string(), "Sodium".to_string());
+
+        let items = items_from_dependencies(&deps, &names);
+
+        assert_eq!(items.len(), 2, "non-embedded dependencies are not pack content");
+        assert_eq!(items[0].name, "Sodium");
+        assert_eq!(items[0].id, "dep-AABBCCDD");
+        assert_eq!(items[0].kind, ModpackContentKind::Mod);
+        // No project id and no filename: falls back to a positional label.
+        assert_eq!(items[1].name, "Mod 3");
+        assert_eq!(items[1].id, "dep-file-2");
+        assert_eq!(items[1].kind, ModpackContentKind::Mod);
+    }
+
+    #[test]
+    fn project_lookup_chunks_at_the_documented_boundary() {
+        let chunk_lens = |n: usize| -> Vec<usize> {
+            let ids: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+            ids.chunks(PROJECT_LOOKUP_CHUNK_SIZE).map(|c| c.len()).collect()
+        };
+
+        assert!(chunk_lens(0).is_empty(), "no ids means no requests at all");
+        assert_eq!(chunk_lens(PROJECT_LOOKUP_CHUNK_SIZE - 1), vec![PROJECT_LOOKUP_CHUNK_SIZE - 1]);
+        assert_eq!(chunk_lens(PROJECT_LOOKUP_CHUNK_SIZE), vec![PROJECT_LOOKUP_CHUNK_SIZE]);
+        assert_eq!(chunk_lens(PROJECT_LOOKUP_CHUNK_SIZE + 1), vec![PROJECT_LOOKUP_CHUNK_SIZE, 1]);
+        // Every id lands in exactly one chunk — nothing silently dropped.
+        let n = PROJECT_LOOKUP_CHUNK_SIZE * 2 + 7;
+        assert_eq!(chunk_lens(n).iter().sum::<usize>(), n);
+    }
+}

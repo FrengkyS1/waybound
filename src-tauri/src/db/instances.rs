@@ -592,3 +592,163 @@ fn parse_source(raw: &str) -> ModSource {
         _ => ModSource::Modrinth,
     }
 }
+
+#[cfg(test)]
+mod instance_db_tests {
+    use super::*;
+
+    /// A throwaway database file in the temp dir, removed when the test ends.
+    /// Never the real `library.db` — `Database::open()` resolves the user's
+    /// app-data path, so these go through `open_at` instead.
+    struct TempDb {
+        dir: std::path::PathBuf,
+        db: Database,
+    }
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("waybound-instance-db-test-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Database::open_at(&dir.join("library.db")).unwrap();
+            Self { dir, db }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn sample_instance(id: &str, name: &str, created_at: u64) -> InstanceSummary {
+        InstanceSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            minecraft_version: "1.20.1".to_string(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.2.0".to_string()),
+            mod_count: 0,
+            created_at,
+            // Deliberately nonexistent: `mod_count` is recounted from disk on
+            // read, so this must come back as 0 rather than error.
+            root_path: format!("C:/waybound-test-nonexistent/{id}"),
+            icon: None,
+            last_played: None,
+            total_play_seconds: 0,
+            modpack_version_label: None,
+        }
+    }
+
+    #[test]
+    fn instance_crud_round_trips() {
+        let temp = TempDb::new("crud");
+        let db = &temp.db;
+
+        db.insert_instance(&sample_instance("a", "Alpha", 100)).unwrap();
+        db.insert_instance(&sample_instance("b", "Beta", 200)).unwrap();
+
+        let listed = db.list_instances().unwrap();
+        assert_eq!(listed.len(), 2);
+        // Ordered by created_at DESC.
+        assert_eq!(listed[0].id, "b");
+        assert_eq!(listed[1].id, "a");
+
+        let got = db.get_instance("a").unwrap().expect("inserted instance must be readable");
+        assert_eq!(got.name, "Alpha");
+        assert_eq!(got.minecraft_version, "1.20.1");
+        assert_eq!(got.loader, ModLoader::Forge);
+        assert_eq!(got.loader_version.as_deref(), Some("47.2.0"));
+        assert_eq!(got.created_at, 100);
+        assert_eq!(got.mod_count, 0, "missing mods dir counts as zero, not an error");
+
+        db.rename_instance("a", "Renamed").unwrap();
+        assert_eq!(db.get_instance("a").unwrap().unwrap().name, "Renamed");
+
+        assert!(db.delete_instance("a").unwrap());
+        assert!(db.get_instance("a").unwrap().is_none());
+        assert!(!db.delete_instance("a").unwrap(), "deleting twice reports nothing removed");
+        assert_eq!(db.list_instances().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loader_version_and_modpack_label_round_trip() {
+        let temp = TempDb::new("columns");
+        let db = &temp.db;
+        db.insert_instance(&sample_instance("a", "Alpha", 100)).unwrap();
+
+        db.set_instance_loader_version("a", Some("47.4.14")).unwrap();
+        db.set_modpack_version_label("a", Some("Ascendra-2.1.0")).unwrap();
+
+        let got = db.get_instance("a").unwrap().unwrap();
+        assert_eq!(got.loader_version.as_deref(), Some("47.4.14"));
+        assert_eq!(got.modpack_version_label.as_deref(), Some("Ascendra-2.1.0"));
+        // Same values must survive the list query, which selects the columns
+        // separately from `get_instance`.
+        assert_eq!(
+            db.list_instances().unwrap()[0].modpack_version_label.as_deref(),
+            Some("Ascendra-2.1.0")
+        );
+
+        // `None` clears rather than being ignored.
+        db.set_instance_loader_version("a", None).unwrap();
+        db.set_modpack_version_label("a", None).unwrap();
+        let cleared = db.get_instance("a").unwrap().unwrap();
+        assert!(cleared.loader_version.is_none());
+        assert!(cleared.modpack_version_label.is_none());
+    }
+
+    #[test]
+    fn content_meta_cache_upserts_and_reads_back() {
+        let temp = TempDb::new("meta-cache");
+        let db = &temp.db;
+
+        db.upsert_content_meta_cache("i1", "mod", "jei.jar", 1024, 42, Some("JEI"), Some("data:png"), Some("jei"))
+            .unwrap();
+        db.upsert_content_meta_cache("i1", "resourcepack", "faithful.zip", 2048, 43, None, None, None)
+            .unwrap();
+
+        let mut rows = db.get_content_meta_cache("i1").unwrap();
+        rows.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].file_name, "jei.jar");
+        assert_eq!(rows[1].category, "mod");
+        assert_eq!(rows[1].size_bytes, 1024);
+        assert_eq!(rows[1].mtime_unix, 42);
+        assert_eq!(rows[1].name.as_deref(), Some("JEI"));
+        assert_eq!(rows[1].mod_id.as_deref(), Some("jei"));
+        assert!(rows[0].name.is_none(), "a parse that found nothing is still cached");
+
+        // Same primary key -> update in place, not a duplicate row.
+        db.upsert_content_meta_cache("i1", "mod", "jei.jar", 4096, 99, Some("Just Enough Items"), None, Some("jei2"))
+            .unwrap();
+        assert_eq!(db.get_content_meta_cache("i1").unwrap().len(), 2);
+        assert_eq!(db.get_content_meta_name_by_file("i1", "jei.jar").unwrap().as_deref(), Some("Just Enough Items"));
+        assert_eq!(db.get_content_meta_mod_id_by_file("i1", "jei.jar").unwrap().as_deref(), Some("jei2"));
+
+        // Scoped per instance.
+        assert!(db.get_content_meta_cache("other").unwrap().is_empty());
+        assert!(db.get_content_meta_mod_id_by_file("i1", "nope.jar").unwrap().is_none());
+        // Only the `mod` category is consulted by the by-file lookups.
+        assert!(db.get_content_meta_name_by_file("i1", "faithful.zip").unwrap().is_none());
+
+        db.delete_content_meta_cache("i1", "mod", "jei.jar").unwrap();
+        assert_eq!(db.get_content_meta_cache("i1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn instance_mods_cascade_on_instance_delete() {
+        let temp = TempDb::new("cascade");
+        let db = &temp.db;
+        db.insert_instance(&sample_instance("a", "Alpha", 100)).unwrap();
+        db.insert_instance_mod("a", "modrinth:abc", "JEI", ModSource::Modrinth, "jei.jar", "C:/x/jei.jar", None)
+            .unwrap();
+        assert_eq!(db.list_instance_mods("a").unwrap().len(), 1);
+
+        db.delete_instance("a").unwrap();
+        assert!(
+            db.list_instance_mods("a").unwrap().is_empty(),
+            "ON DELETE CASCADE requires PRAGMA foreign_keys to actually be on"
+        );
+    }
+}
