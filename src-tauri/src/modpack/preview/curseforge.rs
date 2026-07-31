@@ -41,9 +41,9 @@ pub async fn preview_curseforge_modpack(
         .collect();
     let file_ids: Vec<u32> = manifest.files.iter().map(|entry| entry.file_id).collect();
 
-    // Both are single batch requests regardless of pack size — this used to
-    // be one HTTP round trip per file (300+ for a big pack, sequential),
-    // which was the real cost of opening a modpack's content preview.
+    // Both are batched (chunked at 200 ids per request) instead of one HTTP
+    // round trip per file — 300+ sequential requests for a big pack was the
+    // real cost of opening a modpack's content preview.
     let (mod_meta, file_names) = tokio::join!(
         fetch_mods_batch(&http, api_key, &mod_ids),
         client.file_names_batch(&file_ids, api_key),
@@ -94,6 +94,13 @@ pub async fn preview_curseforge_modpack(
     })
 }
 
+/// Matches `BATCH_CHUNK_SIZE` in `sources/curseforge.rs`, for the same
+/// reason: a single `/v1/mods` request carrying a whole large pack's ids
+/// (300+) was observed silently coming back short, with no error. A modpack
+/// preview is exactly the case that exceeds it — every id past the cut
+/// quietly rendered as "Project <id>" instead of its real name.
+const MODS_BATCH_CHUNK_SIZE: usize = 200;
+
 async fn fetch_mods_batch(
     http: &reqwest::Client,
     api_key: &str,
@@ -111,24 +118,41 @@ async fn fetch_mods_batch(
     struct Body<'a> {
         mod_ids: &'a [u32],
     }
-    let Ok(response) = http
-        .post(format!("{BASE_URL}/mods"))
-        .header("x-api-key", api_key)
-        .header("Accept", "application/json")
-        .json(&Body { mod_ids })
-        .send()
-        .await
-    else {
-        return HashMap::new();
-    };
-    let Ok(payload) = response.json::<CfModsResponse>().await else {
-        return HashMap::new();
-    };
-    payload
-        .data
-        .into_iter()
-        .map(|item| (item.id, item))
-        .collect()
+
+    let mut merged: HashMap<u32, CfModBrief> = HashMap::new();
+    for chunk in mod_ids.chunks(MODS_BATCH_CHUNK_SIZE) {
+        let Ok(response) = http
+            .post(format!("{BASE_URL}/mods"))
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .json(&Body { mod_ids: chunk })
+            .send()
+            .await
+        else {
+            // One bad chunk shouldn't cost the whole preview its names —
+            // the rest still resolve, and anything missing falls back to
+            // the same "Project <id>" placeholder as before.
+            continue;
+        };
+        let Ok(payload) = response.json::<CfModsResponse>().await else {
+            continue;
+        };
+        merged.extend(payload.data.into_iter().map(|item| (item.id, item)));
+    }
+
+    if merged.len() < mod_ids.len() {
+        crate::activity::append_log(
+            &format!(
+                "CF modpack preview: requested {} project names, got {} back",
+                mod_ids.len(),
+                merged.len()
+            ),
+            "warn",
+            None,
+        );
+    }
+
+    merged
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,4 +171,43 @@ struct CfModBrief {
 #[derive(Debug, Deserialize)]
 struct CfAuthor {
     name: String,
+}
+
+#[cfg(test)]
+mod mods_batch_chunking_tests {
+    use super::MODS_BATCH_CHUNK_SIZE;
+
+    fn chunk_lens(n: usize) -> Vec<usize> {
+        let ids: Vec<u32> = (0..n as u32).collect();
+        ids.chunks(MODS_BATCH_CHUNK_SIZE).map(|c| c.len()).collect()
+    }
+
+    #[test]
+    fn splits_large_packs_at_the_documented_boundary() {
+        // This call used to send every id in one request. CurseForge answers
+        // an oversized batch by silently returning a short list, so a 200+
+        // mod pack's preview rendered the overflow as "Project <id>" with no
+        // error anywhere. These are the sizes real packs actually land on.
+        assert_eq!(chunk_lens(0), Vec::<usize>::new());
+        assert_eq!(chunk_lens(1), vec![1]);
+        assert_eq!(chunk_lens(MODS_BATCH_CHUNK_SIZE - 1), vec![MODS_BATCH_CHUNK_SIZE - 1]);
+        assert_eq!(chunk_lens(MODS_BATCH_CHUNK_SIZE), vec![MODS_BATCH_CHUNK_SIZE]);
+        assert_eq!(
+            chunk_lens(MODS_BATCH_CHUNK_SIZE + 1),
+            vec![MODS_BATCH_CHUNK_SIZE, 1],
+        );
+
+        // Ascendra-sized: 464 mods must not go out as a single request.
+        let lens = chunk_lens(464);
+        assert!(lens.len() > 1, "a 464-mod pack must be split, got {lens:?}");
+        assert_eq!(lens.iter().sum::<usize>(), 464, "no id may be dropped");
+        assert!(lens.iter().all(|&l| l <= MODS_BATCH_CHUNK_SIZE));
+    }
+
+    #[test]
+    fn chunk_size_is_nonzero() {
+        // `chunks(0)` panics; a well-meaning "make it smaller" edit that
+        // lands on 0 would take down every modpack preview.
+        assert!(MODS_BATCH_CHUNK_SIZE > 0);
+    }
 }

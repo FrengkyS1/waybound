@@ -36,7 +36,7 @@ pub enum ConfigError {
     Parse(String),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppConfigFile {
     #[serde(default)]
@@ -72,6 +72,31 @@ struct AppConfigFile {
 
 fn default_true() -> bool {
     true
+}
+
+// Written out rather than derived: `#[derive(Default)]` would give
+// `apply_default_mc_options_to_new_instances = false`, disagreeing with the
+// `#[serde(default = "default_true")]` above it. `load()` falls back to
+// `Default::default()` for a missing *or* unreadable config, so the derived
+// version meant a fresh install (and any corrupt-config reset) silently
+// started with global game options NOT applied to new instances, while every
+// config file that merely omitted the key got `true`. Same defaults on both
+// paths now; keep them in sync if a field with a non-`Default` serde default
+// is ever added.
+impl Default for AppConfigFile {
+    fn default() -> Self {
+        Self {
+            curseforge_api_key: None,
+            default_mc_options: None,
+            apply_default_mc_options_to_new_instances: default_true(),
+            account: None,
+            account_protected: None,
+            java_path: None,
+            max_memory_mb: None,
+            jvm_args: None,
+            curseforge_login_prompted: false,
+        }
+    }
 }
 
 pub struct ConfigStore {
@@ -372,4 +397,255 @@ impl ConfigStore {
 fn config_path() -> Result<PathBuf, ConfigError> {
     let base = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
     Ok(base.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+}
+
+#[cfg(test)]
+mod config_store_tests {
+    use super::*;
+
+    // `ConfigStore::load()` resolves its own path from `dirs::config_dir()`,
+    // which cannot be redirected, so these tests never call it — running it
+    // would read (and `encrypt_legacy_secrets` would rewrite) the developer's
+    // real `dev.waybound/config.toml`. Everything reachable without that
+    // hardcoded path is exercised against a store pointed at a temp file.
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("waybound-test-config-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn store_at(path: &std::path::Path) -> ConfigStore {
+        ConfigStore {
+            path: path.to_path_buf(),
+            inner: RwLock::new(AppConfigFile::default()),
+        }
+    }
+
+    /// Re-read a persisted file the same way `load()` would, minus the fixed path.
+    fn reload(path: &std::path::Path) -> ConfigStore {
+        let raw = fs::read_to_string(path).unwrap();
+        ConfigStore {
+            path: path.to_path_buf(),
+            inner: RwLock::new(toml::from_str(&raw).unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_curseforge_key_survives_a_save_and_reload() {
+        let dir = temp_dir("cf_key_roundtrip");
+        let path = dir.join("config.toml");
+
+        store_at(&path).set_curseforge_api_key("test-key-abc123".to_string()).unwrap();
+        assert_eq!(
+            reload(&path).stored_curseforge_api_key().as_deref(),
+            Some("test-key-abc123")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_curseforge_key_is_never_written_to_disk_in_the_clear_on_windows() {
+        let dir = temp_dir("cf_key_protected");
+        let path = dir.join("config.toml");
+
+        store_at(&path).set_curseforge_api_key("super-secret-key".to_string()).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+
+        if cfg!(windows) {
+            // DPAPI is available: the file holds `dpapi:<base64>`, not the key.
+            assert!(
+                !raw.contains("super-secret-key"),
+                "the API key was persisted in plaintext:\n{raw}"
+            );
+            assert!(raw.contains("dpapi:"), "expected a DPAPI blob in:\n{raw}");
+        } else {
+            // Documented fallback: no DPAPI off Windows, so plaintext as before.
+            assert!(raw.contains("super-secret-key"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_plaintext_key_on_disk_is_still_readable() {
+        let dir = temp_dir("cf_key_legacy");
+        let path = dir.join("config.toml");
+        // Pre-DPAPI configs stored the raw key; `reveal` passes it through.
+        fs::write(&path, "curseforgeApiKey = \"  legacy-key  \"\n").unwrap();
+
+        // Also covers the trim done by `normalize_curseforge_api_key`.
+        assert_eq!(reload(&path).stored_curseforge_api_key().as_deref(), Some("legacy-key"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_curseforge_key_is_rejected_and_nothing_is_written() {
+        let dir = temp_dir("cf_key_empty");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        assert!(matches!(
+            store.set_curseforge_api_key("   ".to_string()),
+            Err(ConfigError::Parse(_))
+        ));
+        assert!(!path.exists(), "a rejected key must not create a config file");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_the_key_removes_it_from_the_persisted_file() {
+        let dir = temp_dir("cf_key_clear");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        store.set_curseforge_api_key("test-key-abc123".to_string()).unwrap();
+        store.clear_curseforge_api_key().unwrap();
+
+        assert!(!fs::read_to_string(&path).unwrap().contains("curseforgeApiKey"));
+        assert!(reload(&path).stored_curseforge_api_key().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_settings_round_trip_and_blank_strings_become_none() {
+        let dir = temp_dir("launch_settings");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        store
+            .set_launch_settings(
+                Some("C:/java/bin/java.exe".to_string()),
+                Some(4096),
+                Some("   ".to_string()),
+            )
+            .unwrap();
+
+        let reloaded = reload(&path);
+        assert_eq!(reloaded.java_path().as_deref(), Some("C:/java/bin/java.exe"));
+        assert_eq!(reloaded.max_memory_mb(), 4096);
+        assert!(reloaded.jvm_args().is_none(), "whitespace-only jvm args should not persist");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_is_clamped_into_a_launchable_range_on_write_and_read() {
+        let dir = temp_dir("memory_clamp");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        store.set_launch_settings(None, Some(1), None).unwrap();
+        assert_eq!(store.max_memory_mb(), 512);
+        store.set_launch_settings(None, Some(999_999), None).unwrap();
+        assert_eq!(store.max_memory_mb(), 32768);
+        assert_eq!(reload(&path).max_memory_mb(), 32768);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unset_memory_limit_falls_back_to_the_default_heap() {
+        let dir = temp_dir("memory_default");
+        let path = dir.join("config.toml");
+        assert_eq!(store_at(&path).max_memory_mb(), 2048);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_login_prompt_flag_persists_once_marked() {
+        let dir = temp_dir("login_prompt");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        assert!(!store.curseforge_login_prompted());
+        store.mark_curseforge_login_prompted().unwrap();
+        assert!(store.curseforge_login_prompted());
+        assert!(reload(&path).curseforge_login_prompted());
+        // Idempotent: marking again keeps it set.
+        store.mark_curseforge_login_prompted().unwrap();
+        assert!(reload(&path).curseforge_login_prompted());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_creates_the_config_directory_when_it_does_not_exist_yet() {
+        let dir = temp_dir("nested_persist");
+        let path = dir.join("not").join("created").join("yet").join("config.toml");
+
+        store_at(&path).mark_curseforge_login_prompted().unwrap();
+        assert!(path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_config_file_fails_to_parse_rather_than_yielding_junk() {
+        // The precondition for `load()`'s recovery path: this is the exact
+        // shape of a config truncated mid-write, and it must be an Err so the
+        // backup-and-reset branch runs instead of a partial config loading.
+        for corrupt in [
+            "curseforgeApiKey = \"unterminated",
+            "= no key\n",
+            "\u{0}\u{0}\u{0}\u{0}",
+            "maxMemoryMb = \"not a number\"",
+        ] {
+            assert!(
+                toml::from_str::<AppConfigFile>(corrupt).is_err(),
+                "{corrupt:?} should not parse as a config"
+            );
+        }
+        // An empty file is valid, not corrupt — every field is optional.
+        assert!(toml::from_str::<AppConfigFile>("").is_ok());
+    }
+
+    #[test]
+    fn a_missing_config_and_an_empty_config_agree_on_the_mc_options_default() {
+        // `#[serde(default = ...)]` only applies when deserializing, while
+        // `load()` uses `AppConfigFile::default()` for a missing or corrupt
+        // file. With `Default` derived those two disagreed, so "apply my
+        // default options to new instances" was on after any config file was
+        // read but off on first run and after a corrupt-config reset. The
+        // hand-written `impl Default` keeps both paths identical.
+        let from_empty_file: AppConfigFile = toml::from_str("").unwrap();
+        assert!(from_empty_file.apply_default_mc_options_to_new_instances);
+        assert!(AppConfigFile::default().apply_default_mc_options_to_new_instances);
+    }
+
+    #[test]
+    fn every_default_field_matches_between_derive_path_and_deserialize_path() {
+        // Guards the whole struct, not just the one field that regressed:
+        // any future field whose serde default isn't its `Default` value
+        // would reintroduce the same split-brain between a fresh install
+        // and one that has ever written a config.
+        let from_empty_file: AppConfigFile = toml::from_str("").unwrap();
+        let from_default = AppConfigFile::default();
+
+        assert_eq!(
+            toml::to_string(&from_empty_file).unwrap(),
+            toml::to_string(&from_default).unwrap(),
+        );
+    }
+
+    #[test]
+    fn global_mc_options_round_trip_through_the_file() {
+        let dir = temp_dir("mc_options");
+        let path = dir.join("config.toml");
+
+        let store = store_at(&path);
+        assert!(store.global_mc_options().is_none());
+        store.set_global_mc_options(McOptions::default(), false).unwrap();
+
+        let reloaded = reload(&path);
+        assert!(reloaded.global_mc_options().is_some());
+        assert!(!reloaded.apply_global_mc_options_to_new_instances());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
