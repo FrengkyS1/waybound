@@ -69,6 +69,12 @@ pub fn http_client() -> Result<Client, DownloadError> {
     Ok(Client::builder()
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::limited(10))
+        // Only bounds the initial connect/TLS handshake, not the transfer
+        // itself — this client also serves multi-hundred-MB modpack/mod
+        // downloads that legitimately take minutes, so no full `.timeout()`
+        // here. It only stops a server that never answers the connection at
+        // all from hanging the caller forever.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()?)
 }
 

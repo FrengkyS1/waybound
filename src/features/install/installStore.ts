@@ -156,7 +156,23 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
 
   cancel: (id) => void cancelInstall(id).catch(() => {}),
 
-  dismiss: (id) => set((s) => ({ installs: s.installs.filter((e) => e.id !== id) })),
+  // Closing an entry that's still nagging about missing mods must persist
+  // that the same way "Not installing this" does — otherwise the card is
+  // only gone until the next restart, when list_pending_missing_mods
+  // recomputes straight from the on-disk manifest (which this action never
+  // touched) and re-adds an identical entry. Regular install toasts have no
+  // missingMods, so this is a no-op for them.
+  dismiss: (id) => {
+    const entry = get().installs.find((e) => e.id === id);
+    if (entry?.missingMods?.length && entry.instanceId) {
+      const placedNames = new Set(entry.missingModsPlaced ?? []);
+      for (const m of entry.missingMods) {
+        if (placedNames.has(m.name)) continue; // already resolved on disk, nothing to dismiss
+        void dismissMissingModApi(entry.instanceId, m.projectId).catch(() => {});
+      }
+    }
+    set((s) => ({ installs: s.installs.filter((e) => e.id !== id) }));
+  },
 
   startMissingModsDownload: (id) => {
     const entry = get().installs.find((e) => e.id === id);
@@ -237,11 +253,10 @@ void listen<InstallProgressEvent>("install://progress", (event) => {
   }));
 });
 
-// 5s auto-dismiss, same lifetime as the install store's other transient
-// toasts (cancelled-install message, etc.) — long enough to read, short
-// enough not to pile up during an "Open all" batch of several mods landing
-// close together.
-const NOTIFICATION_LIFETIME = 5000;
+// 5s wasn't enough to actually read a mod's name before it vanished. 8s
+// still keeps a big "Open all" batch's toasts from stacking up forever, but
+// gives an individual one a real chance to be read.
+const NOTIFICATION_LIFETIME = 8000;
 
 function pushNotification(text: string) {
   const id =

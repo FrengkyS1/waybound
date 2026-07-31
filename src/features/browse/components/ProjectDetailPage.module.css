@@ -111,8 +111,15 @@
 }
 
 .iconFallback {
-  background: var(--color-surface-raised);
+  /* Same "no icon available" glyph as the instance Content tab's mod rows —
+     a distribution-restricted project's icon lookup can 403 the same way its
+     download does, so this hero icon needs the same clear placeholder. */
+  background-color: var(--color-surface-raised);
   border: 1px solid var(--color-border-subtle);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238c8c8c' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z'/%3E%3Cpath d='M12 3v9M12 12l8-4.5M12 12l-8-4.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 40%;
 }
 
 .heroBody {

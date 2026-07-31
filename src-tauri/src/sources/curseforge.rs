@@ -56,8 +56,16 @@ pub struct CurseForgeClient {
 
 impl CurseForgeClient {
     pub fn new() -> Result<Self, CurseForgeError> {
+        // No timeout here left CurseForge API hiccups (a connection accepted
+        // but never answered) hang the "Loading project…" spinner
+        // indefinitely instead of surfacing an error the existing
+        // try/catch/finally in ProjectDetailPage.tsx could actually clear —
+        // this is a metadata client only (small JSON responses), never a
+        // multi-hundred-MB file transfer, so a hard ceiling is always safe.
         let http = Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { http })
     }
@@ -557,8 +565,39 @@ impl CurseForgeClient {
             .header("x-api-key", api_key)
             .header("Accept", "application/json")
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+
+        // A 403 straight from GetMod (not a file download) means the author
+        // disabled third-party API access for the whole project, not just
+        // downloads — CurseForge will never serve this project's details, no
+        // matter how many times it's retried. Without this check, `?` on
+        // `error_for_status()` below turns it into an opaque
+        // `CurseForgeError::Network(reqwest::Error)` whose message is just
+        // the raw "HTTP status client error (403 Forbidden) for url (...)" —
+        // exactly what a user sees with no explanation of why.
+        //
+        // Deliberately not reusing `is_likely_rate_limit` here: its
+        // "empty body -> probably rate limited" default is tuned for the
+        // search/batch flows, where a burst of calls really is the common
+        // cause. A single GetMod call for one project returning an *empty*
+        // 403 is CurseForge's actual response shape for a distribution-
+        // disabled project (confirmed against real project IDs) — treating
+        // that as "temporary, wait a minute" is actively wrong, since it
+        // never clears no matter how long you wait. Only escalate to the
+        // rate-limit message on concrete evidence of one.
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            let message = if looks_like_rate_limit_block(&body, &headers) {
+                rejection_message(status.as_u16(), &body, &headers)
+            } else {
+                "This mod's page isn't available here — its author has disabled third-party access on CurseForge.".to_string()
+            };
+            return Err(CurseForgeError::Rejected { status: 403, message });
+        }
+
+        let response = response.error_for_status()?;
         let payload: CurseForgeApiResponse<CurseForgeModDetail> = response.json().await?;
         let item = payload.data;
 
@@ -995,6 +1034,30 @@ fn rate_limit_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(2u64.saturating_pow(attempt + 1))
 }
 
+/// Stricter than `is_likely_rate_limit`: only true on concrete rate-limit
+/// evidence (a WAF/CDN block page, explicit wording, or a `Retry-After`
+/// header), never just because the body happened to be empty — an empty
+/// body is what a single-project 403 looks like either way, and defaulting
+/// to "rate limited" there misdiagnoses a permanent per-project restriction
+/// as a transient one.
+fn looks_like_rate_limit_block(body: &str, headers: &reqwest::header::HeaderMap) -> bool {
+    if headers.contains_key("retry-after") {
+        return true;
+    }
+    if headers
+        .get("x-cache")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("Error"))
+    {
+        return true;
+    }
+    if body.contains("<!DOCTYPE") || body.contains("CloudFront") {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("rate") || lower.contains("too many")
+}
+
 fn is_likely_rate_limit(status: u16, body: &str, headers: &reqwest::header::HeaderMap) -> bool {
     if status != 403 {
         return false;
@@ -1014,6 +1077,38 @@ fn is_likely_rate_limit(status: u16, body: &str, headers: &reqwest::header::Head
 
     let lower = body.to_ascii_lowercase();
     lower.contains("rate") || lower.contains("too many")
+}
+
+#[cfg(test)]
+mod rate_limit_classification_tests {
+    use super::looks_like_rate_limit_block;
+    use reqwest::header::HeaderMap;
+
+    #[test]
+    fn empty_body_is_not_treated_as_rate_limit() {
+        // The actual regression: a distribution-restricted project's GetMod
+        // 403 has an empty body too — this must default to "not a rate
+        // limit" (the caller then shows the permanent-restriction message),
+        // unlike the looser `is_likely_rate_limit` used elsewhere.
+        assert!(!looks_like_rate_limit_block("", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn retry_after_header_is_rate_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "60".parse().unwrap());
+        assert!(looks_like_rate_limit_block("", &headers));
+    }
+
+    #[test]
+    fn waf_block_page_is_rate_limit() {
+        assert!(looks_like_rate_limit_block("<!DOCTYPE html>blocked", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn explicit_rate_wording_is_rate_limit() {
+        assert!(looks_like_rate_limit_block("Too many requests", &HeaderMap::new()));
+    }
 }
 
 fn sort_to_field(sort: SortIndex) -> u32 {

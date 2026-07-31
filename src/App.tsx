@@ -88,6 +88,14 @@ function App() {
   function goHome(clearTarget = true) {
     if (clearTarget) {
       clearBrowseContext();
+      // The top-nav "My Instances" link is the only caller that passes
+      // true — `view` is already "home" while browsing an instance's own
+      // sub-pages (HomePage renders the grid vs. detail view internally
+      // off `selectedId`), so without this the click was a no-op: `view`
+      // never changed value, and nothing else cleared the still-selected
+      // instance. `goHome(false)` (returning from Browse to the instance
+      // you were adding mods to) must keep this untouched.
+      setSelectedInstanceId(null);
     }
     setView("home");
   }

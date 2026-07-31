@@ -129,6 +129,58 @@ pub fn rename_instance(
     })
 }
 
+/// Looks up what the loader's own "recommended" build currently is for this
+/// instance's Minecraft version — the exact same lookup `resolve_version`
+/// falls back to at launch time when no build is pinned. `None` for
+/// Fabric/Quilt/Vanilla, which have no equivalent "latest recommended build"
+/// concept in this codebase (Fabric's loader versions have no "recommended"
+/// notion the way Forge/NeoForge's promotions do, and Quilt isn't a
+/// supported launch loader at all).
+#[tauri::command]
+pub async fn get_latest_loader_version(
+    state: State<'_, AppState>,
+    instance_id: String,
+) -> Result<Option<String>, String> {
+    let instance = state
+        .db
+        .get_instance(&instance_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "Instance not found.".to_string())?;
+
+    let client = crate::download::http_client().map_err(|err| err.to_string())?;
+    match instance.loader {
+        crate::dto::ModLoader::Forge => {
+            crate::launch::forge::latest_forge_build(&client, &instance.minecraft_version)
+                .await
+                .map(Some)
+                .map_err(|err| err.to_string())
+        }
+        crate::dto::ModLoader::NeoForge => {
+            crate::launch::forge::latest_neoforge(&client, &instance.minecraft_version)
+                .await
+                .map(Some)
+                .map_err(|err| err.to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Pins (or, with `None`, un-pins) the instance's loader build. Takes effect
+/// on the next launch — there's no separate "install" step, since
+/// `forge::prepare`/the Fabric equivalent already download and cache
+/// whatever build is resolved fresh on every launch.
+#[tauri::command]
+pub fn set_instance_loader_version(
+    state: State<'_, AppState>,
+    instance_id: String,
+    loader_version: Option<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .set_instance_loader_version(&instance_id, loader_version.as_deref())
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub fn set_instance_icon(
     state: State<'_, AppState>,
@@ -154,6 +206,40 @@ pub async fn duplicate_instance(
 pub fn delete_instance(state: State<'_, AppState>, instance_id: String) -> Result<DeleteResult, String> {
     InstanceService::delete(&state.db, &instance_id).map_err(map_error)?;
     Ok(DeleteResult { ok: true })
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Opens a folder in the user's default file manager via one direct shell
+/// call. `@tauri-apps/plugin-opener`'s `openPath` was observed opening the
+/// real default handler (e.g. a third-party manager like File Pilot)
+/// correctly, then Explorer *again* several seconds later — some fallback
+/// path inside the plugin firing when it doesn't get a fast/definite success
+/// signal back from a non-standard registered handler. `cmd /C start ""`
+/// resolves through the exact same OS folder-open association Explorer
+/// itself uses when you double-click a folder, with no secondary fallback
+/// of our own to misfire.
+#[tauri::command]
+pub fn open_in_file_manager(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

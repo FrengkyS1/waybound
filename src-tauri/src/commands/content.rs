@@ -18,21 +18,23 @@ use super::search::AppState;
 
 pub(crate) const DISABLED_SUFFIX: &str = ".disabled";
 
-/// A mod's own declared display name and embedded icon, read from its jar
-/// metadata in one pass. Best-effort: any missing/unreadable/malformed
-/// metadata just leaves the field `None` (name falls back to the
+/// A mod's own declared display name, embedded icon, and modId, read from
+/// its jar metadata in one pass. Best-effort: any missing/unreadable/
+/// malformed metadata just leaves the field `None` (name falls back to the
 /// filename-derived name on the frontend; icon falls back to a DB-recorded
-/// one, if any).
+/// one, if any; modId falls back to fuzzy name-based config matching).
 struct ModMeta {
     name: Option<String>,
     icon: Option<String>,
+    mod_id: Option<String>,
 }
 
-/// Reads name + icon from a jar's Fabric/Quilt, Forge/NeoForge, or legacy
-/// Forge metadata. Opens the zip archive once and reuses it for both lookups
-/// instead of the two separate full re-parses this used to do per mod.
+/// Reads name + icon + modId from a jar's Fabric/Quilt, Forge/NeoForge, or
+/// legacy Forge metadata. Opens the zip archive once and reuses it for both
+/// lookups instead of the two separate full re-parses this used to do per
+/// mod.
 fn read_mod_metadata(jar_path: &Path) -> ModMeta {
-    let mut meta = ModMeta { name: None, icon: None };
+    let mut meta = ModMeta { name: None, icon: None, mod_id: None };
     let Ok(file) = fs::File::open(jar_path) else {
         return meta;
     };
@@ -44,6 +46,7 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
     if let Some(contents) = read_zip_entry(&mut archive, "fabric.mod.json") {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
             meta.name = non_empty(value.get("name").and_then(|v| v.as_str()));
+            meta.mod_id = non_empty(value.get("id").and_then(|v| v.as_str()));
             let icon_path = match value.get("icon") {
                 Some(serde_json::Value::String(path)) => non_empty(Some(path)),
                 Some(serde_json::Value::Object(sizes)) => sizes
@@ -83,6 +86,10 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
                         .and_then(|m| m.get("displayName"))
                         .and_then(|v| v.as_str()),
                 );
+            }
+            if meta.mod_id.is_none() {
+                meta.mod_id =
+                    non_empty(first_mod.and_then(|m| m.get("modId")).and_then(|v| v.as_str()));
             }
             if meta.icon.is_none() {
                 // `logoFile` is documented as a top-level key (applies to
@@ -263,6 +270,7 @@ fn apply_cache(
                 .get(&(category.to_string(), f.file_name.clone()))
                 .filter(|c| c.size_bytes == f.size_bytes && c.mtime_unix == f.mtime_unix);
             let name = hit.and_then(|c| c.name.clone());
+            let mod_id_norm = hit.and_then(|c| c.mod_id.as_deref()).map(normalize_for_match);
             let has_config = config_top_entries.is_some_and(|entries| {
                 let mut terms = vec![normalize_for_match(&file_stem(&f.file_name))];
                 if let Some(n) = &name {
@@ -272,7 +280,10 @@ fn apply_cache(
                     terms.push(normalize_for_match(n));
                 }
                 entries.iter().any(|e| {
-                    config_entry_matches(&e.normalized, &terms)
+                    let mod_id_match = mod_id_norm.as_deref().is_some_and(|mid| {
+                        e.normalized == mid || strip_config_side_suffix(&e.normalized) == Some(mid)
+                    });
+                    (mod_id_match || config_entry_matches(&e.normalized, &terms))
                         && (e.is_dir || is_text_config_file(&e.raw_name))
                 })
             });
@@ -331,12 +342,46 @@ fn normalize_for_match(name: &str) -> String {
 /// (e.g. "Nature's Compass" vs config folder "naturescompass") — gated by a
 /// minimum length so a short common substring doesn't false-positive across
 /// unrelated mods.
+///
+/// Forge/NeoForge's per-side config convention names files `<modid>-common`,
+/// `<modid>-client`, `<modid>-server` — none of which is a substring of a
+/// mod's declared name whenever that name has an extra word the modid
+/// doesn't (Curios API's modid is `curios`, so `curios-common.toml` shares no
+/// full-containment relationship with "curiosapi"). Stripping a trailing
+/// side name off the entry recovers the bare modid — but only checked as a
+/// *prefix* of a term, not a substring anywhere in it: a plain-containment
+/// check let the stripped "curios" match unrelated "Apothic Curios" (which
+/// merely ends with that word) and stripped "forge" match every single
+/// NeoForge-suffixed mod's jar filename (".../neoforge-...").
+const CONFIG_SIDE_SUFFIXES: &[&str] = &["common", "client", "server"];
+
+fn strip_config_side_suffix(entry_norm: &str) -> Option<&str> {
+    CONFIG_SIDE_SUFFIXES
+        .iter()
+        .find_map(|suffix| entry_norm.strip_suffix(suffix))
+        .filter(|stripped| !stripped.is_empty())
+}
+
+/// A bare top-level config entry named exactly after the modloader itself
+/// (a `config/fabric/` folder — Fabric API's own per-module configs like
+/// `indigo-renderer.properties` — or a stray `forge`/`neoforge`/`quilt`
+/// entry) is either loader-owned or too generic to attribute to any single
+/// mod. Almost every mod built for a given loader embeds that loader's name
+/// in its own jar filename (`ftbessentials-fabric-1.20.1.jar`), so without
+/// this, `full_match`'s plain substring containment made *every* Fabric mod
+/// fuzzy-match the loader's own "fabric" folder. A real mod's modId is never
+/// literally one of these, so they're only ever matched via the exact modId
+/// check elsewhere, never fuzzily here.
+const GENERIC_RESERVED_NAMES: &[&str] =
+    &["fabric", "quilt", "forge", "neoforge", "common", "client", "server"];
+
 fn config_entry_matches(entry_norm: &str, terms: &[String]) -> bool {
     const MIN_MATCH_LEN: usize = 4;
-    if entry_norm.is_empty() {
+    if entry_norm.is_empty() || GENERIC_RESERVED_NAMES.contains(&entry_norm) {
         return false;
     }
-    terms.iter().any(|term| {
+
+    let full_match = terms.iter().any(|term| {
         if term.is_empty() {
             return false;
         }
@@ -344,7 +389,18 @@ fn config_entry_matches(entry_norm: &str, terms: &[String]) -> bool {
             return term == entry_norm;
         }
         entry_norm.contains(term.as_str()) || term.contains(entry_norm)
-    })
+    });
+    if full_match {
+        return true;
+    }
+
+    let Some(stripped) = strip_config_side_suffix(entry_norm) else {
+        return false;
+    };
+    if stripped.len() < MIN_MATCH_LEN {
+        return false;
+    }
+    terms.iter().any(|term| term.starts_with(stripped))
 }
 
 /// One top-level entry directly inside `config/`, fingerprinted for
@@ -540,19 +596,25 @@ pub async fn get_content_meta(
     let category_for_cache = category.clone();
     let file_name_for_cache = file_name.clone();
 
-    let meta = tauri::async_runtime::spawn_blocking(move || match category.as_str() {
+    let (meta, mod_id) = tauri::async_runtime::spawn_blocking(move || match category.as_str() {
         "mod" if is_jar => {
             let meta = read_mod_metadata(&path);
-            ContentMeta {
-                name: meta.name,
-                icon: meta.icon.or(db_icon),
-            }
+            (
+                ContentMeta {
+                    name: meta.name,
+                    icon: meta.icon.or(db_icon),
+                },
+                meta.mod_id,
+            )
         }
-        "resourcepack" if is_zip => ContentMeta {
-            name: None,
-            icon: read_resourcepack_icon(&path),
-        },
-        _ => ContentMeta::default(),
+        "resourcepack" if is_zip => (
+            ContentMeta {
+                name: None,
+                icon: read_resourcepack_icon(&path),
+            },
+            None,
+        ),
+        _ => (ContentMeta::default(), None),
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -570,6 +632,7 @@ pub async fn get_content_meta(
             mtime_unix,
             meta.name.as_deref(),
             meta.icon.as_deref(),
+            mod_id.as_deref(),
         );
     }
 
@@ -648,10 +711,23 @@ pub fn list_mod_configs(
     if let Ok(Some(name)) = state.db.get_content_meta_name_by_file(&instance_id, &file_name) {
         terms.push(normalize_for_match(&name));
     }
+    // The loader's own per-side config system names files after exactly this
+    // string by default (see `strip_config_side_suffix`'s doc comment) — an
+    // exact match against it is precise where the name-based `terms` above
+    // are only ever a plausibility guess.
+    let mod_id_norm = state
+        .db
+        .get_content_meta_mod_id_by_file(&instance_id, &file_name)
+        .ok()
+        .flatten()
+        .map(|id| normalize_for_match(&id));
 
     let mut results = Vec::new();
     for entry in scan_config_top_level(&config_dir) {
-        if !config_entry_matches(&entry.normalized, &terms) {
+        let mod_id_match = mod_id_norm.as_deref().is_some_and(|mid| {
+            entry.normalized == mid || strip_config_side_suffix(&entry.normalized) == Some(mid)
+        });
+        if !mod_id_match && !config_entry_matches(&entry.normalized, &terms) {
             continue;
         }
         let entry_path = config_dir.join(&entry.raw_name);
@@ -701,7 +777,7 @@ pub fn write_config_file(
 
 #[cfg(test)]
 mod content_meta_cache_tests {
-    use super::{apply_cache, ScannedFile};
+    use super::{apply_cache, normalize_for_match, ConfigTopEntry, ScannedFile};
     use crate::db::CachedContentMeta;
     use std::collections::HashMap;
 
@@ -713,7 +789,42 @@ mod content_meta_cache_tests {
             mtime_unix,
             name: name.map(str::to_string),
             icon: icon.map(str::to_string),
+            mod_id: None,
         }
+    }
+
+    #[test]
+    fn has_config_uses_cached_mod_id_when_name_based_matching_would_miss() {
+        // Curios API's declared name doesn't share a full-containment
+        // relationship with "curios-common", so this only passes because
+        // has_config now also checks the cached modId, not just the name.
+        let scanned = vec![ScannedFile {
+            file_name: "curios-neoforge-5.11.0.jar".to_string(),
+            enabled: true,
+            size_bytes: 10,
+            mtime_unix: 10,
+        }];
+        let mut cache = HashMap::new();
+        cache.insert(
+            ("mod".to_string(), "curios-neoforge-5.11.0.jar".to_string()),
+            CachedContentMeta {
+                category: "mod".to_string(),
+                file_name: "curios-neoforge-5.11.0.jar".to_string(),
+                size_bytes: 10,
+                mtime_unix: 10,
+                name: Some("Curios API".to_string()),
+                icon: None,
+                mod_id: Some("curios".to_string()),
+            },
+        );
+        let config_entries = vec![ConfigTopEntry {
+            raw_name: "curios-common.toml".to_string(),
+            is_dir: false,
+            normalized: normalize_for_match("curios-common"),
+        }];
+
+        let entries = apply_cache(scanned, "mod", &cache, Some(&config_entries), &HashMap::new());
+        assert!(entries[0].has_config);
     }
 
     #[test]
@@ -798,7 +909,9 @@ mod content_meta_cache_tests {
 
 #[cfg(test)]
 mod config_matching_tests {
-    use super::{config_entry_matches, is_text_config_file, normalize_for_match};
+    use super::{
+        config_entry_matches, is_text_config_file, normalize_for_match, strip_config_side_suffix,
+    };
 
     #[test]
     fn normalize_strips_punctuation_case_and_keeps_digits() {
@@ -831,6 +944,66 @@ mod config_matching_tests {
             &normalize_for_match("enigmaticlegacy-common"),
             &[enigmatic_legacy]
         ));
+    }
+
+    #[test]
+    fn side_config_matches_mod_name_with_extra_words() {
+        // Curios API's modid is "curios", but its declared name has an extra
+        // word the config filenames don't — was the actual bug report.
+        let curios_api = normalize_for_match("Curios API");
+        assert!(config_entry_matches(&normalize_for_match("curios-common"), &[curios_api.clone()]));
+        assert!(config_entry_matches(&normalize_for_match("curios-client"), &[curios_api]));
+    }
+
+    #[test]
+    fn side_config_does_not_match_mod_whose_name_merely_ends_with_the_modid() {
+        // "Apothic Curios" is a *different* mod that just happens to end
+        // with the word "curios" — it must not also claim Curios API's
+        // curios-common/curios-client.toml.
+        let apothic_curios = normalize_for_match("Apothic Curios");
+        assert!(!config_entry_matches(&normalize_for_match("curios-common"), &[apothic_curios.clone()]));
+        assert!(!config_entry_matches(&normalize_for_match("curios-client"), &[apothic_curios]));
+    }
+
+    #[test]
+    fn side_config_does_not_match_every_neoforge_suffixed_jar() {
+        // forge-client.toml is the modloader's own core config, not any
+        // mod's — stripping it down to "forge" must not then match every
+        // mod whose jar filename happens to contain "...-neoforge-...".
+        let curios_jar = normalize_for_match("curios-neoforge-5.11.0+1.21.1");
+        assert!(!config_entry_matches(&normalize_for_match("forge-client"), &[curios_jar]));
+    }
+
+    #[test]
+    fn bare_loader_named_entry_never_fuzzy_matches_any_mod() {
+        // FTB Essentials' jar filename embeds "-fabric-" (loader tag), which
+        // used to make it fuzzy-match the loader's own top-level "fabric"
+        // config folder (Fabric API's unrelated indigo-renderer.properties
+        // etc.) via plain substring containment. The bare folder name must
+        // never match, no matter what the mod's own terms look like.
+        let ftb_essentials_jar = normalize_for_match("ftbessentials-fabric-1.20.1");
+        assert!(!config_entry_matches(&normalize_for_match("fabric"), &[ftb_essentials_jar]));
+
+        let some_forge_mod = normalize_for_match("somemod-forge-1.20.1");
+        assert!(!config_entry_matches(&normalize_for_match("forge"), &[some_forge_mod]));
+    }
+
+    #[test]
+    fn exact_mod_id_matches_bare_or_side_suffixed_entry() {
+        // Mirrors list_mod_configs's exact-modId check: an entry matches
+        // when its normalized name equals the modId directly, or with a
+        // side suffix stripped off — the precise counterpart to the fuzzy
+        // name-based `config_entry_matches` used when no modId is known.
+        let mod_id = normalize_for_match("curios");
+        let exact = |entry_norm: &str| {
+            entry_norm == mod_id || strip_config_side_suffix(entry_norm) == Some(mod_id.as_str())
+        };
+        assert!(exact(&normalize_for_match("curios")));
+        assert!(exact(&normalize_for_match("curios-common")));
+        assert!(exact(&normalize_for_match("curios-client")));
+        // "Apothic Curios" is a different mod (different modId entirely) —
+        // its config folder would never normalize down to bare "curios".
+        assert!(!exact(&normalize_for_match("apothiccurios")));
     }
 
     #[test]

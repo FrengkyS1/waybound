@@ -12,6 +12,10 @@ export interface InstanceSummary {
   icon?: string | null;
   lastPlayed?: number | null;
   totalPlaySeconds: number;
+  /** The installed modpack's own version/filename label, recorded at import
+   * time. Absent for a manually-created instance or one that only ever had
+   * individual mods installed. */
+  modpackVersionLabel?: string | null;
 }
 
 export interface CreateInstanceInput {

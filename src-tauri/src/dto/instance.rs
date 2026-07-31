@@ -22,6 +22,11 @@ pub struct InstanceSummary {
     /// Total accumulated play time in seconds.
     #[serde(default)]
     pub total_play_seconds: u64,
+    /// The installed modpack's own version/filename label, recorded at
+    /// import time (e.g. "Ascendra-2.1.0"). Absent for a manually-created
+    /// instance or one that only ever had individual mods installed.
+    #[serde(default)]
+    pub modpack_version_label: Option<String>,
 }
 
 /// A single content file inside an instance (mod, resource pack, or shader).

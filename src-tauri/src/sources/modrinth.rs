@@ -39,8 +39,14 @@ pub struct ModrinthProjectMeta {
 
 impl ModrinthClient {
     pub fn new() -> Result<Self, ModrinthError> {
+        // Same reasoning as CurseForgeClient::new: this client only ever
+        // fetches small JSON payloads, so a hard timeout can't break a
+        // legitimate call — it only turns a silent hang into a clear error
+        // the caller's existing error handling can surface.
         let http = Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { http })
     }
@@ -373,7 +379,7 @@ impl ModrinthClient {
 
         let response = request.send().await?.error_for_status()?;
         let versions: Vec<ModrinthVersion> = decode_json(response).await?;
-        versions
+        sort_versions_newest_first(versions)
             .first()
             .and_then(version_to_download)
             .ok_or(ModrinthError::NotFound)
@@ -386,7 +392,8 @@ impl ModrinthClient {
             .send()
             .await?
             .error_for_status()?;
-        Ok(decode_json(response).await?)
+        let versions: Vec<ModrinthVersion> = decode_json(response).await?;
+        Ok(sort_versions_newest_first(versions))
     }
 }
 
@@ -560,6 +567,17 @@ fn pick_suggested_mc_loader(
     (mc, loader)
 }
 
+/// Modrinth's `/version` listing has no documented sort guarantee — relying
+/// on whatever order it happens to come back in silently installed a
+/// months-old release once (6.12.0 instead of a since-published 7.4.1,
+/// breaking every mod in a pack that declared a minimum version against it).
+/// `date_published` is an ISO 8601 string, so a plain string sort is already
+/// chronologically correct with no parsing needed.
+fn sort_versions_newest_first(mut versions: Vec<ModrinthVersion>) -> Vec<ModrinthVersion> {
+    versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
+    versions
+}
+
 fn version_to_download(version: &ModrinthVersion) -> Option<ResolvedDownload> {
     let file = version
         .files
@@ -671,7 +689,7 @@ fn parse_mc_version(version: &str) -> (u32, u32, u32) {
 
 #[cfg(test)]
 mod version_tests {
-    use super::{compare_mc_versions, is_release_version_id};
+    use super::{compare_mc_versions, is_release_version_id, sort_versions_newest_first, ModrinthVersion};
 
     #[test]
     fn rejects_beta_style_versions() {
@@ -684,6 +702,39 @@ mod version_tests {
         assert_eq!(
             compare_mc_versions("1.21.1", "1.20.4"),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    fn version_with_date(date_published: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: date_published.to_string(),
+            name: String::new(),
+            version_number: String::new(),
+            date_published: date_published.to_string(),
+            changelog: None,
+            downloads: 0,
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sort_versions_newest_first_ignores_api_response_order() {
+        // The actual regression: the API's own listing order can't be
+        // trusted, so an out-of-order response (oldest first here) must
+        // still come out newest-first.
+        let versions = vec![
+            version_with_date("2026-01-01T00:00:00Z"),
+            version_with_date("2026-07-24T00:00:00Z"),
+            version_with_date("2026-03-01T00:00:00Z"),
+        ];
+        let sorted = sort_versions_newest_first(versions);
+        let dates: Vec<&str> = sorted.iter().map(|v| v.date_published.as_str()).collect();
+        assert_eq!(
+            dates,
+            vec!["2026-07-24T00:00:00Z", "2026-03-01T00:00:00Z", "2026-01-01T00:00:00Z"]
         );
     }
 }

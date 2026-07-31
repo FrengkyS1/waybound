@@ -19,6 +19,23 @@ interface InstallTargetDialogProps {
   onSuccess: (message: string) => void;
 }
 
+/// Instances whose loader+MC version actually match at least one of the
+/// mod's published versions — checked per-version (not the coarser
+/// "loaders ever used" / "versions ever used" union on `detail` itself),
+/// since a mod compatible with fabric+1.20 and forge+1.21 shouldn't also
+/// read as compatible with forge+1.20. Without this, the "Use existing"
+/// dropdown listed every instance regardless of loader/version, and picking
+/// a mismatched one silently dropped a dead jar into its mods folder.
+function compatibleInstances(list: InstanceSummary[], detail: ModDetail): InstanceSummary[] {
+  return list.filter((instance) =>
+    detail.versions.some(
+      (v) =>
+        v.loaders.includes(instance.loader) &&
+        v.gameVersions.includes(instance.minecraftVersion),
+    ),
+  );
+}
+
 export function InstallTargetDialog({
   detail,
   versionPrefill,
@@ -55,16 +72,23 @@ export function InstallTargetDialog({
         if (fixedInstanceId) {
           setExistingId(fixedInstanceId);
           setMode("existing");
-        } else if (list[0]) {
-          setExistingId(list[0].id);
         } else {
-          // No instances to pick from yet — "existing" mode would be a dead
-          // end (empty dropdown, disabled submit). Fall back to creating one.
-          setMode("create");
+          // Prefer a compatible instance as the default pick; fall back to
+          // any instance (rather than an empty dropdown) only when none
+          // match at all.
+          const preferred = compatibleInstances(list, detail)[0] ?? list[0];
+          if (preferred) {
+            setExistingId(preferred.id);
+          } else {
+            // No instances to pick from yet — "existing" mode would be a
+            // dead end (empty dropdown, disabled submit). Fall back to
+            // creating one.
+            setMode("create");
+          }
         }
       })
       .catch(() => setInstances([]));
-  }, [fixedInstanceId]);
+  }, [fixedInstanceId, detail]);
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -97,6 +121,9 @@ export function InstallTargetDialog({
   const selectedInstance =
     instances.find((item) => item.id === (fixedInstanceId ?? existingId)) ??
     null;
+
+  const compatible = compatibleInstances(instances, detail);
+  const selectableInstances = compatible.length > 0 ? compatible : instances;
 
   return (
     <div className={styles.backdrop} onClick={onClose} role="presentation">
@@ -215,13 +242,18 @@ export function InstallTargetDialog({
                     value={existingId}
                     onChange={(e) => setExistingId(e.target.value)}
                   >
-                    {instances.map((instance) => (
+                    {selectableInstances.map((instance) => (
                       <option key={instance.id} value={instance.id}>
                         {instance.name} ({instance.minecraftVersion} ·{" "}
                         {instance.loader})
                       </option>
                     ))}
                   </select>
+                  {compatible.length === 0 && instances.length > 0 && (
+                    <p className={styles.versionHint}>
+                      No instance matches this {isModpack ? "modpack's" : "mod's"} loader/version — showing all instances anyway.
+                    </p>
+                  )}
                 </label>
               )}
             </>

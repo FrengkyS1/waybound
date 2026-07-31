@@ -18,8 +18,21 @@ use crate::launch::files::file_sha1;
 
 const BROWSER_WINDOW_LABEL: &str = "missing-mods-browser";
 const LOGIN_WINDOW_LABEL: &str = "curseforge-login";
-const WATCH_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+// A flat 20 minutes was tuned for the single-mod flow — "Open all" hands the
+// user several pages to click "Download" on in turn (ads, wait timers, a
+// CAPTCHA here and there), and once this watch gives up, any file that lands
+// afterward is never detected: it's not moved into the instance, and its
+// window — having done its job as far as the user can tell — never gets
+// closed. Scaling with mod count keeps the single-mod case's existing
+// generous window while giving a big "Open all" batch room to actually
+// finish.
+const MIN_WATCH_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const WATCH_TIMEOUT_PER_MOD: Duration = Duration::from_secs(5 * 60);
+
+fn watch_timeout(mod_count: usize) -> Duration {
+    MIN_WATCH_TIMEOUT.max(WATCH_TIMEOUT_PER_MOD * mod_count as u32)
+}
 
 /// Checks (and immediately flips) the one-time "prompt CurseForge login"
 /// flag. Pure config read/write — safe to call synchronously from the
@@ -246,7 +259,7 @@ pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<Mis
         let mut remaining: Vec<(usize, MissingMod)> = mods.into_iter().enumerate().collect();
         let total = remaining.len() as u32;
         let mut placed_names = Vec::new();
-        let deadline = Instant::now() + WATCH_TIMEOUT;
+        let deadline = Instant::now() + watch_timeout(remaining.len());
         // path -> (mtime, sha1) — a file already hashed and not matched
         // doesn't need re-hashing every second until it changes; this is
         // what keeps a large unrelated file in Downloads from being read
@@ -365,8 +378,19 @@ pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<Mis
 
 #[cfg(test)]
 mod tests {
-    use super::{is_candidate_file, validate_curseforge_url};
+    use super::{is_candidate_file, validate_curseforge_url, watch_timeout, MIN_WATCH_TIMEOUT};
     use std::path::Path;
+
+    #[test]
+    fn watch_timeout_scales_with_mod_count_but_has_a_floor() {
+        // A single mod (or the empty case) keeps the original flat window —
+        // this must not get shorter than it used to be.
+        assert_eq!(watch_timeout(1), MIN_WATCH_TIMEOUT);
+        assert_eq!(watch_timeout(0), MIN_WATCH_TIMEOUT);
+        // A big "Open all" batch gets real extra time instead of racing the
+        // same flat 20 minutes regardless of how many pages there are.
+        assert!(watch_timeout(11) > MIN_WATCH_TIMEOUT);
+    }
 
     #[test]
     fn accepts_bare_and_subdomain_curseforge_hosts() {

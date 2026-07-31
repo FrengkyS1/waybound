@@ -20,6 +20,116 @@ use super::search::AppState;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Marker file dropped in an instance's own game directory while its Java
+/// child process is alive. The instance's `AppState.launches` entry only
+/// covers the prepare/download phase and is gone within moments of the game
+/// actually starting (see `launch_instance`), and the whole map lives in this
+/// process's memory — closing Waybound while Minecraft keeps running (it's an
+/// independent OS process) loses all trace of it, so the Play button resets
+/// to launchable on the next start and lets a second copy be launched
+/// concurrently onto the same world files. This file plus [`is_pid_alive`] is
+/// what `get_running_instances` checks on startup to rebuild that state.
+const PID_FILE_NAME: &str = ".waybound-pid";
+
+/// Whether a process with this PID is still alive. Shells out to `tasklist`
+/// rather than adding a process-inspection crate: this project already treats
+/// a Windows-only helper process as an acceptable answer elsewhere (e.g. Java
+/// version probing), and this is a startup-only, once-per-instance check.
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn is_pid_alive(pid: u32) -> bool {
+    // Signal 0 sends no signal but still errors if the process doesn't exist
+    // or isn't ours; `kill` is universally available without a crate.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A Minecraft process detected as still running from a previous Waybound
+/// session, so the frontend can restore its Play button to the disabled
+/// "Running" state instead of allowing a second concurrent launch.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningInstance {
+    pub instance_id: String,
+    pub instance_name: String,
+}
+
+/// Called once when the frontend starts up. Scans every instance for a
+/// leftover PID file and checks whether that process is genuinely still
+/// alive (a crash or forced kill can leave a stale file behind). Anything
+/// still alive gets a watcher thread so it's cleaned up and reported via the
+/// normal `launch://exited` event once the player actually closes it, exactly
+/// like a launch started in this session.
+#[tauri::command]
+pub fn get_running_instances(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<RunningInstance>, String> {
+    let instances = state.db.list_instances().map_err(|e| e.to_string())?;
+    let mut running = Vec::new();
+    for inst in instances {
+        let Ok(dir) = crate::instances::paths::instance_root(&inst.id) else {
+            continue;
+        };
+        let pid_file = dir.join(PID_FILE_NAME);
+        let Ok(contents) = std::fs::read_to_string(&pid_file) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            let _ = std::fs::remove_file(&pid_file);
+            continue;
+        };
+        if is_pid_alive(pid) {
+            spawn_orphan_watcher(app.clone(), inst.id.clone(), pid_file.clone());
+            running.push(RunningInstance {
+                instance_id: inst.id,
+                instance_name: inst.name,
+            });
+        } else {
+            let _ = std::fs::remove_file(&pid_file);
+        }
+    }
+    Ok(running)
+}
+
+/// Poll until a previous session's Minecraft process finally exits, then
+/// clean up its PID file and emit the same `launch://exited` event a launch
+/// started in this session would, so the frontend flips back to launchable
+/// through its existing listener with no new event type to handle.
+fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let pid: Option<u32> = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        let Some(pid) = pid else { return };
+        while is_pid_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = app.emit(
+            "launch://exited",
+            LaunchExitedEvent {
+                instance_id,
+                code: None,
+            },
+        );
+    });
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchSettings {
@@ -270,6 +380,13 @@ async fn run_launch(app: AppHandle, instance_id: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to start Java: {e}"))?;
 
+    // Record the PID so a startup check in a future Waybound session (after
+    // this one closes with the game still running) can tell this instance is
+    // still live rather than assuming it's launchable again. Best-effort:
+    // if this write fails, launching still proceeds exactly as before.
+    let pid_file = prepared.working_dir.join(PID_FILE_NAME);
+    let _ = std::fs::write(&pid_file, child.id().to_string());
+
     let _ = app.emit(
         "launch://started",
         LaunchStartedEvent {
@@ -299,6 +416,7 @@ async fn run_launch(app: AppHandle, instance_id: String) -> Result<(), String> {
                 Err(_) => break None,
             }
         };
+        let _ = std::fs::remove_file(&pid_file);
         crate::activity::append_log(
             &format!("{exit_name} closed (exit {code:?})"),
             "info",

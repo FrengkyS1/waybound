@@ -91,6 +91,18 @@ export async function cancelLaunch(instanceId: string): Promise<void> {
   await invoke("cancel_launch", { instanceId });
 }
 
+export interface RunningInstance {
+  instanceId: string;
+  instanceName: string;
+}
+
+/** Instances whose Minecraft process is still alive from a previous Waybound
+ * session (the game outlives the launcher closing) — checked once on
+ * startup so the Play button doesn't reset to launchable for them. */
+export async function getRunningInstances(): Promise<RunningInstance[]> {
+  return invoke<RunningInstance[]>("get_running_instances");
+}
+
 // ---- Event payloads ------------------------------------------------------
 
 export interface LaunchProgressEvent {

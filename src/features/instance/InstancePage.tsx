@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { openPath } from "@tauri-apps/plugin-opener";
 
 import {
   fetchContentMeta,
   fetchInstanceContent,
   fetchModSummaryForContent,
+  openInFileManager,
   removeContentFile,
   setContentEnabled,
   updateModInInstance,
@@ -41,6 +41,9 @@ interface InstancePageProps {
   onAddMods: () => void;
   onChangeImage: (icon: string | null) => void;
   onRename: (name: string) => Promise<void>;
+  /** Pins (or, with `null`, un-pins) this instance's loader build — Forge/
+   * NeoForge only, see `LaunchOverrides`. */
+  onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
   /** Opens a mod's project page in Browse — omitted, the Content tab's rows
    * just aren't clickable. */
   onOpenMod?: (summary: ModSummary) => void;
@@ -64,6 +67,7 @@ export function InstancePage({
   onAddMods,
   onChangeImage,
   onRename,
+  onLoaderVersionChange,
   onOpenMod,
   tab,
   onTabChange: setTab,
@@ -234,6 +238,17 @@ export function InstancePage({
               disabled
             />
           )}
+          <button
+            type="button"
+            className={styles.folderBtn}
+            aria-label="Open folder"
+            title="Open folder"
+            onClick={() => void openInFileManager(instance.rootPath)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+            </svg>
+          </button>
           <div className={styles.menuWrap} ref={menuRef}>
             <button
               type="button"
@@ -279,17 +294,6 @@ export function InstancePage({
                   }}
                 >
                   Change image
-                </button>
-                <button
-                  type="button"
-                  className={styles.menuItem}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void openPath(instance.rootPath);
-                  }}
-                >
-                  Open folder
                 </button>
                 <button
                   type="button"
@@ -365,6 +369,7 @@ export function InstancePage({
             instance={instance}
             busy={busy}
             onDelete={confirmDelete}
+            onLoaderVersionChange={onLoaderVersionChange}
           />
         )}
       </div>
@@ -447,6 +452,12 @@ function OverviewTab({
             <dt>Installed mods</dt>
             <dd>{instance.modCount}</dd>
           </div>
+          {instance.modpackVersionLabel && (
+            <div>
+              <dt>Modpack version</dt>
+              <dd>{instance.modpackVersionLabel}</dd>
+            </div>
+          )}
           <div>
             <dt>Folder</dt>
             <dd className={styles.mono}>{instance.rootPath}</dd>
@@ -521,6 +532,15 @@ function ContentTab({
   const targetsRef = useRef<Map<Element, { category: ContentCategory; fileName: string }>>(
     new Map(),
   );
+  // A fast scroll can bring a few dozen rows into view's rootMargin at once,
+  // each resolving independently — without batching, every single resolution
+  // called setContent on its own, re-mapping and re-rendering the *entire*
+  // (unvirtualized) list once per row. Collecting them and flushing on the
+  // next frame turns a burst of N re-renders into one.
+  const pendingPatchesRef = useRef<Map<string, { category: ContentCategory; fileName: string; patch: Partial<ContentEntry> }>>(
+    new Map(),
+  );
+  const flushScheduledRef = useRef(false);
 
   useEffect(() => {
     fetchedRef.current = new Set();
@@ -539,7 +559,7 @@ function ContentTab({
           void fetchContentMeta(instance.id, info.category, info.fileName).then(
             (meta) => {
               if (meta.name || meta.icon) {
-                patchEntry(info.category, info.fileName, meta);
+                enqueuePatch(info.category, info.fileName, meta);
               }
             },
           );
@@ -610,6 +630,38 @@ function ContentTab({
           e.fileName === fileName ? { ...e, ...patch } : e,
         ),
       };
+    });
+  }
+
+  // Queues a metadata patch instead of applying it immediately, and schedules
+  // one batched flush (next animation frame) covering every patch queued
+  // since the last flush — see the comment on `pendingPatchesRef` above.
+  function enqueuePatch(category: ContentCategory, fileName: string, patch: Partial<ContentEntry>) {
+    pendingPatchesRef.current.set(`${category}:${fileName}`, { category, fileName, patch });
+    if (flushScheduledRef.current) return;
+    flushScheduledRef.current = true;
+    requestAnimationFrame(() => {
+      flushScheduledRef.current = false;
+      const pending = pendingPatchesRef.current;
+      if (pending.size === 0) return;
+      const batch = Array.from(pending.values());
+      pending.clear();
+      setContent((prev) => {
+        if (!prev) return prev;
+        const byKey = new Map<"mods" | "resourcePacks" | "shaderPacks", Map<string, Partial<ContentEntry>>>();
+        for (const { category: c, fileName: f, patch: p } of batch) {
+          const key = categoryKey[c];
+          if (!byKey.has(key)) byKey.set(key, new Map());
+          byKey.get(key)!.set(f, p);
+        }
+        const next = { ...prev };
+        for (const [key, patchesByFile] of byKey) {
+          next[key] = next[key].map((e) =>
+            patchesByFile.has(e.fileName) ? { ...e, ...patchesByFile.get(e.fileName) } : e,
+          );
+        }
+        return next;
+      });
     });
   }
 
@@ -1072,14 +1124,16 @@ function SettingsTab({
   instance,
   busy,
   onDelete,
+  onLoaderVersionChange,
 }: {
   instance: InstanceSummary;
   busy: boolean;
   onDelete: () => void;
+  onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
 }) {
   return (
     <div className={styles.settings}>
-      <LaunchOverrides instanceId={instance.id} />
+      <LaunchOverrides instance={instance} onLoaderVersionChange={onLoaderVersionChange} />
 
       <section className={styles.dangerCard}>
         <div>

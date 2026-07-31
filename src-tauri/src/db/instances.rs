@@ -9,7 +9,8 @@ impl Database {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT i.id, i.name, i.minecraft_version, i.loader, i.loader_version,
-                    i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds
+                    i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds,
+                    i.modpack_version_label
              FROM instances i
              ORDER BY i.created_at DESC",
         )?;
@@ -22,7 +23,8 @@ impl Database {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT i.id, i.name, i.minecraft_version, i.loader, i.loader_version,
-                    i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds
+                    i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds,
+                    i.modpack_version_label
              FROM instances i
              WHERE i.id = ?1",
         )?;
@@ -70,6 +72,34 @@ impl Database {
         conn.execute(
             "UPDATE instances SET name = ?2 WHERE id = ?1",
             params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrites the instance's pinned loader build (e.g. `"47.4.14"`).
+    /// `None` clears the pin, reverting to whatever the loader's own
+    /// "recommended" build resolves to at the next launch — see
+    /// `launch::forge::resolve_version`.
+    pub fn set_instance_loader_version(
+        &self,
+        id: &str,
+        loader_version: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instances SET loader_version = ?2 WHERE id = ?1",
+            params![id, loader_version],
+        )?;
+        Ok(())
+    }
+
+    /// Records the modpack's own version/filename label at import time, for
+    /// display only — see `instances::install_modpack`.
+    pub fn set_modpack_version_label(&self, id: &str, label: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instances SET modpack_version_label = ?2 WHERE id = ?1",
+            params![id, label],
         )?;
         Ok(())
     }
@@ -375,7 +405,7 @@ impl Database {
     pub fn get_content_meta_cache(&self, instance_id: &str) -> Result<Vec<CachedContentMeta>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT category, file_name, size_bytes, mtime_unix, name, icon
+            "SELECT category, file_name, size_bytes, mtime_unix, name, icon, mod_id
              FROM content_meta_cache WHERE instance_id = ?1",
         )?;
         let rows = stmt.query_map(params![instance_id], |row| {
@@ -386,6 +416,7 @@ impl Database {
                 mtime_unix: row.get(3)?,
                 name: row.get(4)?,
                 icon: row.get(5)?,
+                mod_id: row.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -406,10 +437,10 @@ impl Database {
         Ok(())
     }
 
-    /// Records one file's parsed name/icon (or the fact that parsing found
-    /// neither — still worth caching, so a jar with no embedded icon isn't
-    /// re-opened forever trying to find one) against its current size+mtime
-    /// fingerprint.
+    /// Records one file's parsed name/icon/modId (or the fact that parsing
+    /// found none — still worth caching, so a jar with no embedded icon
+    /// isn't re-opened forever trying to find one) against its current
+    /// size+mtime fingerprint.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_content_meta_cache(
         &self,
@@ -420,20 +451,46 @@ impl Database {
         mtime_unix: i64,
         name: Option<&str>,
         icon: Option<&str>,
+        mod_id: Option<&str>,
     ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO content_meta_cache (instance_id, category, file_name, size_bytes, mtime_unix, name, icon, written_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO content_meta_cache (instance_id, category, file_name, size_bytes, mtime_unix, name, icon, written_version, mod_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(instance_id, category, file_name) DO UPDATE SET
                size_bytes = excluded.size_bytes,
                mtime_unix = excluded.mtime_unix,
                name = excluded.name,
                icon = excluded.icon,
-               written_version = excluded.written_version",
-            params![instance_id, category, file_name, size_bytes as i64, mtime_unix, name, icon, crate::db::APP_VERSION],
+               written_version = excluded.written_version,
+               mod_id = excluded.mod_id",
+            params![instance_id, category, file_name, size_bytes as i64, mtime_unix, name, icon, crate::db::APP_VERSION, mod_id],
         )?;
         Ok(())
+    }
+
+    /// The cached jar-parsed modId (Forge/NeoForge `modId` from
+    /// `mods.toml`/`neoforge.mods.toml`, or Fabric/Quilt's `id`) for one mod
+    /// file — the loader's own per-side config system names files after
+    /// exactly this string by default, so it's a precise (not fuzzy) config
+    /// match when present. `None` both when unresolved and when the jar
+    /// genuinely has no modId (never actually true, but parsing is
+    /// best-effort) — either way the caller falls back to name-based
+    /// matching.
+    pub fn get_content_meta_mod_id_by_file(
+        &self,
+        instance_id: &str,
+        file_name: &str,
+    ) -> Result<Option<String>, DbError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT mod_id FROM content_meta_cache WHERE instance_id = ?1 AND category = 'mod' AND file_name = ?2 LIMIT 1",
+            params![instance_id, file_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(DbError::from)
     }
 }
 
@@ -446,6 +503,7 @@ pub struct CachedContentMeta {
     pub mtime_unix: i64,
     pub name: Option<String>,
     pub icon: Option<String>,
+    pub mod_id: Option<String>,
 }
 
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
@@ -463,6 +521,7 @@ fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
         icon: row.get(7)?,
         last_played: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         total_play_seconds: row.get::<_, i64>(9)? as u64,
+        modpack_version_label: row.get(10)?,
     })
 }
 

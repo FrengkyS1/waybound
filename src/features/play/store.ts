@@ -5,6 +5,7 @@ import {
   addPlayTime,
   cancelLaunch,
   getAccount,
+  getRunningInstances,
   launchInstance,
   logout,
   microsoftLogin,
@@ -93,6 +94,36 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
       set({ account, accountLoaded: true });
     } catch {
       set({ accountLoaded: true });
+    }
+
+    // Restore "Running" for instances whose Minecraft process outlived a
+    // previous Waybound session, so Play stays disabled instead of resetting
+    // to launchable and allowing a second concurrent copy of the same
+    // instance. The backend already verified these PIDs are genuinely alive.
+    try {
+      const running = await getRunningInstances();
+      if (running.length > 0) {
+        set((state) => {
+          const launches = { ...state.launches };
+          for (const { instanceId, instanceName } of running) {
+            launches[instanceId] = {
+              instanceId,
+              instanceName,
+              phase: "running",
+              stage: "Running",
+              current: 0,
+              total: 0,
+              logs: [],
+              exitCode: null,
+              error: null,
+              startedAtMs: null,
+            };
+          }
+          return { launches };
+        });
+      }
+    } catch {
+      // Best-effort restoration; a failure here shouldn't block startup.
     }
   },
 

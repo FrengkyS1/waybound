@@ -28,11 +28,13 @@ fn mods_match(a: &ModSummary, b: &ModSummary) -> bool {
         return true;
     }
 
-    if name_match(&a.name, &b.name) && author_match(&a.author, &b.author) {
-        return true;
-    }
-
-    normalize_name(&a.name) == normalize_name(&b.name)
+    // No bare name-only fallback beyond this — a common generic name
+    // ("Configured", "Enhanced Visuals", ...) is reused by unrelated authors
+    // across Modrinth/CurseForge often enough that name equality alone isn't
+    // evidence of the same mod. `name_match` already does the same
+    // normalized-name comparison; author_match is the only thing that makes
+    // it safe.
+    name_match(&a.name, &b.name) && author_match(&a.author, &b.author)
 }
 
 fn merge_into(target: &mut ModSummary, incoming: ModSummary) {
@@ -160,5 +162,19 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!(merged[0].sources.contains(&ModSource::Modrinth));
         assert!(merged[0].sources.contains(&ModSource::Curseforge));
+    }
+
+    #[test]
+    fn same_generic_name_different_author_does_not_merge() {
+        // Two real, unrelated mods both happen to be named "Configured" —
+        // must not merge just because the name string matches when the
+        // authors clearly don't.
+        let mut jack = sample("configured-modrinth", "Configured", ModSource::Modrinth);
+        jack.author = "Jack".to_string();
+        let mut craf = sample("configured-curseforge", "Configured", ModSource::Curseforge);
+        craf.author = "MrCrayFish".to_string();
+
+        let merged = dedupe_mods(vec![jack, craf]);
+        assert_eq!(merged.len(), 2);
     }
 }

@@ -57,4 +57,11 @@ pub struct ModpackImportResult {
     /// Files the author blocked from third-party download — empty for the
     /// Modrinth importer, which has no equivalent restriction.
     pub missing_mods: Vec<crate::dto::instance::MissingMod>,
+    /// The pack's own version string, when the source format actually
+    /// carries one. Modrinth's `.mrpack` index has a `versionId` field;
+    /// CurseForge's manifest.json has no version field at all (only
+    /// `name`/`files`/`overrides`), so its importer always leaves this
+    /// `None` and the caller falls back to the downloaded archive's
+    /// filename instead.
+    pub version_label: Option<String>,
 }

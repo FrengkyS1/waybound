@@ -135,15 +135,32 @@ fn slugify(name: &str) -> String {
     }
 }
 
+/// Windows reserves these names at the filesystem-namespace level (with or
+/// without an extension) — a folder literally named `con` can't be reliably
+/// addressed by most APIs (including `remove_dir_all`/`trash::delete`) without
+/// the `\\?\` extended-length prefix, so a display name that slugifies down to
+/// one of these would create an instance whose folder can never be properly
+/// deleted again. Checked as an immediate "taken" collision below so it's
+/// silently disambiguated to `con-2` etc. instead of ever being used bare —
+/// the display name itself is untouched, only the folder id changes.
+const RESERVED_WINDOWS_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 /// Appends `-2`, `-3`, ... until the candidate doesn't collide with an
 /// existing instance folder. Names are already unique per the DB's UNIQUE
 /// constraint, but two different names can slugify to the same string (e.g.
 /// "My Pack!" and "My Pack?"), so this is the real uniqueness guarantee.
+fn is_reserved_windows_name(candidate: &str) -> bool {
+    RESERVED_WINDOWS_NAMES.contains(&candidate)
+}
+
 fn unique_instance_id(base_slug: &str) -> Result<String, InstanceError> {
     let root_dir = instances_root()?;
     let mut candidate = base_slug.to_string();
     let mut suffix = 2;
-    while root_dir.join(&candidate).exists() {
+    while root_dir.join(&candidate).exists() || is_reserved_windows_name(&candidate) {
         candidate = format!("{base_slug}-{suffix}");
         suffix += 1;
     }
@@ -219,6 +236,8 @@ impl InstanceService {
             last_played: None,
 
             total_play_seconds: 0,
+
+            modpack_version_label: None,
 
         };
 
@@ -299,6 +318,9 @@ impl InstanceService {
                 );
             }
         }
+        if let Some(label) = source.modpack_version_label.as_deref() {
+            let _ = db.set_modpack_version_label(&copy.id, Some(label));
+        }
         if let Ok(launch) = db.get_instance_launch_config(id) {
             if db.set_instance_launch_config(&copy.id, &launch).is_err() {
                 crate::activity::append_log(
@@ -325,7 +347,10 @@ impl InstanceService {
 
         if let Ok(path) = instance_root(id) {
 
-            let _ = std::fs::remove_dir_all(path);
+            // Recycle Bin, not a permanent wipe — a deleted instance can
+            // carry hundreds of hours of world saves, and `remove_dir_all`
+            // gave no way back from a misclick.
+            let _ = trash::delete(path);
 
         }
 
@@ -734,6 +759,17 @@ async fn install_modpack(
 
     };
 
+    // Only reached for a real modpack import (the plain-mod-jar path returns
+    // early above) — record the pack's own version signal for display on the
+    // Overview tab. The mrpack index's `versionId` is more reliable when
+    // present (CurseForge's manifest.json has no version field at all), so
+    // it wins; otherwise fall back to the downloaded archive's own filename.
+    let modpack_version_label = import
+        .version_label
+        .clone()
+        .unwrap_or_else(|| strip_pack_extension(&download.filename));
+    let _ = db.set_modpack_version_label(&instance.id, Some(&modpack_version_label));
+
 
 
     sync_mods_folder(
@@ -857,6 +893,19 @@ pub fn recommended_memory_mb(mod_count: u32) -> u32 {
         81..=150 => 4096,
         _ => 6144,
     }
+}
+
+/// Strips a trailing `.zip`/`.mrpack` extension for a friendlier display
+/// label (e.g. `"Ascendra-2.1.0.zip"` -> `"Ascendra-2.1.0"`). Deliberately
+/// not a real parser — no attempt to pull out "just the version number",
+/// since the raw filename minus its extension is an honest-enough label on
+/// its own.
+fn strip_pack_extension(filename: &str) -> String {
+    filename
+        .strip_suffix(".mrpack")
+        .or_else(|| filename.strip_suffix(".zip"))
+        .unwrap_or(filename)
+        .to_string()
 }
 
 fn sync_mods_folder(
@@ -1092,6 +1141,7 @@ fn seed_content_meta_cache(
             mtime_unix,
             name.map(String::as_str),
             icon.map(String::as_str),
+            None,
         );
     }
 }
@@ -1446,7 +1496,7 @@ pub struct ResolvedDownload {
 
 mod tests {
 
-    use super::is_installable;
+    use super::{is_installable, is_reserved_windows_name, slugify, strip_pack_extension};
 
     use crate::dto::ContentType;
 
@@ -1458,6 +1508,34 @@ mod tests {
 
         assert!(is_installable(ContentType::Modpack));
 
+    }
+
+    #[test]
+    fn reserved_windows_device_names_are_flagged() {
+        // Case matters here: `slugify` always lowercases before this check
+        // ever runs, so only the lowercase forms need covering.
+        for name in ["con", "prn", "aux", "nul", "com1", "lpt9"] {
+            assert!(is_reserved_windows_name(name), "{name} should be reserved");
+        }
+        assert!(!is_reserved_windows_name("console"));
+        assert!(!is_reserved_windows_name("con-2"));
+    }
+
+    #[test]
+    fn reserved_name_survives_slugify() {
+        // "CON" (a plausible real display name someone types) must still
+        // collide with the reserved list after slugify lowercases it.
+        assert_eq!(slugify("CON"), "con");
+        assert!(is_reserved_windows_name(&slugify("CON")));
+    }
+
+    #[test]
+    fn strips_known_pack_extensions() {
+        assert_eq!(strip_pack_extension("Ascendra-2.1.0.zip"), "Ascendra-2.1.0");
+        assert_eq!(strip_pack_extension("MyPack-1.0.mrpack"), "MyPack-1.0");
+        // Unrecognized extension (or none) is left untouched rather than
+        // guessed at.
+        assert_eq!(strip_pack_extension("weird-pack.tar.gz"), "weird-pack.tar.gz");
     }
 
 }

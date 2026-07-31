@@ -146,6 +146,8 @@ impl Database {
             "ALTER TABLE instances ADD COLUMN total_play_seconds INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE instance_mods ADD COLUMN icon_url TEXT",
             "ALTER TABLE content_meta_cache ADD COLUMN written_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE content_meta_cache ADD COLUMN mod_id TEXT",
+            "ALTER TABLE instances ADD COLUMN modpack_version_label TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }

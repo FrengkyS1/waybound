@@ -90,8 +90,8 @@
 
 .iconBtn {
   position: relative;
-  width: 84px;
-  height: 84px;
+  width: 112px;
+  height: 112px;
   flex: none;
   padding: 0;
   border: 1px solid var(--color-border);
@@ -113,7 +113,7 @@
 }
 
 .iconInitial {
-  font-size: 36px;
+  font-size: 48px;
   font-weight: 700;
   color: var(--color-text-muted);
 }
@@ -121,8 +121,8 @@
 .iconOverlay {
   position: absolute;
   inset: auto 0 0 0;
-  padding: 2px 0;
-  font-size: 9px;
+  padding: 3px 0;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   text-align: center;
@@ -254,7 +254,11 @@
   position: relative;
 }
 
-.kebab {
+.kebab,
+.folderBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 36px;
   height: 36px;
   border: 1px solid var(--color-border);
@@ -264,6 +268,11 @@
   font-size: 18px;
   line-height: 1;
   cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+.folderBtn:hover {
+  color: var(--color-text);
+  border-color: var(--color-text-muted);
 }
 .kebab:hover {
   color: var(--color-text);
@@ -556,8 +565,17 @@
 }
 
 .modIconFallback {
-  background: var(--color-surface-raised);
+  /* Generic "no icon available" glyph — shown for a mod whose icon simply
+     isn't known (embedded jar has none, and CurseForge either has no icon on
+     record or refused the lookup with a 403 for a distribution-restricted
+     project). A blank box here used to be indistinguishable from "still
+     loading" or a rendering bug. */
+  background-color: var(--color-surface-raised);
   border: 1px solid var(--color-border-subtle);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238c8c8c' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z'/%3E%3Cpath d='M12 3v9M12 12l8-4.5M12 12l-8-4.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 55%;
 }
 
 .modInfo {

@@ -84,14 +84,18 @@ pub async fn resolve_version(
     }
 }
 
-async fn latest_forge(client: &Client, game_version: &str) -> Result<String, LaunchError> {
-    let promos: Promotions = client
+async fn fetch_forge_promotions(client: &Client) -> Result<Promotions, LaunchError> {
+    client
         .get(FORGE_PROMOTIONS)
         .send()
         .await?
         .json()
         .await
-        .map_err(|e| LaunchError::Parse(format!("forge promotions: {e}")))?;
+        .map_err(|e| LaunchError::Parse(format!("forge promotions: {e}")))
+}
+
+pub(crate) async fn latest_forge(client: &Client, game_version: &str) -> Result<String, LaunchError> {
+    let promos = fetch_forge_promotions(client).await?;
     promos
         .promos
         .get(&format!("{game_version}-recommended"))
@@ -100,7 +104,25 @@ async fn latest_forge(client: &Client, game_version: &str) -> Result<String, Lau
         .ok_or_else(|| LaunchError::Parse(format!("no Forge build for {game_version}")))
 }
 
-async fn latest_neoforge(client: &Client, game_version: &str) -> Result<String, LaunchError> {
+/// Forge's "recommended" build lags behind "latest" — sometimes for months,
+/// as with 1.20.1 staying on 47.4.10 while 47.4.22 was out — and a mod can
+/// (and did, in practice) raise its own minimum Forge requirement past
+/// whatever "recommended" currently is. `latest_forge` above stays
+/// recommended-first for automatic/fresh-instance resolution, where the more
+/// conservative default is the right call; this is specifically for the
+/// user's own explicit "check for a newer build" action, where surfacing
+/// only "recommended" can never actually offer the fix for that exact case.
+pub(crate) async fn latest_forge_build(client: &Client, game_version: &str) -> Result<String, LaunchError> {
+    let promos = fetch_forge_promotions(client).await?;
+    promos
+        .promos
+        .get(&format!("{game_version}-latest"))
+        .or_else(|| promos.promos.get(&format!("{game_version}-recommended")))
+        .cloned()
+        .ok_or_else(|| LaunchError::Parse(format!("no Forge build for {game_version}")))
+}
+
+pub(crate) async fn latest_neoforge(client: &Client, game_version: &str) -> Result<String, LaunchError> {
     // NeoForge versions look like `20.4.190` for MC `1.20.4`, `21.1.66` for
     // `1.21.1`. Derive the `<major>.<minor>` prefix and pick the newest match.
     let mut parts = game_version.split('.');

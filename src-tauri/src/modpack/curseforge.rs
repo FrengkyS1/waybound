@@ -277,8 +277,8 @@ async fn find_modrinth_replacement(
         {
             crate::activity::append_log(
                 &format!(
-                    "CF modpack import: found \"{mod_name}\" on Modrinth as \"{}\" (project {project_id}), using it instead of CurseForge",
-                    hit.name
+                    "CF modpack import: found \"{mod_name}\" on Modrinth as \"{}\" (project {project_id}), using it instead of CurseForge — resolved file: {}",
+                    hit.name, download.filename
                 ),
                 "debug",
                 None,
@@ -705,6 +705,7 @@ pub async fn import_curseforge_modpack_zip(
         content_names,
         project_uids,
         missing_mods,
+        version_label: None,
     })
 }
 

@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useTimedMessage } from "../../hooks/useTimedMessage";
+import { getLatestLoaderVersion } from "../instances/api";
+import type { InstanceSummary } from "../instances/types";
 import {
   getInstanceLaunchConfig,
   getLaunchSettings,
@@ -17,14 +20,19 @@ const MIN_MEMORY_MB = 512;
 const MAX_MEMORY_MB = 32768;
 
 interface LaunchOverridesProps {
-  instanceId: string;
+  instance: InstanceSummary;
+  /** Pins (or, with `null`, un-pins) this instance's loader build. */
+  onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
 }
+
+const LOADER_HAS_LATEST_BUILD = new Set(["forge", "neoforge"]);
 
 /**
  * Per-instance launch overrides. Any field left on "Use global" falls back to
  * the global launch settings; a value here overrides just this instance.
  */
-export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
+export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverridesProps) {
+  const instanceId = instance.id;
   const [detected, setDetected] = useState<JavaRuntime[]>([]);
   const [javaChoice, setJavaChoice] = useState("global");
   const [memory, setMemory] = useState("");
@@ -32,6 +40,12 @@ export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
   const [saving, setSaving] = useState(false);
   const { message, showMessage, clearMessage } = useTimedMessage();
   const [error, setError] = useState<string | null>(null);
+
+  const [latestLoaderVersion, setLatestLoaderVersion] = useState<string | null>(null);
+  const [checkingLoader, setCheckingLoader] = useState(false);
+  const [applyingLoader, setApplyingLoader] = useState(false);
+  const [loaderError, setLoaderError] = useState<string | null>(null);
+  const [confirmApplyOpen, setConfirmApplyOpen] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -50,18 +64,64 @@ export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
     })();
   }, [instanceId]);
 
+  // A previous instance's "here's a newer build" result has no bearing on
+  // whatever instance is showing now — drop it rather than let it linger
+  // across a navigation.
+  useEffect(() => {
+    setLatestLoaderVersion(null);
+    setLoaderError(null);
+  }, [instanceId]);
+
+  const supportsLoaderUpdate = LOADER_HAS_LATEST_BUILD.has(instance.loader);
+
+  async function handleCheckForLoaderUpdate() {
+    setCheckingLoader(true);
+    setLoaderError(null);
+    try {
+      setLatestLoaderVersion(await getLatestLoaderVersion(instanceId));
+    } catch (err) {
+      setLoaderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckingLoader(false);
+    }
+  }
+
+  async function handleApplyLoaderVersion() {
+    if (!latestLoaderVersion) return;
+    setApplyingLoader(true);
+    setLoaderError(null);
+    try {
+      await onLoaderVersionChange(latestLoaderVersion);
+      showMessage(
+        `Loader version set to ${latestLoaderVersion}. It'll download the next time you launch.`,
+      );
+      setLatestLoaderVersion(null);
+    } catch (err) {
+      setLoaderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setApplyingLoader(false);
+      setConfirmApplyOpen(false);
+    }
+  }
+
   async function handleSave() {
     setSaving(true);
     setError(null);
     clearMessage();
     try {
+      const clampedMemory = memory.trim()
+        ? Math.min(Math.max(Number(memory), MIN_MEMORY_MB), MAX_MEMORY_MB)
+        : null;
       await setInstanceLaunchConfig(instanceId, {
         javaPath: javaChoice === "global" ? null : javaChoice,
-        maxMemoryMb: memory.trim()
-          ? Math.min(Math.max(Number(memory), MIN_MEMORY_MB), MAX_MEMORY_MB)
-          : null,
+        maxMemoryMb: clampedMemory,
         jvmArgs: jvmArgs.trim() || null,
       });
+      // Without this, typing an out-of-range value (e.g. "0") kept showing
+      // exactly what was typed even though the backend clamped it to 512 —
+      // the field never reflected what was actually saved and would keep
+      // looking wrong on every future visit to this tab.
+      setMemory(clampedMemory ? String(clampedMemory) : "");
       showMessage("Instance launch overrides saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -71,6 +131,7 @@ export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
   }
 
   return (
+    <>
     <section className={styles.settingsCard}>
       <div className={styles.settingsHead}>
         <h2 className={styles.cardTitle}>
@@ -135,5 +196,54 @@ export function LaunchOverrides({ instanceId }: LaunchOverridesProps) {
       {error && <p className={styles.error}>{error}</p>}
       {message && <p className={styles.message}>{message}</p>}
     </section>
+
+    {supportsLoaderUpdate && (
+      <section className={styles.settingsCard}>
+        <div className={styles.settingsHead}>
+          <h2 className={styles.cardTitle}>Loader version</h2>
+          <button
+            type="button"
+            className={styles.ghostBtn}
+            onClick={() => void handleCheckForLoaderUpdate()}
+            disabled={checkingLoader}
+          >
+            {checkingLoader ? "Checking…" : "Check for update"}
+          </button>
+        </div>
+        <p className={styles.note}>
+          {instance.loaderVersion
+            ? `Loader version: ${instance.loaderVersion}`
+            : "Loader version: automatic (uses whatever build is currently recommended at launch)."}
+          {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
+            <> — a newer build, {latestLoaderVersion}, is available.</>
+          )}
+          {latestLoaderVersion && latestLoaderVersion === instance.loaderVersion && (
+            <> You're on the latest recommended build.</>
+          )}
+        </p>
+        {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
+          <button
+            type="button"
+            className={styles.primaryBtn}
+            onClick={() => setConfirmApplyOpen(true)}
+            disabled={applyingLoader}
+          >
+            Update to {latestLoaderVersion}
+          </button>
+        )}
+        {loaderError && <p className={styles.error}>{loaderError}</p>}
+      </section>
+    )}
+
+    {confirmApplyOpen && latestLoaderVersion && (
+      <ConfirmDialog
+        title="Update loader version?"
+        message={`This sets ${instance.name}'s loader to ${latestLoaderVersion}. It downloads automatically the next time you launch.`}
+        confirmLabel={applyingLoader ? "Updating…" : "Update"}
+        onConfirm={() => void handleApplyLoaderVersion()}
+        onCancel={() => setConfirmApplyOpen(false)}
+      />
+    )}
+    </>
   );
 }

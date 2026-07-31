@@ -15,22 +15,25 @@ mod activity;
 use commands::{
     apply_global_mc_options_to_all_instances, cancel_install, cancel_launch, clear_curseforge_api_key, create_instance,
     add_play_time, delete_instance, dismiss_missing_mod, duplicate_instance, get_account, get_activity_logs, get_curseforge_status,
-    get_content_meta, get_mod_summary_for_content, list_instance_content, list_mod_configs,
+    get_content_meta, get_latest_loader_version, get_mod_summary_for_content, list_instance_content, list_mod_configs,
     read_config_file, remove_content_file, set_content_enabled, write_config_file,
     get_global_mc_options, get_instance_launch_config, get_instance_options, get_launch_settings,
-    get_mod_details, get_modpack_content, get_version_changelog,
+    get_mod_details, get_modpack_content, get_running_instances, get_version_changelog,
     import_curseforge_api_key_from_env_file, install_mod_to_instance, launch_instance,
     list_instance_mods, list_instances, list_java_runtimes, list_minecraft_versions,
     list_pending_missing_mods, logout,
-    microsoft_login, open_all_missing_mods_browsers, open_missing_mods_browser, remove_mod_from_instance, rename_instance, save_global_mc_options,
+    microsoft_login, open_all_missing_mods_browsers, open_in_file_manager, open_missing_mods_browser, remove_mod_from_instance, rename_instance, save_global_mc_options,
     save_instance_options, search_mods, set_curseforge_api_key, set_instance_icon,
-    set_instance_launch_config, set_launch_settings, test_curseforge_api_key,
+    set_instance_launch_config, set_instance_loader_version, set_launch_settings, test_curseforge_api_key,
     test_curseforge_docker_env_key, update_mod_in_instance, watch_for_missing_mods, AppState,
 };
 use config::ConfigStore;
 use db::Database;
 use sources::curseforge::CurseForgeClient;
 use sources::modrinth::ModrinthClient;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -41,6 +44,55 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let show_item = MenuItem::with_id(app, "show", "Show Waybound", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Waybound")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            Ok(())
+        })
+        // Closing the window sends the app to the tray instead of quitting —
+        // the tray icon's own "Quit" menu item is the only way to actually
+        // exit, so a launched Minecraft process's parent app stays reachable
+        // (and the running-instance tracking in `AppState` isn't lost) while
+        // the window is just hidden, not the process torn down.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                window.hide().ok();
+                api.prevent_close();
+            }
+        })
         .manage(AppState {
             modrinth,
             curseforge,
@@ -63,6 +115,8 @@ pub fn run() {
             create_instance,
             rename_instance,
             set_instance_icon,
+            get_latest_loader_version,
+            set_instance_loader_version,
             list_instance_content,
             get_content_meta,
             get_mod_summary_for_content,
@@ -98,8 +152,10 @@ pub fn run() {
             add_play_time,
             launch_instance,
             cancel_launch,
+            get_running_instances,
             open_missing_mods_browser,
             open_all_missing_mods_browsers,
+            open_in_file_manager,
             watch_for_missing_mods,
             update_mod_in_instance,
         ])

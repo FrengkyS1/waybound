@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { openPath } from "@tauri-apps/plugin-opener";
 import {
   createInstance,
   deleteInstance,
   duplicateInstance,
   fetchInstances,
   fetchMinecraftVersions,
+  openInFileManager,
   renameInstance,
   setInstanceIcon,
+  setInstanceLoaderVersion,
 } from "../instances/api";
 import { fileToIconDataUrl } from "./imageIcon";
 import { fetchCurseForgeStatus } from "../settings/api";
@@ -202,6 +203,17 @@ export function HomePage({
     }
   }
 
+  async function handleLoaderVersionChange(instanceId: string, loaderVersion: string | null) {
+    setError(null);
+    try {
+      await setInstanceLoaderVersion(instanceId, loaderVersion);
+      await refresh(instanceId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
   function handleOpenDetail(id: string) {
     setSelectedId(id);
   }
@@ -257,7 +269,7 @@ export function HomePage({
       { label: "Rename", onClick: () => setRenamingId(instance.id) },
       { label: "Duplicate", onClick: () => void handleDuplicate(instance.id) },
       { label: "Change image", onClick: () => pickIcon(instance.id) },
-      { label: "Open folder", onClick: () => void openPath(instance.rootPath) },
+      { label: "Open folder", onClick: () => void openInFileManager(instance.rootPath) },
       { label: "Add mods", onClick: () => onAddMods(instance) },
       {
         label: "Delete instance",
@@ -285,6 +297,9 @@ export function HomePage({
         onAddMods={() => onAddMods(selected)}
         onChangeImage={(icon) => void handleChangeIcon(selected.id, icon)}
         onRename={(name) => handleRename(selected.id, name)}
+        onLoaderVersionChange={(loaderVersion) =>
+          handleLoaderVersionChange(selected.id, loaderVersion)
+        }
         onOpenMod={onOpenMod}
         tab={instanceTab}
         onTabChange={onInstanceTabChange}

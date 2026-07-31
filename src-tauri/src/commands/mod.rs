@@ -19,13 +19,15 @@ pub use config::{
 };
 pub use launch::{
     add_play_time, cancel_launch, get_instance_launch_config, get_launch_settings,
-    launch_instance, list_java_runtimes, set_instance_launch_config, set_launch_settings,
+    get_running_instances, launch_instance, list_java_runtimes, set_instance_launch_config,
+    set_launch_settings,
 };
 pub use instances::{
     cancel_install, create_instance, delete_instance, dismiss_missing_mod, duplicate_instance,
-    get_mod_summary_for_content, install_mod_to_instance, list_instance_mods, list_instances,
-    list_minecraft_versions, list_pending_missing_mods, remove_mod_from_instance, rename_instance,
-    set_instance_icon, update_mod_in_instance,
+    get_latest_loader_version, get_mod_summary_for_content, install_mod_to_instance,
+    list_instance_mods, list_instances, list_minecraft_versions, list_pending_missing_mods,
+    open_in_file_manager, remove_mod_from_instance, rename_instance, set_instance_icon,
+    set_instance_loader_version, update_mod_in_instance,
 };
 pub use missing_mods::{open_all_missing_mods_browsers, open_missing_mods_browser, watch_for_missing_mods};
 pub use project::{

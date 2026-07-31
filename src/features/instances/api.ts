@@ -22,6 +22,11 @@ export async function renameInstance(instanceId: string, name: string): Promise<
   await invoke("rename_instance", { instanceId, name });
 }
 
+/** Opens a folder in the user's default file manager (bypasses the opener plugin — see backend comment). */
+export async function openInFileManager(path: string): Promise<void> {
+  await invoke("open_in_file_manager", { path });
+}
+
 /** Clones an instance (files, mods, launch config, icon) with fresh play stats. */
 export async function duplicateInstance(instanceId: string): Promise<InstanceSummary> {
   return invoke<InstanceSummary>("duplicate_instance", { instanceId });
@@ -144,6 +149,23 @@ export async function setInstanceIcon(
   icon: string | null,
 ): Promise<void> {
   await invoke("set_instance_icon", { instanceId, icon });
+}
+
+/** Looks up the loader's current recommended build for this instance's
+ * Minecraft version (Forge/NeoForge only — resolves to `null` for
+ * Fabric/Quilt/Vanilla, which have no equivalent "latest recommended build"
+ * concept here). Doesn't change anything by itself. */
+export async function getLatestLoaderVersion(instanceId: string): Promise<string | null> {
+  return invoke("get_latest_loader_version", { instanceId });
+}
+
+/** Pins (or, passing `null`, un-pins) the instance's loader build. Takes
+ * effect on the next launch — nothing needs to download right away. */
+export async function setInstanceLoaderVersion(
+  instanceId: string,
+  loaderVersion: string | null,
+): Promise<void> {
+  await invoke("set_instance_loader_version", { instanceId, loaderVersion });
 }
 
 export async function fetchInstanceMods(instanceId: string): Promise<InstalledMod[]> {

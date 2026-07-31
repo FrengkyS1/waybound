@@ -187,6 +187,7 @@ pub async fn import_modrinth_mrpack_bytes(
         content_names,
         project_uids,
         missing_mods: Vec::new(),
+        version_label: Some(index.version_id.clone()).filter(|v| !v.is_empty()),
     })
 }
 
