@@ -265,6 +265,12 @@ fn map_modrinth_error(error: ModrinthError) -> String {
 
         ModrinthError::NotFound => "Modrinth returned no compatible file.".to_string(),
 
+        // Only reachable from the install path; the search path never picks a
+        // specific version, but the match arm is still required here.
+        ModrinthError::Incompatible => {
+            "That version is not built for this instance's Minecraft version and loader.".to_string()
+        }
+
         ModrinthError::Decode(message) => format!("Modrinth response parse error: {message}"),
 
     }

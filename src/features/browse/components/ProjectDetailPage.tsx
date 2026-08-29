@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   fetchActivityLogs,
   fetchModDetails,
@@ -13,8 +13,16 @@ import { isInstallableType, installVerb } from "../detailTypes";
 import type { VersionPrefill } from "../../settings/types";
 import { GalleryLightbox } from "./GalleryLightbox";
 import { InstallTargetDialog } from "./InstallTargetDialog";
-import { MarkdownBody } from "./MarkdownBody";
-import { OverviewBody } from "./OverviewBody";
+import { CopyNameButton } from "./CopyNameButton";
+// The react-markdown/rehype/remark stack is the single heaviest dependency
+// cluster in the app; lazy-loading it keeps it out of the startup chunk so
+// first paint isn't blocked on parsing code most sessions never open.
+const MarkdownBody = lazy(() =>
+  import("./MarkdownBody").then((m) => ({ default: m.MarkdownBody })),
+);
+const OverviewBody = lazy(() =>
+  import("./OverviewBody").then((m) => ({ default: m.OverviewBody })),
+);
 import { ModpackContentTab } from "./ModpackContentTab";
 import { SourceBadges } from "./SourceBadges";
 import styles from "./ProjectDetailPage.module.css";
@@ -143,6 +151,25 @@ export function ProjectDetailPage({
   const directInstall =
     Boolean(installTarget) && data.projectType !== "modpack";
 
+  // When adding to a specific instance, version rows that don't match the
+  // instance's game version / loader are disabled — installing them would
+  // just be rejected by the backend (or worse, before it existed, silently
+  // install the wrong loader's jar).
+  const targetMc = installTarget?.minecraftVersion ?? null;
+  const targetLoader = installTarget?.loader ?? null;
+  function matchesInstance(gameVersions: string[], loaders: string[]): boolean {
+    if (!targetMc && !targetLoader) return true;
+    const gvOk =
+      gameVersions.length === 0 ||
+      (targetMc != null && gameVersions.includes(targetMc));
+    const loaderOk =
+      targetLoader == null ||
+      targetLoader === "vanilla" ||
+      loaders.length === 0 ||
+      loaders.some((l) => l.toLowerCase() === targetLoader);
+    return gvOk && loaderOk;
+  }
+
   function openInstall(version?: VersionPrefill) {
     if (directInstall && installTarget) {
       void handleDirectInstall(version);
@@ -202,7 +229,10 @@ export function ProjectDetailPage({
               <div className={styles.heroBody}>
                 <div className={styles.titleRow}>
                   <div>
-                    <h1 className={styles.title}>{data.name}</h1>
+                    <div className={styles.titleLine}>
+                      <h1 className={styles.title}>{data.name}</h1>
+                      <CopyNameButton name={data.name} />
+                    </div>
                     <p className={styles.author}>by {data.author}</p>
                   </div>
                   {canInstall && (
@@ -283,10 +313,16 @@ export function ProjectDetailPage({
                 {tab === "overview" && (
                   <div className={styles.overview}>
                     {detail?.body ? (
-                      <OverviewBody
-                        content={detail.body}
-                        bodyFormat={detail.bodyFormat}
-                      />
+                      <Suspense
+                        fallback={
+                          <p className={styles.emptyBody}>Loading description…</p>
+                        }
+                      >
+                        <OverviewBody
+                          content={detail.body}
+                          bodyFormat={detail.bodyFormat}
+                        />
+                      </Suspense>
                     ) : (
                       <p className={styles.emptyBody}>
                         {data.description || "No description available."}
@@ -338,7 +374,13 @@ export function ProjectDetailPage({
                       <p className={styles.emptyBody}>Loading changelog…</p>
                     )}
                     {!changelogLoading && changelogBody && (
-                      <MarkdownBody content={changelogBody} />
+                      <Suspense
+                        fallback={
+                          <p className={styles.emptyBody}>Loading changelog…</p>
+                        }
+                      >
+                        <MarkdownBody content={changelogBody} />
+                      </Suspense>
                     )}
                     {!changelogLoading && !changelogBody && (
                       <p className={styles.emptyBody}>
@@ -402,6 +444,10 @@ export function ProjectDetailPage({
                         version.loaders,
                         detail.suggestedInstance.loader,
                       );
+                      const compatible = matchesInstance(
+                        version.gameVersions,
+                        version.loaders,
+                      );
                       return (
                         <article key={version.id} className={styles.versionRow}>
                           <div className={styles.versionMain}>
@@ -422,6 +468,12 @@ export function ProjectDetailPage({
                             <button
                               type="button"
                               className={styles.versionInstallBtn}
+                              disabled={!compatible}
+                              title={
+                                compatible
+                                  ? undefined
+                                  : "Not built for this instance's game version and loader"
+                              }
                               onClick={() =>
                                 openInstall({
                                   versionId: version.id,

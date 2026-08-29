@@ -35,6 +35,11 @@ const FORGE_PROMOTIONS: &str =
 const NEOFORGE_MAVEN: &str = "https://maven.neoforged.net/releases";
 const NEOFORGE_META: &str =
     "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml";
+// The original 1.20.1 fork was published under a separate `forge` artifact
+// whose versions carry the game version Forge-promotions style
+// (`1.20.1-47.1.11`), not the stripped form the modern artifact uses.
+const NEOFORGE_LEGACY_META: &str =
+    "https://maven.neoforged.net/releases/net/neoforged/forge/maven-metadata.xml";
 
 #[derive(Deserialize)]
 struct Promotions {
@@ -122,40 +127,119 @@ pub(crate) async fn latest_forge_build(client: &Client, game_version: &str) -> R
         .ok_or_else(|| LaunchError::Parse(format!("no Forge build for {game_version}")))
 }
 
-pub(crate) async fn latest_neoforge(client: &Client, game_version: &str) -> Result<String, LaunchError> {
-    // NeoForge versions look like `20.4.190` for MC `1.20.4`, `21.1.66` for
-    // `1.21.1`. Derive the `<major>.<minor>` prefix and pick the newest match.
-    let mut parts = game_version.split('.');
-    let _one = parts.next();
-    let major = parts.next().unwrap_or("");
-    let minor = parts.next().unwrap_or("0");
-    let prefix = format!("{major}.{minor}.");
+pub(crate) async fn latest_neoforge(
+    client: &Client,
+    game_version: &str,
+) -> Result<String, LaunchError> {
+    // NeoForge versions embed the targeted game version, but the mapping has
+    // changed twice (PrismLauncher reads the authoritative value out of each
+    // installer's install_profile.json; prefix matching is our lighter
+    // equivalent):
+    //
+    // - Legacy `1.x.y` builds strip the leading `1.`: MC `1.20.4` ->
+    //   `20.4.190`, and a bare `1.21` maps to the `21.0.` lineage. The
+    //   separate 1.20.1 fork instead uses long forms: MC `1.20.1` ->
+    //   `1.20.1-47.1.11` under the legacy artifact.
+    // - Since Mojang dropped the `1.` prefix (year-based versions), NeoForge
+    //   embeds the FULL game version: MC `26.2` -> `26.2.0.67`, MC
+    //   `26.1.2` -> `26.1.2.97`.
+    let prefixes = neoforge_prefix_candidates(game_version);
 
-    let xml = client.get(NEOFORGE_META).send().await?.text().await?;
-    let mut best: Option<String> = None;
-    for chunk in xml.split("<version>").skip(1) {
-        if let Some(end) = chunk.find("</version>") {
-            let version = &chunk[..end];
-            if version.starts_with(&prefix) {
-                // Lexicographic works poorly for numbers; compare by parsed patch.
-                best = Some(match best {
-                    Some(cur) if newer(&cur, version) => cur,
-                    _ => version.to_string(),
-                });
-            }
-        }
+    let mut pool = fetch_maven_versions(client, NEOFORGE_META).await?;
+    if game_version.starts_with("1.") {
+        pool.extend(fetch_maven_versions(client, NEOFORGE_LEGACY_META).await?);
     }
-    best.ok_or_else(|| LaunchError::Parse(format!("no NeoForge build for {game_version}")))
+
+    newest_matching(&pool, &prefixes)
+        .ok_or_else(|| LaunchError::Parse(format!("no NeoForge build for {game_version}")))
+}
+
+/// Prefix candidates for `game_version`, most specific first.
+fn neoforge_prefix_candidates(game_version: &str) -> Vec<String> {
+    let mut parts = game_version.split('.');
+    let first = parts.next().unwrap_or("");
+    if first.is_empty() {
+        return Vec::new();
+    }
+    if first == "1" {
+        let major = parts.next().unwrap_or("");
+        let minor = parts.next().unwrap_or("0");
+        return vec![format!("{major}.{minor}."), format!("{game_version}-")];
+    }
+
+    let mut candidates = Vec::new();
+    if game_version.matches('.').count() == 1 {
+        // A bare two-component id like `26.1` pins the `.0` lineage; try it
+        // before the broader prefix so a later point-release build
+        // (`26.1.2.x`, which targets MC `26.1.2`) is never picked for `26.1`.
+        candidates.push(format!("{game_version}.0."));
+    }
+    candidates.push(format!("{game_version}."));
+    candidates.push(format!("{game_version}-"));
+    candidates
+}
+
+async fn fetch_maven_versions(client: &Client, meta_url: &str) -> Result<Vec<String>, LaunchError> {
+    let xml = client.get(meta_url).send().await?.text().await?;
+    Ok(xml
+        .split("<version>")
+        .skip(1)
+        .filter_map(|chunk| chunk.find("</version>").map(|end| chunk[..end].trim().to_string()))
+        .collect())
+}
+
+/// Newest build matching the most specific candidate prefix that yields
+/// anything, preferring stable builds over `-beta`/`-alpha` prereleases
+/// within that tier (the maven metadata interleaves both).
+fn newest_matching(pool: &[String], prefixes: &[String]) -> Option<String> {
+    for prefix in prefixes {
+        let matches: Vec<&str> = pool
+            .iter()
+            .map(String::as_str)
+            .filter(|v| v.starts_with(prefix.as_str()))
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        let pick =
+            |candidates: &[&str]| -> Option<String> {
+                candidates
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| version_key(a).cmp(&version_key(b)))
+                    .map(str::to_string)
+            };
+        let stable: Vec<&str> = matches.iter().copied().filter(|v| !is_prerelease(v)).collect();
+        return pick(&stable).or_else(|| pick(&matches));
+    }
+    None
+}
+
+/// A prerelease when some dash-separated segment isn't purely numeric:
+/// `26.2.0.43-beta` and `26.1.0.0-alpha.2+snapshot-1` are, but the legacy
+/// artifact's `1.20.1-47.1.11` (the dash separates the game version) is not.
+fn is_prerelease(version: &str) -> bool {
+    version.split('-').skip(1).any(|seg| {
+        seg.is_empty()
+            || !seg
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+/// Numeric component vector for semver-ish ordering ("21.1.66" -> [21, 1, 66]).
+/// Non-numeric pieces parse as 0; lexicographic comparison on the vectors
+/// avoids string-ordering mistakes like "100" < "66".
+fn version_key(s: &str) -> Vec<u64> {
+    s.split(|c: char| c == '.' || c == '-')
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
 }
 
 /// True when `a` is a newer semver-ish version than `b`.
+#[cfg(test)]
 fn newer(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split(|c: char| c == '.' || c == '-')
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    parse(a) > parse(b)
+    version_key(a) > version_key(b)
 }
 
 fn installer_url(loader: ModLoader, game_version: &str, loader_version: &str) -> String {
@@ -502,11 +586,76 @@ fn main_class_of(jar: &Path) -> Result<String, LaunchError> {
 mod tests {
     use super::*;
 
+    fn versions(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn owned(v: &[&str]) -> Vec<String> {
+        versions(v)
+    }
+
     #[test]
     fn version_ordering() {
         assert!(newer("47.4.0", "47.2.0"));
         assert!(newer("21.1.100", "21.1.66"));
         assert!(!newer("20.4.190", "21.1.66"));
+    }
+
+    #[test]
+    fn neoforge_prefixes_legacy_and_year_based() {
+        use super::neoforge_prefix_candidates;
+        assert_eq!(
+            neoforge_prefix_candidates("1.21.1"),
+            vec!["21.1.", "1.21.1-"]
+        );
+        // Missing patch level defaults to the `.0` lineage (real builds exist
+        // there: NeoForge 21.0.x targets MC 1.21).
+        assert_eq!(neoforge_prefix_candidates("1.21"), vec!["21.0.", "1.21-"]);
+        assert_eq!(
+            neoforge_prefix_candidates("26.2"),
+            vec!["26.2.0.", "26.2.", "26.2-"]
+        );
+        assert_eq!(
+            neoforge_prefix_candidates("26.1"),
+            vec!["26.1.0.", "26.1.", "26.1-"]
+        );
+        assert!(neoforge_prefix_candidates("").is_empty());
+    }
+
+    #[test]
+    fn picks_newest_stable_within_tier() {
+        let pool = versions(&["26.2.0.43-beta", "26.2.0.66", "26.2.0.67"]);
+        let prefixes = owned(&["26.2."]);
+        assert_eq!(newest_matching(&pool, &prefixes), Some("26.2.0.67".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_prerelease_when_only_option() {
+        let pool = versions(&["26.2.0.43-beta", "26.2.0.44-beta"]);
+        let prefixes = owned(&["26.2."]);
+        assert_eq!(
+            newest_matching(&pool, &prefixes),
+            Some("26.2.0.44-beta".to_string())
+        );
+    }
+
+    #[test]
+    fn more_specific_tier_wins() {
+        let pool = versions(&["26.1.0.5", "26.1.2.97"]);
+        let prefixes = owned(&["26.1.0.", "26.1."]);
+        assert_eq!(
+            newest_matching(&pool, &prefixes),
+            Some("26.1.0.5".to_string())
+        );
+    }
+
+    #[test]
+    fn prerelease_detection_spans_both_schemes() {
+        assert!(is_prerelease("26.2.0.43-beta"));
+        assert!(is_prerelease("26.1.0.0-alpha.2+snapshot-1"));
+        assert!(!is_prerelease("21.1.248"));
+        assert!(!is_prerelease("1.20.1-47.1.11"));
+        assert!(!is_prerelease("26.2.0.67"));
     }
 
     /// Network test: resolve the latest Forge build for 1.20.1, download its
@@ -539,5 +688,20 @@ mod tests {
             .await
             .unwrap();
         assert!(v.starts_with("21.1."), "unexpected neoforge version: {v}");
+
+        // Year-based scheme: the full game version is embedded.
+        let v = resolve_version(&client, ModLoader::NeoForge, "26.2", None)
+            .await
+            .unwrap();
+        assert!(v.starts_with("26.2."), "unexpected neoforge version: {v}");
+
+        // Legacy fork lives under the separate `forge` artifact.
+        let v = resolve_version(&client, ModLoader::NeoForge, "1.20.1", None)
+            .await
+            .unwrap();
+        assert!(
+            v.starts_with("1.20.1-") || v.starts_with("20.1."),
+            "unexpected neoforge version: {v}"
+        );
     }
 }

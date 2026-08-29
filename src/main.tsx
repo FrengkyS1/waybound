@@ -17,3 +17,6 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <App />
   </React.StrictMode>,
 );
+
+// React owns the screen now; drop the pre-JS splash from index.html.
+document.getElementById("splash")?.remove();

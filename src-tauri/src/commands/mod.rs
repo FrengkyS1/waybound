@@ -19,8 +19,8 @@ pub use config::{
 };
 pub use launch::{
     add_play_time, cancel_launch, get_instance_launch_config, get_launch_settings,
-    get_running_instances, launch_instance, list_java_runtimes, set_instance_launch_config,
-    set_launch_settings,
+    get_running_instances, launch_instance, list_java_runtimes, read_launch_log,
+    set_instance_launch_config, set_launch_settings,
 };
 pub use instances::{
     cancel_install, create_instance, delete_instance, dismiss_missing_mod, duplicate_instance,

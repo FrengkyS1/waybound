@@ -26,8 +26,16 @@ pub enum NarratorMode {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+// `#[serde(default)]` at the struct level, not per-field, and it is load-
+// bearing: this type is persisted inside `config.toml`, so every field added
+// later is absent from every config written before it. Without this, adding
+// one field makes the whole file fail to deserialize, and `ConfigStore::load`
+// reasonably treats an unparseable config as corrupt — renaming it to `.bak`
+// and starting fresh. That silently destroyed a real user's saved account and
+// launch settings when the accessibility/comfort options were added. Missing
+// keys must fall back to their default instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct McOptions {
     pub customize: bool,
     pub fullscreen: bool,
@@ -46,8 +54,15 @@ pub struct McOptions {
     pub mipmap_levels: i32,
     pub entity_distance_scaling: i32,
     pub biome_blend_radius: i32,
+    pub ao: bool,
+    // 0-1 fractions in options.txt, stored here as 0-100 ints (see `gamma`).
+    pub screen_effect_scale: i32,
+    pub fov_effect_scale: i32,
+    pub darkness_effect_scale: i32,
     pub auto_jump: bool,
+    /// Maps to `invertYMouse`.
     pub invert_mouse: bool,
+    pub invert_x_mouse: bool,
     pub mouse_sensitivity: i32,
     pub raw_mouse_input: bool,
     pub discrete_mouse_scroll: bool,
@@ -55,6 +70,11 @@ pub struct McOptions {
     pub toggle_crouch: bool,
     pub show_subtitles: bool,
     pub reduced_debug_info: bool,
+    pub high_contrast: bool,
+    pub directional_audio: bool,
+    pub hide_lightning_flashes: bool,
+    pub force_unicode_font: bool,
+    pub damage_tilt_strength: i32,
     pub narrator: NarratorMode,
     pub language: String,
     pub master_volume: i32,
@@ -67,7 +87,11 @@ pub struct McOptions {
     pub player_volume: i32,
     pub ambient_volume: i32,
     pub voice_volume: i32,
-    #[serde(default)]
+    pub ui_volume: i32,
+    // No field-level `#[serde(default)]` here on purpose: it would shadow the
+    // struct-level one above with `HashMap::default()`, i.e. an *empty* map,
+    // so a config omitting this key would silently come back with no key
+    // bindings at all instead of the vanilla set.
     pub key_bindings: HashMap<String, String>,
 }
 
@@ -107,8 +131,13 @@ impl Default for McOptions {
             mipmap_levels: 4,
             entity_distance_scaling: 100,
             biome_blend_radius: 2,
+            ao: true,
+            screen_effect_scale: 100,
+            fov_effect_scale: 100,
+            darkness_effect_scale: 100,
             auto_jump: false,
             invert_mouse: false,
+            invert_x_mouse: false,
             mouse_sensitivity: 50,
             raw_mouse_input: true,
             discrete_mouse_scroll: false,
@@ -116,6 +145,11 @@ impl Default for McOptions {
             toggle_crouch: false,
             show_subtitles: false,
             reduced_debug_info: false,
+            high_contrast: false,
+            directional_audio: false,
+            hide_lightning_flashes: false,
+            force_unicode_font: false,
+            damage_tilt_strength: 100,
             narrator: NarratorMode::Off,
             language: "en_us".to_string(),
             master_volume: 100,
@@ -128,6 +162,7 @@ impl Default for McOptions {
             player_volume: 100,
             ambient_volume: 100,
             voice_volume: 100,
+            ui_volume: 100,
             key_bindings: default_key_bindings(),
         }
     }
@@ -340,6 +375,7 @@ fn parse_options(content: &str) -> McOptions {
     };
     options.auto_jump = parse_bool(map.get("autoJump"), options.auto_jump);
     options.invert_mouse = parse_bool(map.get("invertYMouse"), options.invert_mouse);
+    options.invert_x_mouse = parse_bool(map.get("invertXMouse"), options.invert_x_mouse);
     // Vanilla stores sensitivity as a 0.0-1.0 fraction where displayed
     // percent = value * 200 (0.5 -> 100%, 1.0 -> 200%), not value * 100.
     options.mouse_sensitivity =
@@ -351,16 +387,17 @@ fn parse_options(content: &str) -> McOptions {
     if let Some(lang) = map.get("lang") {
         options.language = lang.clone();
     }
-    options.master_volume = volume_from_file(map.get("soundCategory_master"), options.master_volume);
-    options.music_volume = volume_from_file(map.get("soundCategory_music"), options.music_volume);
-    options.jukebox_volume = volume_from_file(map.get("soundCategory_record"), options.jukebox_volume);
-    options.weather_volume = volume_from_file(map.get("soundCategory_weather"), options.weather_volume);
-    options.blocks_volume = volume_from_file(map.get("soundCategory_block"), options.blocks_volume);
-    options.hostile_volume = volume_from_file(map.get("soundCategory_hostile"), options.hostile_volume);
-    options.neutral_volume = volume_from_file(map.get("soundCategory_neutral"), options.neutral_volume);
-    options.player_volume = volume_from_file(map.get("soundCategory_player"), options.player_volume);
-    options.ambient_volume = volume_from_file(map.get("soundCategory_ambient"), options.ambient_volume);
-    options.voice_volume = volume_from_file(map.get("soundCategory_voice"), options.voice_volume);
+    options.master_volume = percent_from_file(map.get("soundCategory_master"), options.master_volume);
+    options.music_volume = percent_from_file(map.get("soundCategory_music"), options.music_volume);
+    options.jukebox_volume = percent_from_file(map.get("soundCategory_record"), options.jukebox_volume);
+    options.weather_volume = percent_from_file(map.get("soundCategory_weather"), options.weather_volume);
+    options.blocks_volume = percent_from_file(map.get("soundCategory_block"), options.blocks_volume);
+    options.hostile_volume = percent_from_file(map.get("soundCategory_hostile"), options.hostile_volume);
+    options.neutral_volume = percent_from_file(map.get("soundCategory_neutral"), options.neutral_volume);
+    options.player_volume = percent_from_file(map.get("soundCategory_player"), options.player_volume);
+    options.ambient_volume = percent_from_file(map.get("soundCategory_ambient"), options.ambient_volume);
+    options.voice_volume = percent_from_file(map.get("soundCategory_voice"), options.voice_volume);
+    options.ui_volume = percent_from_file(map.get("soundCategory_ui"), options.ui_volume);
     options.mipmap_levels = parse_i32(map.get("mipmapLevels"), options.mipmap_levels);
     options.entity_distance_scaling = (parse_f64(
         map.get("entityDistanceScaling"),
@@ -371,6 +408,19 @@ fn parse_options(content: &str) -> McOptions {
     options.discrete_mouse_scroll =
         parse_bool(map.get("discreteMouseScroll"), options.discrete_mouse_scroll);
     options.reduced_debug_info = parse_bool(map.get("reducedDebugInfo"), options.reduced_debug_info);
+    options.high_contrast = parse_bool(map.get("highContrast"), options.high_contrast);
+    options.directional_audio = parse_bool(map.get("directionalAudio"), options.directional_audio);
+    options.hide_lightning_flashes =
+        parse_bool(map.get("hideLightningFlashes"), options.hide_lightning_flashes);
+    options.force_unicode_font = parse_bool(map.get("forceUnicodeFont"), options.force_unicode_font);
+    options.damage_tilt_strength =
+        percent_from_file(map.get("damageTiltStrength"), options.damage_tilt_strength);
+    options.ao = parse_bool(map.get("ao"), options.ao);
+    options.screen_effect_scale =
+        percent_from_file(map.get("screenEffectScale"), options.screen_effect_scale);
+    options.fov_effect_scale = percent_from_file(map.get("fovEffectScale"), options.fov_effect_scale);
+    options.darkness_effect_scale =
+        percent_from_file(map.get("darknessEffectScale"), options.darkness_effect_scale);
     options.narrator = match parse_i32(map.get("narrator"), 0) {
         1 => NarratorMode::All,
         2 => NarratorMode::Chat,
@@ -427,6 +477,7 @@ fn serialize_options(options: &McOptions) -> String {
         ),
         format!("autoJump:{}", options.auto_jump),
         format!("invertYMouse:{}", options.invert_mouse),
+        format!("invertXMouse:{}", options.invert_x_mouse),
         format!("mouseSensitivity:{:.2}", options.mouse_sensitivity as f64 / 200.0),
         format!("toggleSprint:{}", options.toggle_sprint),
         format!("toggleCrouch:{}", options.toggle_crouch),
@@ -451,6 +502,7 @@ fn serialize_options(options: &McOptions) -> String {
         format!("soundCategory_player:{:.2}", options.player_volume as f64 / 100.0),
         format!("soundCategory_ambient:{:.2}", options.ambient_volume as f64 / 100.0),
         format!("soundCategory_voice:{:.2}", options.voice_volume as f64 / 100.0),
+        format!("soundCategory_ui:{:.2}", options.ui_volume as f64 / 100.0),
         format!("mipmapLevels:{}", options.mipmap_levels),
         format!(
             "entityDistanceScaling:{:.2}",
@@ -460,6 +512,24 @@ fn serialize_options(options: &McOptions) -> String {
         format!("rawMouseInput:{}", options.raw_mouse_input),
         format!("discreteMouseScroll:{}", options.discrete_mouse_scroll),
         format!("reducedDebugInfo:{}", options.reduced_debug_info),
+        format!("highContrast:{}", options.high_contrast),
+        format!("directionalAudio:{}", options.directional_audio),
+        format!("hideLightningFlashes:{}", options.hide_lightning_flashes),
+        format!("forceUnicodeFont:{}", options.force_unicode_font),
+        format!(
+            "damageTiltStrength:{:.2}",
+            options.damage_tilt_strength as f64 / 100.0
+        ),
+        format!("ao:{}", options.ao),
+        format!(
+            "screenEffectScale:{:.2}",
+            options.screen_effect_scale as f64 / 100.0
+        ),
+        format!("fovEffectScale:{:.2}", options.fov_effect_scale as f64 / 100.0),
+        format!(
+            "darknessEffectScale:{:.2}",
+            options.darkness_effect_scale as f64 / 100.0
+        ),
         format!(
             "narrator:{}",
             match options.narrator {
@@ -498,7 +568,8 @@ fn parse_f64(value: Option<&String>, default: f64) -> f64 {
     value.and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn volume_from_file(value: Option<&String>, default: i32) -> i32 {
+/// options.txt stores these as 0.0-1.0 fractions; Waybound stores 0-100 ints.
+fn percent_from_file(value: Option<&String>, default: i32) -> i32 {
     (parse_f64(value, default as f64 / 100.0) * 100.0).round() as i32
 }
 
@@ -523,11 +594,61 @@ mod tests {
 
     #[test]
     fn roundtrip_defaults() {
+        // Whole-struct equality, so every field added later is covered for
+        // free: forget a serialize/parse line and this fails.
         let options = McOptions::default();
-        let parsed = parse_options(&serialize_options(&options));
-        assert_eq!(parsed.render_distance, options.render_distance);
-        assert_eq!(parsed.master_volume, options.master_volume);
-        assert_eq!(parsed.fov, options.fov);
+        assert_eq!(parse_options(&serialize_options(&options)), options);
+    }
+
+    #[test]
+    fn roundtrip_non_default_values() {
+        let mut options = McOptions::default();
+        options.invert_x_mouse = true;
+        options.high_contrast = true;
+        options.directional_audio = true;
+        options.hide_lightning_flashes = true;
+        options.force_unicode_font = true;
+        options.damage_tilt_strength = 35;
+        options.ao = false;
+        options.screen_effect_scale = 0;
+        options.fov_effect_scale = 20;
+        options.darkness_effect_scale = 75;
+        options.ui_volume = 40;
+
+        assert_eq!(parse_options(&serialize_options(&options)), options);
+    }
+
+    #[test]
+    fn zero_to_one_floats_scale_at_the_file_boundary() {
+        for (stored, written) in [(0, "0.00"), (50, "0.50"), (100, "1.00")] {
+            let mut options = McOptions::default();
+            options.damage_tilt_strength = stored;
+            options.screen_effect_scale = stored;
+            options.fov_effect_scale = stored;
+            options.darkness_effect_scale = stored;
+            options.ui_volume = stored;
+
+            let serialized = serialize_options(&options);
+            for key in [
+                "damageTiltStrength",
+                "screenEffectScale",
+                "fovEffectScale",
+                "darknessEffectScale",
+                "soundCategory_ui",
+            ] {
+                assert!(
+                    serialized.contains(&format!("{key}:{written}")),
+                    "{key} at {stored} should write {written}: {serialized}"
+                );
+            }
+
+            let parsed = parse_options(&serialized);
+            assert_eq!(parsed.damage_tilt_strength, stored);
+            assert_eq!(parsed.screen_effect_scale, stored);
+            assert_eq!(parsed.fov_effect_scale, stored);
+            assert_eq!(parsed.darkness_effect_scale, stored);
+            assert_eq!(parsed.ui_volume, stored);
+        }
     }
 
     #[test]
@@ -581,6 +702,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_still_preserves_unmanaged_keys_alongside_the_new_options() {
+        // Keys that neighbour the ones Waybound now manages but aren't
+        // managed themselves: the new options must not swallow them.
+        let existing = "ao:false\n\
+             attackIndicator:1\n\
+             chatOpacity:1.0\n\
+             skipMultiplayerWarning:true\n\
+             glintSpeed:0.5\n";
+
+        let merged = merge_options(existing, &McOptions::default());
+
+        assert!(merged.contains("ao:true"), "managed key wins: {merged}");
+        for unmanaged in [
+            "attackIndicator:1",
+            "chatOpacity:1.0",
+            "skipMultiplayerWarning:true",
+            "glintSpeed:0.5",
+        ] {
+            assert!(merged.contains(unmanaged), "{unmanaged} must survive: {merged}");
+        }
+        // And the new keys the file didn't have get appended.
+        assert!(merged.contains("soundCategory_ui:1.00"), "{merged}");
+        assert!(merged.contains("damageTiltStrength:1.00"), "{merged}");
+    }
+
+    #[test]
     fn fresh_file_gets_version_stamp_existing_version_survives() {
         // No existing file: the stamp must be present or vanilla datafixes
         // the modern key names and discards everything.
@@ -594,5 +741,84 @@ mod tests {
         let merged = merge_options("version:3465\nfullscreen:false\n", &McOptions::default());
         assert!(merged.contains("version:3465"), "{merged}");
         assert!(!merged.contains("version:99999999"), "{merged}");
+    }
+}
+
+#[cfg(test)]
+mod config_forward_compat_tests {
+    use super::McOptions;
+
+    #[test]
+    fn a_config_written_before_new_fields_existed_still_deserializes() {
+        // Verbatim shape of a real pre-existing `[defaultMcOptions]` table:
+        // none of the accessibility/comfort/skin-era keys are present. Adding
+        // a required field here once made the entire config.toml unparseable,
+        // which `ConfigStore::load` treats as corruption — it renamed the
+        // file to `.bak` and started fresh, destroying the saved account and
+        // launch settings. Missing keys must fall back to defaults.
+        let legacy = r#"
+            customize = true
+            fullscreen = false
+            viewBobbing = true
+            guiScale = 2
+            gamma = 50
+            renderDistance = 12
+            simulationDistance = 12
+            fov = 70
+            entityShadows = true
+            vsync = true
+            maxFps = 120
+            graphicsMode = "fancy"
+            clouds = "fancy"
+            particles = "all"
+            mipmapLevels = 4
+            entityDistanceScaling = 100
+            biomeBlendRadius = 2
+            autoJump = false
+            invertMouse = false
+            mouseSensitivity = 100
+            rawMouseInput = true
+            discreteMouseScroll = false
+            toggleSprint = false
+            toggleCrouch = false
+            showSubtitles = false
+            reducedDebugInfo = false
+            narrator = "off"
+            language = "en_us"
+            masterVolume = 100
+            musicVolume = 100
+            jukeboxVolume = 100
+            weatherVolume = 100
+            blocksVolume = 100
+            hostileVolume = 100
+            neutralVolume = 100
+            playerVolume = 100
+            ambientVolume = 100
+            voiceVolume = 100
+        "#;
+
+        let parsed: McOptions =
+            toml::from_str(legacy).expect("a pre-existing config must still load");
+
+        // Values actually present are honoured...
+        assert_eq!(parsed.gui_scale, 2);
+        assert_eq!(parsed.language, "en_us");
+        // ...and every field added afterwards falls back to its default
+        // rather than failing the whole parse.
+        let defaults = McOptions::default();
+        assert_eq!(parsed.ao, defaults.ao);
+        assert_eq!(parsed.high_contrast, defaults.high_contrast);
+        assert_eq!(parsed.screen_effect_scale, defaults.screen_effect_scale);
+        assert_eq!(parsed.ui_volume, defaults.ui_volume);
+        assert_eq!(parsed.invert_x_mouse, defaults.invert_x_mouse);
+    }
+
+    #[test]
+    fn an_empty_table_yields_defaults_rather_than_an_error() {
+        // The degenerate case of the same rule: nothing present at all.
+        assert_eq!(
+            toml::from_str::<McOptions>("").expect("empty table must load"),
+            McOptions::default(),
+        );
     }
 }

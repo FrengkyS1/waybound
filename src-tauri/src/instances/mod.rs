@@ -591,12 +591,56 @@ impl InstanceService {
 
 
 
+        // Runs only after the requested mod is safely on disk and recorded,
+        // so nothing here can cost the user the install they asked for.
+        // Both sources are walked: Modrinth via its version dependency list,
+        // CurseForge via the file's relation metadata (relationType 3).
+        let (dependency_names, dependency_missing) =
+            if summary.project_type == ContentType::Mod {
+                install_required_dependencies(
+                    db,
+                    modrinth,
+                    curseforge,
+                    config,
+                    &instance,
+                    summary,
+                    source,
+                    version_id,
+                    cancel,
+                    report,
+                )
+                .await
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        let mut message = if dependency_names.is_empty() {
+            format!("Installed {} to {}", summary.name, instance.name)
+        } else {
+            format!(
+                "Installed {} to {}, plus {} required {}: {}",
+                summary.name,
+                instance.name,
+                dependency_names.len(),
+                if dependency_names.len() == 1 { "dependency" } else { "dependencies" },
+                dependency_names.join(", "),
+            )
+        };
+        if !dependency_missing.is_empty() {
+            message.push_str(&format!(
+                " {} required {} need{} a manual download (author disabled third-party downloads) — use \"Download missing mods\".",
+                dependency_missing.len(),
+                if dependency_missing.len() == 1 { "dependency" } else { "dependencies" },
+                if dependency_missing.len() == 1 { "s" } else { "" },
+            ));
+        }
+
         Ok(InstallModResult {
-            message: format!("Installed {} to {}", summary.name, instance.name),
+            message,
             installed: Some(installed),
             instance: instance.clone(),
-            has_skipped: false,
-            missing_mods: Vec::new(),
+            has_skipped: !dependency_missing.is_empty(),
+            missing_mods: dependency_missing,
         })
 
     }
@@ -634,6 +678,387 @@ impl InstanceService {
 }
 
 
+
+/// Ceiling on how many dependencies one install may pull in. A real mod's
+/// required-dependency closure is small (a library or two, occasionally a
+/// chain of three); anything approaching this means the graph is cyclic in a
+/// way the visited-set missed, or a project mislabels optional deps as
+/// required. Stopping is better than silently downloading a hundred files
+/// the user never asked for.
+const MAX_DEPENDENCY_INSTALLS: usize = 24;
+
+/// Installs one already-identified Modrinth dependency: resolve, download,
+/// record. Deliberately narrower than `install_mod` — a dependency is always
+/// a plain mod from Modrinth, so none of that function's modpack branch or
+/// CurseForge distribution-restriction handling can apply, and reusing it
+/// would mean recursing through dependency resolution a second time.
+async fn install_dependency(
+    db: &Database,
+    modrinth: &ModrinthClient,
+    instance: &InstanceSummary,
+    summary: &ModSummary,
+    cancel: &crate::download::CancelToken,
+) -> Result<(), InstanceError> {
+    let download = modrinth
+        .query_versions(
+            summary.modrinth_id.as_deref().unwrap_or_default(),
+            Some(&instance.minecraft_version),
+            Some(instance.loader.as_modrinth()),
+        )
+        .await
+        .map_err(map_modrinth_install_error)?;
+
+    let dest_dir = ensure_instance_dirs(&instance.id)?;
+    let dest_path = safe_join(&dest_dir, &download.filename).map_err(map_download_error)?;
+
+    let client = http_client().map_err(map_download_error)?;
+    download_to_file(&client, &download.url, &dest_path, cancel)
+        .await
+        .map_err(map_download_error)?;
+
+    let icon = match summary.icon_url.as_deref() {
+        Some(icon_url) => Some(
+            download_icon_data_url(icon_url, cancel)
+                .await
+                .unwrap_or_else(|| icon_url.to_string()),
+        ),
+        None => None,
+    };
+
+    db.insert_instance_mod(
+        &instance.id,
+        &summary.uid,
+        &summary.name,
+        crate::dto::ModSource::Modrinth,
+        &download.filename,
+        &dest_path.display().to_string(),
+        icon.as_deref(),
+    )?;
+
+    Ok(())
+}
+
+/// One pending dependency, tagged by source so a single queue can carry both
+/// kinds. The tag decides how it's resolved, installed, and recorded.
+#[derive(Debug, Clone, PartialEq)]
+enum DependencyRef {
+    Modrinth(String),
+    Curseforge(u32),
+}
+
+/// The required dependencies of whichever exact version/root selection the
+/// install just used. For a user-picked version id this reads THAT version's
+/// dependency list (not whatever the auto-resolver would pick now); for
+/// auto-resolution the source-specific helper re-derives the same choice the
+/// download just made. Best-effort throughout — an empty list just means no
+/// dependency walk, never a failed install.
+async fn root_dependency_refs(
+    modrinth: &ModrinthClient,
+    curseforge: &CurseForgeClient,
+    config: &ConfigStore,
+    root: &ModSummary,
+    instance: &InstanceSummary,
+    source: ModSource,
+    version_id: Option<&str>,
+) -> Vec<DependencyRef> {
+    match source {
+        ModSource::Modrinth => {
+            let project_id = root
+                .modrinth_id
+                .clone()
+                .unwrap_or_else(|| root.slug.clone());
+            if let Some(vid) = version_id {
+                if let Ok(version) = modrinth.fetch_version_detail(vid).await {
+                    return crate::sources::modrinth::required_dependency_ids_of(&version)
+                        .into_iter()
+                        .map(DependencyRef::Modrinth)
+                        .collect();
+                }
+            }
+            modrinth
+                .required_dependency_ids(
+                    &project_id,
+                    &instance.minecraft_version,
+                    instance.loader.as_modrinth(),
+                )
+                .await
+                .into_iter()
+                .map(DependencyRef::Modrinth)
+                .collect()
+        }
+        ModSource::Curseforge => {
+            let Some(mod_id) = root.curseforge_id else {
+                return Vec::new();
+            };
+            let Some(api_key) = config.curseforge_api_key() else {
+                return Vec::new();
+            };
+            if let Some(vid) = version_id.and_then(|v| v.parse::<u32>().ok()) {
+                return curseforge
+                    .file_dependency_mod_ids(mod_id, vid, &api_key)
+                    .await
+                    .into_iter()
+                    .map(DependencyRef::Curseforge)
+                    .collect();
+            }
+            curseforge
+                .required_dependency_mod_ids(
+                    mod_id,
+                    &instance.minecraft_version,
+                    instance.loader,
+                    &api_key,
+                )
+                .await
+                .into_iter()
+                .map(DependencyRef::Curseforge)
+                .collect()
+        }
+    }
+}
+
+/// Walks the required-dependency graph of a just-installed mod and installs
+/// whatever the instance is missing, returning the names actually added plus
+/// any dependencies that need a manual download (CurseForge authors can
+/// disable third-party distribution on individual files).
+///
+/// Breadth-first with an explicit queue rather than recursion, so the
+/// visited-set is trivially correct and there's no boxed async recursion.
+/// Every failure is swallowed on purpose: this runs *after* the mod the user
+/// asked for is already on disk, so a dependency that can't be resolved must
+/// leave them with a working install and a note, not an error that undoes it.
+async fn install_required_dependencies(
+    db: &Database,
+    modrinth: &ModrinthClient,
+    curseforge: &CurseForgeClient,
+    config: &ConfigStore,
+    instance: &InstanceSummary,
+    root: &ModSummary,
+    source: ModSource,
+    version_id: Option<&str>,
+    cancel: &crate::download::CancelToken,
+    report: &impl Fn(u32, u32, &str),
+) -> (Vec<String>, Vec<crate::dto::instance::MissingMod>) {
+    let mut queue: std::collections::VecDeque<DependencyRef> =
+        root_dependency_refs(modrinth, curseforge, config, root, instance, source, version_id)
+            .await
+            .into_iter()
+            .collect();
+    let mut visited: Vec<DependencyRef> = Vec::new();
+    let mut installed: Vec<String> = Vec::new();
+    let mut missing: Vec<crate::dto::instance::MissingMod> = Vec::new();
+
+    while let Some(dep) = queue.pop_front() {
+        if cancel.is_cancelled() || installed.len() >= MAX_DEPENDENCY_INSTALLS {
+            break;
+        }
+        // Successful installs are recorded in the DB immediately (which breaks
+        // cycles on its own), but a dependency that FAILED to install leaves
+        // no DB row — without this set, two mods sharing a failing dependency
+        // would each retry it.
+        if visited.contains(&dep) {
+            continue;
+        }
+        visited.push(dep.clone());
+
+        match dep {
+            DependencyRef::Modrinth(project_id) => {
+                // Already present: its own dependencies came with it, so
+                // there's nothing further to walk down this branch.
+                if db
+                    .get_instance_mod(&instance.id, &format!("modrinth:{project_id}"))
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+
+                let Ok(summary) = modrinth.fetch_project_summary(&project_id).await else {
+                    crate::activity::append_log(
+                        &format!("Dependency lookup failed for Modrinth project {project_id}"),
+                        "warn",
+                        None,
+                    );
+                    continue;
+                };
+
+                report(installed.len() as u32, MAX_DEPENDENCY_INSTALLS as u32, &summary.name);
+
+                match install_dependency(db, modrinth, instance, &summary, cancel).await {
+                    Ok(()) => {
+                        crate::activity::append_log(
+                            &format!(
+                                "Installed {} to {} as a required dependency of {}",
+                                summary.name, instance.name, root.name
+                            ),
+                            "info",
+                            Some(&summary.uid),
+                        );
+                        installed.push(summary.name.clone());
+                        let loader = instance.loader.as_modrinth();
+                        queue.extend(
+                            modrinth
+                                .required_dependency_ids(
+                                    &project_id,
+                                    &instance.minecraft_version,
+                                    loader,
+                                )
+                                .await
+                                .into_iter()
+                                .map(DependencyRef::Modrinth),
+                        );
+                    }
+                    Err(err) => {
+                        // Most commonly: the dependency has no build for this
+                        // exact MC version + loader. Worth telling the user
+                        // about, not worth failing their install over.
+                        crate::activity::append_log(
+                            &format!(
+                                "Could not install required dependency {} for {}: {err}",
+                                summary.name, root.name
+                            ),
+                            "warn",
+                            None,
+                        );
+                    }
+                }
+            }
+            DependencyRef::Curseforge(mod_id) => {
+                let uid = format!("curseforge:{mod_id}");
+                if db
+                    .get_instance_mod(&instance.id, &uid)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+
+                let Some(api_key) = config.curseforge_api_key() else {
+                    continue;
+                };
+                let (name, slug, icon_url, website_url) = curseforge
+                    .mods_batch(&[mod_id], &api_key)
+                    .await
+                    .remove(&mod_id)
+                    .unwrap_or((
+                        format!("CurseForge project {mod_id}"),
+                        String::new(),
+                        None,
+                        None,
+                    ));
+
+                report(installed.len() as u32, MAX_DEPENDENCY_INSTALLS as u32, &name);
+
+                match curseforge
+                    .fetch_file(mod_id, &instance.minecraft_version, instance.loader, &api_key)
+                    .await
+                {
+                    Ok(download) => {
+                        let recorded: Result<(), InstanceError> = async {
+                            let dest_dir = ensure_instance_dirs(&instance.id)?;
+                            let dest_path = safe_join(&dest_dir, &download.filename)
+                                .map_err(map_download_error)?;
+                            let client = http_client().map_err(map_download_error)?;
+                            download_to_file(&client, &download.url, &dest_path, cancel)
+                                .await
+                                .map_err(map_download_error)?;
+
+                            let icon = match &icon_url {
+                                Some(icon_url) => Some(
+                                    download_icon_data_url(icon_url, cancel)
+                                        .await
+                                        .unwrap_or_else(|| icon_url.clone()),
+                                ),
+                                None => None,
+                            };
+
+                            db.insert_instance_mod(
+                                &instance.id,
+                                &uid,
+                                &name,
+                                crate::dto::ModSource::Curseforge,
+                                &download.filename,
+                                &dest_path.display().to_string(),
+                                icon.as_deref(),
+                            )?;
+                            Ok(())
+                        }
+                        .await;
+
+                        match recorded {
+                            Ok(()) => {
+                                crate::activity::append_log(
+                                    &format!(
+                                        "Installed {} to {} as a required dependency of {}",
+                                        name, instance.name, root.name
+                                    ),
+                                    "info",
+                                    Some(&uid),
+                                );
+                                installed.push(name.clone());
+                                queue.extend(
+                                    curseforge
+                                        .required_dependency_mod_ids(
+                                            mod_id,
+                                            &instance.minecraft_version,
+                                            instance.loader,
+                                            &api_key,
+                                        )
+                                        .await
+                                        .into_iter()
+                                        .map(DependencyRef::Curseforge),
+                                );
+                            }
+                            Err(err) => {
+                                crate::activity::append_log(
+                                    &format!(
+                                        "Could not install required dependency {name} for {}: {err}",
+                                        root.name
+                                    ),
+                                    "warn",
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    Err(crate::sources::curseforge::CurseForgeError::DistributionRestricted { file_id, filename, sha1 }) => {
+                        // Same handling as a restricted direct install: hand
+                        // the user an exact manual-download link instead of
+                        // failing or silently skipping.
+                        missing.push(crate::dto::instance::MissingMod {
+                            project_id: mod_id,
+                            name: name.clone(),
+                            filename,
+                            url: curseforge_file_url(website_url.as_deref(), &slug, file_id),
+                            sha1,
+                        });
+                        crate::activity::append_log(
+                            &format!(
+                                "Required dependency {name} of {} needs a manual download",
+                                root.name
+                            ),
+                            "warn",
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        crate::activity::append_log(
+                            &format!(
+                                "Could not install required dependency {name} for {}: {err}",
+                                root.name
+                            ),
+                            "warn",
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    (installed, missing)
+}
 
 fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
@@ -1176,7 +1601,7 @@ async fn resolve_download(
 
                 return modrinth
 
-                    .resolve_version_by_id(vid)
+                    .resolve_version_by_id(vid, mc_version, loader)
 
                     .await
 
@@ -1226,9 +1651,11 @@ async fn resolve_download(
 
                 return curseforge
 
-                    .resolve_file_by_id(mod_id, file_id, &api_key)
+                    .resolve_file_by_id(mod_id, file_id, &api_key, mc_version, loader)
 
                     .await
+
+                    .map(|(download, _)| download)
 
                     .map_err(map_curseforge_install_error);
 
@@ -1364,15 +1791,21 @@ fn map_curseforge_install_error(err: crate::sources::curseforge::CurseForgeError
 
 }
 
-
-
 fn map_modrinth_install_error(err: ModrinthError) -> InstanceError {
 
     match err {
 
         ModrinthError::NotFound => InstanceError::Other(format!(
+
             "No compatible file found for this Minecraft version and loader. Try matching your instance version/loader to the mod, or pick a different mod version."
+
         )),
+
+        ModrinthError::Incompatible => InstanceError::Other(
+
+            "That version isn't built for this instance's Minecraft version and loader — pick a version row whose game version and loader match.".to_string(),
+
+        ),
 
         ModrinthError::Decode(message) => InstanceError::Other(message),
 

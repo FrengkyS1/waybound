@@ -103,6 +103,12 @@ export async function getRunningInstances(): Promise<RunningInstance[]> {
   return invoke<RunningInstance[]>("get_running_instances");
 }
 
+/** The persisted console output of an instance's most recent run. Empty when
+ * it has never been launched, so a crash stays readable after a restart. */
+export async function readLaunchLog(instanceId: string): Promise<string[]> {
+  return invoke<string[]>("read_launch_log", { instanceId });
+}
+
 // ---- Event payloads ------------------------------------------------------
 
 export interface LaunchProgressEvent {
@@ -121,4 +127,10 @@ export interface LaunchLogEvent {
 export interface LaunchExitedEvent {
   instanceId: string;
   code: number | null;
+  /** The process exited non-zero, i.e. it crashed rather than being quit. */
+  crashed: boolean;
+  /** A complete sentence naming the instance and, where the backend could
+   * work it out from the crash report or the mod-loader's error block, the
+   * actual cause. Null unless `crashed`. */
+  crashReason: string | null;
 }

@@ -21,7 +21,7 @@ use commands::{
     get_mod_details, get_modpack_content, get_running_instances, get_version_changelog,
     import_curseforge_api_key_from_env_file, install_mod_to_instance, launch_instance,
     list_instance_mods, list_instances, list_java_runtimes, list_minecraft_versions,
-    list_pending_missing_mods, logout,
+    list_pending_missing_mods, logout, read_launch_log,
     microsoft_login, open_all_missing_mods_browsers, open_in_file_manager, open_missing_mods_browser, remove_mod_from_instance, rename_instance, save_global_mc_options,
     save_instance_options, search_mods, set_curseforge_api_key, set_instance_icon,
     set_instance_launch_config, set_instance_loader_version, set_launch_settings, test_curseforge_api_key,
@@ -31,9 +31,11 @@ use config::ConfigStore;
 use db::Database;
 use sources::curseforge::CurseForgeClient;
 use sources::modrinth::ModrinthClient;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, WindowEvent};
+use tauri::{Listener, Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -44,6 +46,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let show_item = MenuItem::with_id(app, "show", "Show Waybound", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -80,17 +83,58 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // The main window ships hidden (`visible: false` in
+            // tauri.conf.json) so it only appears once the webview has fully
+            // painted its first real frame — no white flash during WebView2
+            // init + bundle parse, and no half-rendered window to alt-tab
+            // into during startup. The frontend emits `waybound://ready`
+            // after its first painted frame; this timer is the safety net if
+            // it never does (broken bundle), so the app can't end up an
+            // invisible process.
+            let shown = Arc::new(AtomicBool::new(false));
+            let handle = app.handle().clone();
+            let flag = shown.clone();
+            app.listen_any("waybound://ready", move |_| {
+                if flag.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            });
+            let handle = app.handle().clone();
+            let flag = shown.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                if !flag.load(Ordering::SeqCst) {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                    }
+                }
+            });
+
             Ok(())
         })
-        // Closing the window sends the app to the tray instead of quitting —
+        // Closing the MAIN window sends the app to the tray instead of quitting —
         // the tray icon's own "Quit" menu item is the only way to actually
         // exit, so a launched Minecraft process's parent app stays reachable
         // (and the running-instance tracking in `AppState` isn't lost) while
         // the window is just hidden, not the process torn down.
+        //
+        // This handler is registered on the builder, so it fires for EVERY
+        // window. Every other window — the CurseForge download pages from
+        // `missing_mods.rs` and the login window — must genuinely close.
+        // Hiding one leaves its WebView2 renderers alive and the page's
+        // JavaScript running forever: one X'd download page was measured
+        // holding 371 MB across twelve renderer processes and still burning
+        // CPU eighteen minutes later.
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                window.hide().ok();
-                api.prevent_close();
+                if window.label() == "main" {
+                    window.hide().ok();
+                    api.prevent_close();
+                }
             }
         })
         .manage(AppState {
@@ -153,6 +197,7 @@ pub fn run() {
             launch_instance,
             cancel_launch,
             get_running_instances,
+            read_launch_log,
             open_missing_mods_browser,
             open_all_missing_mods_browsers,
             open_in_file_manager,

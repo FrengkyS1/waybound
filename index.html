@@ -5,9 +5,37 @@
     <link rel="icon" type="image/png" href="/icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Waybound</title>
+    <!-- Inline critical styles so the very first paint is already themed
+         (no white flash) even before the CSS bundle or React exist. The
+         splash is removed by main.tsx once React has mounted. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #141414;
+      }
+      #splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        color: #ececec;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+    </style>
   </head>
 
   <body>
+    <div id="splash">
+      <svg width="40" height="40" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M8 0.8 15.2 8 8 15.2 0.8 8Z" fill="none" stroke="#8c8c8c" stroke-width="1.6" />
+        <path d="M8 4.8 11.2 8 8 11.2 4.8 8Z" fill="#2e9e4a" />
+      </svg>
+      <span style="font-size: 15px; color: #a3a3a3">Waybound</span>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

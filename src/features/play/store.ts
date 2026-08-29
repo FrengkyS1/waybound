@@ -9,6 +9,7 @@ import {
   launchInstance,
   logout,
   microsoftLogin,
+  readLaunchLog,
   type AccountPublic,
   type DeviceCodePrompt,
   type LaunchExitedEvent,
@@ -37,6 +38,11 @@ export interface LaunchState {
   exitCode: number | null;
   error: string | null;
   startedAtMs: number | null;
+  /** The game exited non-zero: it crashed rather than being quit. */
+  crashed: boolean;
+  /** Why it crashed, as a finished sentence from the backend. Null when the
+   * cause couldn't be worked out or nothing crashed. */
+  crashReason: string | null;
 }
 
 interface PlayStore {
@@ -62,11 +68,17 @@ interface PlayStore {
   dismissLaunch: (instanceId: string) => void;
   clearDevicePrompt: () => void;
   clearLogs: (instanceId: string) => void;
+  /** Fills the Logs tab from the instance's persisted log file when this
+   * session has nothing in memory for it — a crash from before the app was
+   * last closed is otherwise gone. */
+  loadStoredLogs: (instanceId: string) => Promise<void>;
 }
 
 const MAX_LOG_LINES = 500;
 const LOG_FLUSH_MS = 150;
 let listenersReady = false;
+/** Instances whose on-disk log has already been offered to this session. */
+const restoredFromDisk = new Set<string>();
 
 // A chatty modpack can emit hundreds of log lines per second. Applying each
 // one as its own store update floods React with re-renders (the always-mounted
@@ -117,6 +129,8 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
               exitCode: null,
               error: null,
               startedAtMs: null,
+              crashed: false,
+              crashReason: null,
             };
           }
           return { launches };
@@ -164,6 +178,8 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
           exitCode: null,
           error: null,
           startedAtMs: null,
+          crashed: false,
+          crashReason: null,
         },
       },
       logsByInstance: { ...state.logsByInstance, [instanceId]: [] },
@@ -198,6 +214,28 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
       return { launches: rest };
     }),
   clearDevicePrompt: () => set({ devicePrompt: null }),
+
+  loadStoredLogs: async (instanceId) => {
+    // Once per instance per session: "Clear" must stay cleared, and a live
+    // launch's lines must never be shoved aside by the previous run's file.
+    if (restoredFromDisk.has(instanceId)) return;
+    restoredFromDisk.add(instanceId);
+    if ((get().logsByInstance[instanceId]?.length ?? 0) > 0) return;
+    try {
+      const lines = await readLaunchLog(instanceId);
+      if (lines.length === 0) return;
+      if ((get().logsByInstance[instanceId]?.length ?? 0) > 0) return;
+      set((state) => ({
+        logsByInstance: {
+          ...state.logsByInstance,
+          [instanceId]: lines.slice(-MAX_LOG_LINES),
+        },
+      }));
+    } catch {
+      // No stored log (never launched, or unreadable) is not an error state.
+    }
+  },
+
   clearLogs: (instanceId) =>
     set((state) => {
       const launch = state.launches[instanceId];
@@ -296,8 +334,10 @@ async function registerListeners(
           [event.payload.instanceId]: {
             ...launch,
             phase: "exited",
-            stage: "Closed",
+            stage: event.payload.crashed ? "Crashed" : "Closed",
             exitCode: event.payload.code,
+            crashed: event.payload.crashed,
+            crashReason: event.payload.crashReason,
           },
         },
         refreshTick: refreshTick + 1,

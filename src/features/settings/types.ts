@@ -23,8 +23,15 @@ export interface McOptions {
   mipmapLevels: number;
   entityDistanceScaling: number;
   biomeBlendRadius: number;
+  ao: boolean;
+  /** 0-100 ints; options.txt stores them as 0.0-1.0 fractions. */
+  screenEffectScale: number;
+  fovEffectScale: number;
+  darknessEffectScale: number;
   autoJump: boolean;
+  /** Maps to `invertYMouse`. */
   invertMouse: boolean;
+  invertXMouse: boolean;
   mouseSensitivity: number;
   rawMouseInput: boolean;
   discreteMouseScroll: boolean;
@@ -32,6 +39,11 @@ export interface McOptions {
   toggleCrouch: boolean;
   showSubtitles: boolean;
   reducedDebugInfo: boolean;
+  highContrast: boolean;
+  directionalAudio: boolean;
+  hideLightningFlashes: boolean;
+  forceUnicodeFont: boolean;
+  damageTiltStrength: number;
   narrator: NarratorMode;
   language: string;
   masterVolume: number;
@@ -44,6 +56,7 @@ export interface McOptions {
   playerVolume: number;
   ambientVolume: number;
   voiceVolume: number;
+  uiVolume: number;
   keyBindings: Record<string, string>;
 }
 

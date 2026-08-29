@@ -31,8 +31,18 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
     }
   }, [launch.logs, showLog]);
 
-  const { phase, stage, current, total, logs, exitCode, error, instanceName } =
-    launch;
+  const {
+    phase,
+    stage,
+    current,
+    total,
+    logs,
+    exitCode,
+    error,
+    instanceName,
+    crashed,
+    crashReason,
+  } = launch;
   const pct = total > 0 ? Math.round((current / total) * 100) : null;
   // "running" is deliberately excluded: dismissing removes the launches[]
   // entry entirely, which is also what PlayButton checks to disable Play and
@@ -48,9 +58,11 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
       : phase === "cancelled"
         ? "Cancelled"
         : phase === "exited"
-          ? exitCode === 0 || exitCode === null
-            ? "Minecraft closed"
-            : `Minecraft closed (exit ${exitCode})`
+          ? crashed
+            ? "Crashed"
+            : exitCode === 0 || exitCode === null
+              ? "Minecraft closed"
+              : `Minecraft closed (exit ${exitCode})`
           : phase === "running"
             ? "Minecraft is running"
             : stage;
@@ -61,7 +73,7 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
         <div className={styles.main}>
           <div className={styles.headline}>
             <span
-              className={`${styles.dot} ${styles[`dot_${phase}`]}`}
+              className={`${styles.dot} ${crashed ? styles.dot_error : styles[`dot_${phase}`]}`}
               aria-hidden
             />
             <span className={styles.instance}>{instanceName}</span>
@@ -90,6 +102,15 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
 
           {phase === "error" && error && (
             <p className={styles.error}>{error}</p>
+          )}
+
+          {/* The whole point of the crash work: say what actually happened
+              instead of quietly returning to an idle Play button. */}
+          {crashed && (
+            <p className={styles.error}>
+              {crashReason ??
+                `${instanceName} crashed. The Logs tab has the full output.`}
+            </p>
           )}
         </div>
 

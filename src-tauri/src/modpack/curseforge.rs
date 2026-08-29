@@ -775,7 +775,10 @@ mod pack_reconciliation_tests {
     use std::fs;
 
     fn temp_instance_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("waybound-pack-reconcile-test-{name}"));
+        // Pid-scoped so two overlapping `cargo test` processes can't wipe
+        // each other's fixture mid-test (see commands/launch.rs's temp_dir).
+        let dir = std::env::temp_dir()
+            .join(format!("waybound-pack-reconcile-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("mods")).unwrap();
         fs::create_dir_all(dir.join("resourcepacks")).unwrap();

@@ -19,6 +19,7 @@ import { fileToIconDataUrl } from "../home/imageIcon";
 import { PlayButton } from "../play/PlayButton";
 import { usePlayStore } from "../play/store";
 import { useInstallStore } from "../install/installStore";
+import { CopyNameButton } from "../browse/components/CopyNameButton";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { SegmentGroup } from "../../components/SegmentGroup";
 import { ConfigEditorModal } from "./ConfigEditorModal";
@@ -851,6 +852,7 @@ function ContentTab({
               aria-label={CATEGORY_LABEL[group.category]}
             >
               {group.entries.map((entry) => {
+                const displayName = entry.name ?? humanizeFileName(entry.fileName);
                 const iconAndInfo = (
                   <>
                     <div className={styles.modIconWrap}>
@@ -866,8 +868,9 @@ function ContentTab({
                       )}
                     </div>
                     <div className={styles.modInfo}>
-                      <span className={styles.modName}>
-                        {entry.name ?? humanizeFileName(entry.fileName)}
+                      <span className={styles.modNameLine}>
+                        <span className={styles.modName}>{displayName}</span>
+                        <CopyNameButton name={displayName} />
                       </span>
                       <span
                         className={styles.modMeta}
@@ -882,21 +885,36 @@ function ContentTab({
                 // right now — a resourcepack/shaderpack has no equivalent
                 // lookup, so its row stays non-interactive.
                 const canOpen = Boolean(onOpenMod) && group.category === "mod";
+                const opening = openingFile === entry.fileName;
                 return (
                 <li
                   key={entry.fileName}
                   ref={observeRow(group.category, entry.fileName, entry.metaResolved)}
                   className={`${styles.modRow} ${entry.enabled ? "" : styles.modRowDisabled}`}
                 >
+                  {/* A plain clickable div rather than a <button> so the
+                      per-name CopyNameButton isn't a button nested inside a
+                      button (invalid HTML, broken DOM). Same trade-off the
+                      Browse result rows make. */}
                   {canOpen ? (
-                    <button
-                      type="button"
-                      className={styles.modOpen}
-                      disabled={openingFile === entry.fileName}
-                      onClick={() => void handleOpenMod(entry)}
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      aria-busy={opening || undefined}
+                      className={`${styles.modOpen} ${opening ? styles.modOpening : ""}`}
+                      onClick={() => {
+                        if (opening) return;
+                        void handleOpenMod(entry);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter" && e.key !== " ") return;
+                        e.preventDefault();
+                        if (opening) return;
+                        void handleOpenMod(entry);
+                      }}
                     >
                       {iconAndInfo}
-                    </button>
+                    </div>
                   ) : (
                     iconAndInfo
                   )}
@@ -1022,8 +1040,17 @@ function LogsTab({
   const ref = useRef<HTMLPreElement>(null);
   const firstErrorRef = useRef<HTMLSpanElement>(null);
   const clearLogs = usePlayStore((s) => s.clearLogs);
+  const loadStoredLogs = usePlayStore((s) => s.loadStoredLogs);
+  const launch = usePlayStore((s) => s.launches[instanceId]);
   const [copied, setCopied] = useState(false);
   const firstErrorIdx = logs.findIndex((line) => LOG_ERROR_RE.test(line));
+
+  // Nothing in memory means either "never launched this session" or "the app
+  // was restarted since the crash" — the backend keeps the last run's output
+  // on disk precisely so the second case is still investigable.
+  useEffect(() => {
+    void loadStoredLogs(instanceId);
+  }, [instanceId, loadStoredLogs]);
 
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -1053,6 +1080,12 @@ function LogsTab({
 
   return (
     <div className={styles.logsTab}>
+      {launch?.crashed && (
+        <p className={styles.logsCrash} role="status">
+          {launch.crashReason ??
+            `${instanceName} crashed. The output below is the whole run.`}
+        </p>
+      )}
       <div className={styles.logsToolbar}>
         <span className={styles.logsCount}>
           {empty ? "No output" : `${logs.length} lines`}

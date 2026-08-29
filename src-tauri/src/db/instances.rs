@@ -607,7 +607,11 @@ mod instance_db_tests {
 
     impl TempDb {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("waybound-instance-db-test-{name}"));
+            // Pid-scoped so two overlapping `cargo test` processes can't
+            // delete each other's database mid-test (see the same note in
+            // commands/launch.rs's temp_dir).
+            let dir = std::env::temp_dir()
+                .join(format!("waybound-instance-db-test-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let db = Database::open_at(&dir.join("library.db")).unwrap();

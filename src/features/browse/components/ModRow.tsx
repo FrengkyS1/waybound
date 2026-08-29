@@ -1,4 +1,5 @@
 import type { ModSummary } from "../types";
+import { CopyNameButton } from "./CopyNameButton";
 import { SourceBadges } from "./SourceBadges";
 import styles from "./ModRow.module.css";
 
@@ -43,6 +44,7 @@ export function ModRow({ mod, onOpen }: ModRowProps) {
       <div className={styles.body}>
         <header className={styles.header}>
           <h3 className={styles.name}>{mod.name}</h3>
+          <CopyNameButton name={mod.name} />
           <SourceBadges sources={mod.sources} />
         </header>
         {mod.description && (

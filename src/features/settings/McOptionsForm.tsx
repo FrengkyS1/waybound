@@ -136,6 +136,12 @@ export function McOptionsForm({
           onChange={(v) => onChange({ vsync: v })}
           disabled={disabled}
         />
+        <Toggle
+          label="Smooth lighting"
+          checked={options.ao}
+          onChange={(v) => onChange({ ao: v })}
+          disabled={disabled}
+        />
         <SliderField
           label="GUI scale"
           value={options.guiScale}
@@ -211,6 +217,33 @@ export function McOptionsForm({
           onChange={(v) => onChange({ biomeBlendRadius: v })}
           disabled={disabled}
         />
+        <SliderField
+          label="Distortion effects"
+          value={options.screenEffectScale}
+          min={0}
+          max={100}
+          onChange={(v) => onChange({ screenEffectScale: v })}
+          disabled={disabled}
+          display={`${options.screenEffectScale}%`}
+        />
+        <SliderField
+          label="FOV effects"
+          value={options.fovEffectScale}
+          min={0}
+          max={100}
+          onChange={(v) => onChange({ fovEffectScale: v })}
+          disabled={disabled}
+          display={`${options.fovEffectScale}%`}
+        />
+        <SliderField
+          label="Darkness pulsing"
+          value={options.darknessEffectScale}
+          min={0}
+          max={100}
+          onChange={(v) => onChange({ darknessEffectScale: v })}
+          disabled={disabled}
+          display={`${options.darknessEffectScale}%`}
+        />
         <label className={styles.selectRow}>
           <span>Graphics</span>
           <select
@@ -266,9 +299,15 @@ export function McOptionsForm({
           disabled={disabled}
         />
         <Toggle
-          label="Invert mouse"
+          label="Invert mouse Y"
           checked={options.invertMouse}
           onChange={(v) => onChange({ invertMouse: v })}
+          disabled={disabled}
+        />
+        <Toggle
+          label="Invert mouse X"
+          checked={options.invertXMouse}
+          onChange={(v) => onChange({ invertXMouse: v })}
           disabled={disabled}
         />
         <Toggle
@@ -364,8 +403,11 @@ export function McOptionsForm({
           onChange={(v) => onChange({ blocksVolume: v })}
           disabled={disabled}
         />
+        {/* soundCategory_hostile covers hostile *and* neutral mobs, while
+            soundCategory_neutral is vanilla's passive-mob category. Labels
+            follow the spec, not the key names. */}
         <SliderField
-          label="Hostile mobs"
+          label="Hostile & neutral mobs"
           value={options.hostileVolume}
           min={0}
           max={100}
@@ -373,7 +415,7 @@ export function McOptionsForm({
           disabled={disabled}
         />
         <SliderField
-          label="Neutral mobs"
+          label="Passive mobs"
           value={options.neutralVolume}
           min={0}
           max={100}
@@ -404,6 +446,14 @@ export function McOptionsForm({
           onChange={(v) => onChange({ voiceVolume: v })}
           disabled={disabled}
         />
+        <SliderField
+          label="UI"
+          value={options.uiVolume}
+          min={0}
+          max={100}
+          onChange={(v) => onChange({ uiVolume: v })}
+          disabled={disabled}
+        />
       </section>
 
       <section className={styles.section}>
@@ -419,6 +469,39 @@ export function McOptionsForm({
           checked={options.reducedDebugInfo}
           onChange={(v) => onChange({ reducedDebugInfo: v })}
           disabled={disabled}
+        />
+        <Toggle
+          label="High contrast UI"
+          checked={options.highContrast}
+          onChange={(v) => onChange({ highContrast: v })}
+          disabled={disabled}
+        />
+        <Toggle
+          label="Directional audio"
+          checked={options.directionalAudio}
+          onChange={(v) => onChange({ directionalAudio: v })}
+          disabled={disabled}
+        />
+        <Toggle
+          label="Hide lightning flashes"
+          checked={options.hideLightningFlashes}
+          onChange={(v) => onChange({ hideLightningFlashes: v })}
+          disabled={disabled}
+        />
+        <Toggle
+          label="Force unicode font"
+          checked={options.forceUnicodeFont}
+          onChange={(v) => onChange({ forceUnicodeFont: v })}
+          disabled={disabled}
+        />
+        <SliderField
+          label="Damage tilt"
+          value={options.damageTiltStrength}
+          min={0}
+          max={100}
+          onChange={(v) => onChange({ damageTiltStrength: v })}
+          disabled={disabled}
+          display={`${options.damageTiltStrength}%`}
         />
         <label className={styles.selectRow}>
           <span>Narrator</span>

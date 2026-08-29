@@ -1,16 +1,25 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { emit } from "@tauri-apps/api/event";
 import type { ModSummary } from "./features/browse/types";
 import { BrowsePage } from "./features/browse/BrowsePage";
 import { HomePage } from "./features/home/HomePage";
 import type { Tab as InstanceTab } from "./features/instance/InstancePage";
 import type { InstanceInstallTarget } from "./features/navigation/types";
-import { SettingsPage } from "./features/settings/SettingsPage";
 import type { InstanceSummary } from "./features/instances/types";
 import { AccountBar } from "./features/play/AccountBar";
 import { LaunchOverlay } from "./features/play/LaunchOverlay";
 import { InstallOverlay } from "./features/install/InstallOverlay";
 import { usePlayStore } from "./features/play/store";
+import { UpdateNotice } from "./features/settings/UpdateNotice";
 import styles from "./App.module.css";
+
+// Settings is only reached on explicit navigation; keeping it out of the
+// startup chunk shaves bundle-parse time off first paint.
+const SettingsPage = lazy(() =>
+  import("./features/settings/SettingsPage").then((m) => ({
+    default: m.SettingsPage,
+  })),
+);
 
 type AppView = "home" | "browse" | "settings";
 
@@ -20,6 +29,19 @@ function App() {
 
   useEffect(() => {
     void initPlay();
+    // The window is created hidden; reveal it only after this frame has
+    // actually painted (two rAFs = commit + paint) so what appears is the
+    // real UI, never a blank flash.
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        void emit("waybound://ready");
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
   }, [initPlay]);
   const [installTarget, setInstallTarget] = useState<InstanceInstallTarget | null>(null);
   const [browseMod, setBrowseMod] = useState<ModSummary | null>(null);
@@ -153,6 +175,8 @@ function App() {
         </div>
       </header>
 
+      <UpdateNotice onOpenSettings={() => setView("settings")} />
+
       <main className={styles.main}>
         {view === "home" && (
           <HomePage
@@ -176,7 +200,11 @@ function App() {
             onOpenSettings={() => setView("settings")}
           />
         )}
-        {view === "settings" && <SettingsPage />}
+        {view === "settings" && (
+          <Suspense fallback={null}>
+            <SettingsPage />
+          </Suspense>
+        )}
       </main>
 
       <div className={styles.overlayStack}>

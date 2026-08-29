@@ -29,6 +29,10 @@ src-tauri/target/
 # Tauri
 src-tauri/gen/
 
+# Signing keys (never commit the private key)
+src-tauri/.tauri/
+*.key
+
 # Local icon source (generated icons live in src-tauri/icons/)
 app-icon/
 

@@ -19,6 +19,12 @@ pub enum ModrinthError {
     Decode(String),
     #[error("no compatible Modrinth file found")]
     NotFound,
+    /// The user picked (or the resolver fell through to) a version that does
+    /// not list this instance's game version / loader — e.g. the Fabric build
+    /// of a mod into a NeoForge instance. Distinct from NotFound so the
+    /// message can point at the fix instead of implying the mod has no builds.
+    #[error("that version is not built for this instance's Minecraft version and loader")]
+    Incompatible,
 }
 
 pub struct ModrinthClient {
@@ -208,6 +214,8 @@ impl ModrinthClient {
     pub async fn resolve_version_by_id(
         &self,
         version_id: &str,
+        mc_version: &str,
+        loader: ModLoader,
     ) -> Result<ResolvedDownload, ModrinthError> {
         let response = self
             .http
@@ -216,6 +224,10 @@ impl ModrinthClient {
             .await?
             .error_for_status()?;
         let version: ModrinthVersion = decode_json(response).await?;
+        // The version picker lists every release; this guard is what stops an
+        // easy mis-click ("Add" on a row tagged Fabric) from installing it
+        // into a NeoForge instance.
+        ensure_version_matches(&version, mc_version, loader)?;
         version_to_download(&version).ok_or(ModrinthError::NotFound)
     }
 
@@ -243,16 +255,23 @@ impl ModrinthClient {
         {
             return Ok(download);
         }
-        if let Ok(download) = self
-            .query_versions(project_id, Some(mc_version), None)
-            .await
-        {
-            return Ok(download);
+        if content_type != ContentType::Mod {
+            // Resourcepacks and other loader-agnostic content legitimately
+            // have no loader tag to match — fall back to a game-version-only
+            // match for them. Mods do NOT get this fallback: a build for the
+            // right MC version but the wrong loader is useless in this
+            // instance, and silently installing e.g. the Fabric jar into a
+            // NeoForge instance is exactly the bug this guard exists for.
+            if let Ok(download) = self
+                .query_versions(project_id, Some(mc_version), None)
+                .await
+            {
+                return Ok(download);
+            }
         }
 
         let versions = self.fetch_all_versions(project_id).await?;
-        pick_mod_version(&versions, mc_version, loader)
-            .ok_or(ModrinthError::NotFound)
+        pick_mod_version(&versions, mc_version, loader).ok_or(ModrinthError::NotFound)
     }
 
     /// Every file's own project name + icon, resolved by content hash —
@@ -385,6 +404,94 @@ impl ModrinthClient {
             .ok_or(ModrinthError::NotFound)
     }
 
+    /// A minimal `ModSummary` for one project id, enough to install it and
+    /// record it against the instance. Used for dependency resolution, where
+    /// all we start with is an id from another version's dependency list —
+    /// unlike the Browse path, there's no search hit to carry the metadata.
+    pub(crate) async fn fetch_project_summary(
+        &self,
+        project_id: &str,
+    ) -> Result<ModSummary, ModrinthError> {
+        let response = self
+            .http
+            .get(format!("{BASE_URL}/project/{project_id}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        let project: ModrinthProjectSummary = decode_json(response).await?;
+
+        Ok(ModSummary {
+            // Same shape `map_hit` produces, so a dependency-installed mod
+            // is indistinguishable from a directly-installed one afterwards
+            // (update checks, "open project page", removal all key off it).
+            uid: format!("modrinth:{}", project.id),
+            slug: project.slug,
+            name: project.title,
+            description: project.description,
+            author: String::new(),
+            icon_url: project.icon_url.filter(|url| !url.is_empty()),
+            downloads: project.downloads,
+            project_type: ContentType::from_modrinth_categories(
+                &project.project_type,
+                &project.categories,
+            ),
+            loaders: from_modrinth_categories(&project.categories),
+            sources: vec![ModSource::Modrinth],
+            updated_at: project.updated.unwrap_or_default(),
+            curseforge_id: None,
+            modrinth_id: Some(project.id),
+        })
+    }
+
+    /// Project ids the version that `query_versions` would pick declares as
+    /// hard requirements.
+    ///
+    /// Deliberately best-effort: this drives an *extra* convenience install,
+    /// so a lookup failure has to leave the user with the mod they actually
+    /// asked for rather than failing the whole operation. Only
+    /// `dependency_type == "required"` counts — `optional` is the user's
+    /// call, `incompatible` must never be installed, and `embedded` is
+    /// already inside the jar.
+    pub(crate) async fn required_dependency_ids(
+        &self,
+        project_id: &str,
+        mc_version: &str,
+        loader: &str,
+    ) -> Vec<String> {
+        let mut request = self
+            .http
+            .get(format!("{BASE_URL}/project/{project_id}/version"));
+        if !mc_version.is_empty() {
+            request = request.query(&[(
+                "game_versions",
+                serde_json::to_string(&[mc_version]).unwrap_or_else(|_| "[]".into()),
+            )]);
+        }
+        if !loader.is_empty() && loader != "minecraft" {
+            request = request.query(&[(
+                "loaders",
+                serde_json::to_string(&[loader]).unwrap_or_else(|_| "[]".into()),
+            )]);
+        }
+
+        let Ok(response) = request.send().await else {
+            return Vec::new();
+        };
+        let Ok(response) = response.error_for_status() else {
+            return Vec::new();
+        };
+        let Ok(versions) = decode_json::<Vec<ModrinthVersion>>(response).await else {
+            return Vec::new();
+        };
+
+        // Same ordering as `query_versions`, so the dependencies reported
+        // belong to the version that actually gets downloaded.
+        sort_versions_newest_first(versions)
+            .first()
+            .map(|version| required_dependency_ids_of(version))
+            .unwrap_or_default()
+    }
+
     async fn fetch_all_versions(&self, project_id: &str) -> Result<Vec<ModrinthVersion>, ModrinthError> {
         let response = self
             .http
@@ -450,6 +557,28 @@ fn map_hit(hit: ModrinthHit) -> ModSummary {
         curseforge_id: None,
         modrinth_id: Some(hit.project_id),
     }
+}
+
+/// `/project/{id}` — the identity fields only. `ModrinthProject` above
+/// deserializes the same endpoint for the detail page but deliberately skips
+/// these, since that path always already has a `ModSummary` in hand.
+#[derive(Debug, Deserialize)]
+struct ModrinthProjectSummary {
+    id: String,
+    slug: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    downloads: u64,
+    #[serde(default)]
+    project_type: String,
+    #[serde(default)]
+    updated: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,6 +696,29 @@ fn pick_suggested_mc_loader(
     (mc, loader)
 }
 
+/// The `required` dependencies of one version, deduplicated and in declared
+/// order. Split out from the network call above purely so the filtering
+/// rules (which types count, dropping the id-less entries Modrinth uses for
+/// "some file, no project") are testable without HTTP.
+pub(crate) fn required_dependency_ids_of(version: &ModrinthVersion) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dep in &version.dependencies {
+        if dep.dependency_type != "required" {
+            continue;
+        }
+        // A dependency can name a bare file with no project behind it;
+        // there's nothing resolvable to install in that case.
+        let Some(project_id) = dep.project_id.as_deref() else {
+            continue;
+        };
+        if project_id.is_empty() || out.iter().any(|seen| seen == project_id) {
+            continue;
+        }
+        out.push(project_id.to_string());
+    }
+    out
+}
+
 /// Modrinth's `/version` listing has no documented sort guarantee — relying
 /// on whatever order it happens to come back in silently installed a
 /// months-old release once (6.12.0 instead of a since-published 7.4.1,
@@ -608,14 +760,34 @@ fn pick_mod_version(
             }
         }
     }
-    for version in versions {
-        if version.game_versions.iter().any(|v| v == mc_version) {
-            if let Some(download) = version_to_download(version) {
-                return Some(download);
-            }
+    // Deliberately no any-loader / any-version fallback: this path only runs
+    // when the filtered query found nothing, and for mods a wrong-loader jar
+    // is worse than an honest "no compatible file" error.
+    None
+}
+
+/// Rejects a specific version that doesn't list the instance's game version
+/// or loader. Untagged fields pass (Modrinth marks resourcepacks with empty
+/// `loaders`, and game-version lists are occasionally incomplete), Vanilla
+/// targets pass the loader check.
+fn ensure_version_matches(
+    version: &ModrinthVersion,
+    mc_version: &str,
+    loader: ModLoader,
+) -> Result<(), ModrinthError> {
+    let mc_ok = mc_version.is_empty()
+        || version.game_versions.is_empty()
+        || version.game_versions.iter().any(|v| v == mc_version);
+    if !mc_ok {
+        return Err(ModrinthError::Incompatible);
+    }
+    if loader != ModLoader::Vanilla && !version.loaders.is_empty() {
+        let want = loader.as_modrinth();
+        if !want.is_empty() && !version.loaders.iter().any(|l| l == want) {
+            return Err(ModrinthError::Incompatible);
         }
     }
-    versions.first().and_then(version_to_download)
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -736,5 +908,80 @@ mod version_tests {
             dates,
             vec!["2026-07-24T00:00:00Z", "2026-03-01T00:00:00Z", "2026-01-01T00:00:00Z"]
         );
+    }
+}
+
+#[cfg(test)]
+mod required_dependency_tests {
+    use super::{required_dependency_ids_of, ModrinthVersion, ModrinthVersionDependency};
+
+    fn dep(project_id: Option<&str>, dependency_type: &str) -> ModrinthVersionDependency {
+        ModrinthVersionDependency {
+            project_id: project_id.map(str::to_string),
+            dependency_type: dependency_type.to_string(),
+            file_name: None,
+        }
+    }
+
+    fn version_with(dependencies: Vec<ModrinthVersionDependency>) -> ModrinthVersion {
+        ModrinthVersion {
+            id: "v".to_string(),
+            name: String::new(),
+            version_number: String::new(),
+            date_published: "2026-01-01T00:00:00Z".to_string(),
+            changelog: None,
+            downloads: 0,
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn keeps_only_required_dependencies() {
+        // Installing an `incompatible` entry would actively break the
+        // instance, and `optional` is the user's call to make — auto-pulling
+        // either turns a convenience into a surprise.
+        let version = version_with(vec![
+            dep(Some("REQUIRED1"), "required"),
+            dep(Some("OPTIONAL1"), "optional"),
+            dep(Some("INCOMPAT1"), "incompatible"),
+            dep(Some("EMBEDDED1"), "embedded"),
+            dep(Some("REQUIRED2"), "required"),
+        ]);
+
+        assert_eq!(
+            required_dependency_ids_of(&version),
+            vec!["REQUIRED1".to_string(), "REQUIRED2".to_string()],
+        );
+    }
+
+    #[test]
+    fn skips_dependencies_that_name_no_project() {
+        // Modrinth allows a dependency on a bare filename with no project
+        // behind it; there is nothing resolvable to install for those.
+        let version = version_with(vec![
+            dep(None, "required"),
+            dep(Some(""), "required"),
+            dep(Some("REAL"), "required"),
+        ]);
+
+        assert_eq!(required_dependency_ids_of(&version), vec!["REAL".to_string()]);
+    }
+
+    #[test]
+    fn deduplicates_repeated_project_ids() {
+        let version = version_with(vec![
+            dep(Some("SAME"), "required"),
+            dep(Some("SAME"), "required"),
+        ]);
+
+        assert_eq!(required_dependency_ids_of(&version), vec!["SAME".to_string()]);
+    }
+
+    #[test]
+    fn a_version_with_no_dependencies_yields_none() {
+        assert!(required_dependency_ids_of(&version_with(Vec::new())).is_empty());
     }
 }

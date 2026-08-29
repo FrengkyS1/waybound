@@ -13,6 +13,7 @@ import {
 import styles from "./SettingsPage.module.css";
 import { GlobalGameSettingsSection } from "./GlobalGameSettingsSection";
 import { LaunchSettingsSection } from "../play/LaunchSettingsSection";
+import { UpdateSection } from "./UpdateSection";
 
 function sourceLabel(source?: CurseForgeKeySource): string | null {
   if (source === "config") return "Saved in Waybound";
@@ -197,6 +198,7 @@ export function SettingsPage() {
       <div className={styles.grid}>
         <div className={styles.left}>
           <LaunchSettingsSection />
+          <UpdateSection />
 
       <section className={styles.section} aria-labelledby="curseforge-heading">
         <div className={styles.sectionHead}>

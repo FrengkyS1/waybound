@@ -24,17 +24,18 @@ fn mods_match(a: &ModSummary, b: &ModSummary) -> bool {
         return false;
     }
 
-    if slug_match(&a.slug, &b.slug) {
-        return true;
+    // An author disagreement vetoes a merge on BOTH paths below. Slugs are
+    // only unique per source, so `shared-life` on Modrinth and `shared-life`
+    // on CurseForge can be entirely unrelated projects (Shared Life by Bold
+    // vs Shared Life by Gimmeh used to fuse into one card, hiding the other);
+    // names collide far more often ("Configured", "Enhanced Visuals", ...).
+    // When either side lacks an author string, slug/name equality alone
+    // decides, as before.
+    if !author_match(&a.author, &b.author) {
+        return false;
     }
 
-    // No bare name-only fallback beyond this — a common generic name
-    // ("Configured", "Enhanced Visuals", ...) is reused by unrelated authors
-    // across Modrinth/CurseForge often enough that name equality alone isn't
-    // evidence of the same mod. `name_match` already does the same
-    // normalized-name comparison; author_match is the only thing that makes
-    // it safe.
-    name_match(&a.name, &b.name) && author_match(&a.author, &b.author)
+    slug_match(&a.slug, &b.slug) || name_match(&a.name, &b.name)
 }
 
 fn merge_into(target: &mut ModSummary, incoming: ModSummary) {
@@ -176,5 +177,28 @@ mod tests {
 
         let merged = dedupe_mods(vec![jack, craf]);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn same_slug_different_author_does_not_merge() {
+        // Two real, unrelated projects both called "Shared Life" share a
+        // normalized slug across sources; the slug path must respect author
+        // disagreement exactly like the name path.
+        let mut bold = sample("shared-life", "Shared Life", ModSource::Modrinth);
+        bold.author = "Bold".to_string();
+        let mut gimmeh = sample("shared-life", "Shared Life", ModSource::Curseforge);
+        gimmeh.author = "Gimmeh".to_string();
+
+        assert_eq!(dedupe_mods(vec![bold, gimmeh]).len(), 2);
+    }
+
+    #[test]
+    fn missing_author_still_merges_on_slug() {
+        // No author info on either side: slug equality alone decides.
+        let mut anon = sample("sodium", "Sodium", ModSource::Modrinth);
+        anon.author = String::new();
+        let known = sample("sodium", "Sodium", ModSource::Curseforge);
+
+        assert_eq!(dedupe_mods(vec![anon, known]).len(), 1);
     }
 }

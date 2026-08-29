@@ -170,25 +170,59 @@ impl CurseForgeClient {
 
         if loader != ModLoader::Vanilla {
             if let Ok(download) = self
-                .fetch_file(mod_id, mc_version, ModLoader::Vanilla, api_key)
+                .fetch_file_any_loader(mod_id, mc_version, loader, api_key)
                 .await
             {
                 return Ok(download);
             }
         }
 
-        self.fetch_file(mod_id, "", ModLoader::Vanilla, api_key)
+        self.fetch_file_any_loader(mod_id, "", loader, api_key)
             .await
     }
 
-    async fn fetch_file(
+    /// Newest file matching this MC version + loader exactly. The returned
+    /// file's loader tags are validated against `loader`, so a Fabric-tagged
+    /// file can never satisfy a NeoForge query even if CurseForge's category
+    /// data would let it through the API filter.
+    pub(crate) async fn fetch_file(
         &self,
         mod_id: u32,
         mc_version: &str,
         loader: ModLoader,
         api_key: &str,
     ) -> Result<ResolvedDownload, CurseForgeError> {
-        let loader_type = loader.as_curseforge_loader_type().to_string();
+        self.fetch_file_inner(mod_id, mc_version, Some(loader), loader, api_key)
+            .await
+            .map(|(download, _)| download)
+    }
+
+    /// Fallback attempt: widen the query (any loader / any game version) but
+    /// still validate whatever comes back against the instance's real loader
+    /// — an untagged file is accepted, a file tagged for another loader is
+    /// refused, so the fallback can only ever return something usable.
+    async fn fetch_file_any_loader(
+        &self,
+        mod_id: u32,
+        mc_version: &str,
+        validate_loader: ModLoader,
+        api_key: &str,
+    ) -> Result<ResolvedDownload, CurseForgeError> {
+        self.fetch_file_inner(mod_id, mc_version, None, validate_loader, api_key)
+            .await
+            .map(|(download, _)| download)
+    }
+
+    /// `query_loader = None` skips the modLoaderType filter entirely; files
+    /// that declare no loader categories always pass validation.
+    async fn fetch_file_inner(
+        &self,
+        mod_id: u32,
+        mc_version: &str,
+        query_loader: Option<ModLoader>,
+        validate_loader: ModLoader,
+        api_key: &str,
+    ) -> Result<(ResolvedDownload, Vec<u32>), CurseForgeError> {
         let mut request = self
             .http
             .get(format!("{BASE_URL}/mods/{mod_id}/files"))
@@ -204,8 +238,13 @@ impl CurseForgeClient {
         if !mc_version.is_empty() {
             request = request.query(&[("gameVersion", mc_version)]);
         }
-        if loader != ModLoader::Vanilla {
-            request = request.query(&[("modLoaderType", loader_type.as_str())]);
+        if let Some(loader) =
+            query_loader.filter(|l| *l != ModLoader::Vanilla)
+        {
+            request = request.query(&[(
+                "modLoaderType",
+                loader.as_curseforge_loader_type().to_string(),
+            )]);
         }
 
         let response = request.send().await?.error_for_status()?;
@@ -215,6 +254,9 @@ impl CurseForgeClient {
             .into_iter()
             .next()
             .ok_or(CurseForgeError::NotFound)?;
+
+        ensure_file_loader_matches(&file.loaders, validate_loader)?;
+        let required_dependencies = required_dependency_mod_ids_of_file(&file);
 
         let download_url = match file.download_url.filter(|u| !u.is_empty()) {
             Some(url) => url,
@@ -235,10 +277,73 @@ impl CurseForgeClient {
             },
         };
 
-        Ok(ResolvedDownload {
-            url: download_url,
-            filename: file.file_name,
-        })
+        Ok((
+            ResolvedDownload {
+                url: download_url,
+                filename: file.file_name,
+            },
+            required_dependencies,
+        ))
+    }
+
+    /// The dependency mod ids declared by the newest file matching this MC
+    /// version + loader — the same selection rule as `fetch_file`'s exact
+    /// attempt, so the dependencies belong to the file that gets installed.
+    /// Best-effort like the Modrinth counterpart: any failure yields empty.
+    pub(crate) async fn required_dependency_mod_ids(
+        &self,
+        mod_id: u32,
+        mc_version: &str,
+        loader: ModLoader,
+        api_key: &str,
+    ) -> Vec<u32> {
+        if api_key.trim().is_empty() {
+            return Vec::new();
+        }
+        let response = self
+            .http
+            .get(format!("{BASE_URL}/mods/{mod_id}/files"))
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .query(&[
+                ("pageSize", "1"),
+                ("index", "0"),
+                ("sortField", "2"),
+                ("sortOrder", "desc"),
+            ])
+            .query(&[("gameVersion", mc_version)])
+            .query(&[(
+                "modLoaderType",
+                loader.as_curseforge_loader_type().to_string(),
+            )])
+            .send()
+            .await;
+        let Ok(response) = response else {
+            return Vec::new();
+        };
+        let Ok(payload) = response.json::<CurseForgeApiResponse<Vec<CurseForgeModFile>>>().await
+        else {
+            return Vec::new();
+        };
+        payload
+            .data
+            .first()
+            .map(required_dependency_mod_ids_of_file)
+            .unwrap_or_default()
+    }
+
+    /// Dependency mod ids of one specific file (a version the user picked by
+    /// hand). Best-effort.
+    pub(crate) async fn file_dependency_mod_ids(
+        &self,
+        mod_id: u32,
+        file_id: u32,
+        api_key: &str,
+    ) -> Vec<u32> {
+        self.file_meta_inner(mod_id, file_id, api_key, 0)
+            .await
+            .map(|file| required_dependency_mod_ids_of_file(&file))
+            .unwrap_or_default()
     }
 
     pub async fn file_download_url(
@@ -293,15 +398,6 @@ impl CurseForgeClient {
         let response = response.error_for_status()?;
         let payload: CurseForgeApiResponse<String> = response.json().await?;
         Ok(payload.data)
-    }
-
-    pub async fn file_name(
-        &self,
-        mod_id: u32,
-        file_id: u32,
-        api_key: &str,
-    ) -> Result<String, CurseForgeError> {
-        Ok(self.file_meta_inner(mod_id, file_id, api_key, 0).await?.file_name)
     }
 
     /// Filename + Sha1 together, one request instead of two — for callers
@@ -520,7 +616,9 @@ impl CurseForgeClient {
         mod_id: u32,
         file_id: u32,
         api_key: &str,
-    ) -> Result<ResolvedDownload, CurseForgeError> {
+        mc_version: &str,
+        loader: ModLoader,
+    ) -> Result<(ResolvedDownload, Vec<u32>), CurseForgeError> {
         if api_key.trim().is_empty() {
             return Err(CurseForgeError::NotConfigured);
         }
@@ -528,25 +626,38 @@ impl CurseForgeClient {
         // no ambiguity about which file is "correct" — so a 403 here is
         // reported as a restriction on this exact file rather than a bare
         // rejection, same as the version/loader-matching path above.
+        let file = self.file_meta_inner(mod_id, file_id, api_key, 0).await?;
+        // The picker shows every version; this guard is what stops an easy
+        // mis-click ("Add" on a row tagged Fabric) from installing it into a
+        // NeoForge instance.
+        ensure_file_loader_matches(&file.loaders, loader)?;
+        if !mc_version.is_empty()
+            && !file.game_versions.is_empty()
+            && !file.game_versions.iter().any(|v| v == mc_version)
+        {
+            return Err(CurseForgeError::NotFound);
+        }
+        let required_dependencies = required_dependency_mod_ids_of_file(&file);
+
         let url = match self.file_download_url(mod_id, file_id, api_key).await {
             Ok(url) => url,
             Err(CurseForgeError::Rejected { status: 403, .. }) => {
-                let (filename, sha1) = self
-                    .file_meta(mod_id, file_id, api_key)
-                    .await
-                    .unwrap_or_else(|_| (format!("mod-{mod_id}-{file_id}.jar"), None));
-                return Err(CurseForgeError::DistributionRestricted { file_id, filename, sha1 });
+                let sha1 = sha1_of(&file.hashes);
+                return Err(CurseForgeError::DistributionRestricted {
+                    file_id,
+                    filename: file.file_name,
+                    sha1,
+                });
             }
             Err(e) => return Err(e),
         };
-        let filename = self
-            .file_name(mod_id, file_id, api_key)
-            .await
-            .unwrap_or_else(|_| format!("mod-{mod_id}-{file_id}.jar"));
-        Ok(ResolvedDownload {
-            url,
-            filename,
-        })
+        Ok((
+            ResolvedDownload {
+                url,
+                filename: file.file_name,
+            },
+            required_dependencies,
+        ))
     }
 
     pub async fn fetch_mod_detail(
@@ -1343,6 +1454,12 @@ struct CurseForgeModFile {
     download_url: Option<String>,
     #[serde(default)]
     hashes: Vec<CurseForgeFileHash>,
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    loaders: Vec<CurseForgeFileLoader>,
+    #[serde(default)]
+    dependencies: Vec<CurseForgeFileDependency>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1350,6 +1467,64 @@ struct CurseForgeFileHash {
     value: String,
     // 1 = Sha1, 2 = Md5 per CurseForge's API.
     algo: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFileDependency {
+    mod_id: u32,
+    // 1 = embedded, 2 = optional, 3 = required, 4 = tool, 5 = incompatible.
+    relation_type: u8,
+}
+
+/// CurseForge's display name for a loader's category, used to check whether a
+/// file is tagged for the instance's loader (`loaders` on File objects).
+fn curseforge_loader_name(loader: ModLoader) -> Option<&'static str> {
+    match loader {
+        ModLoader::Forge => Some("Forge"),
+        ModLoader::NeoForge => Some("NeoForge"),
+        ModLoader::Fabric => Some("Fabric"),
+        ModLoader::Quilt => Some("Quilt"),
+        ModLoader::Vanilla => None,
+    }
+}
+
+/// Refuses a file explicitly tagged for a *different* loader than the target.
+/// Untagged files pass (plenty of older CurseForge files never declare a
+/// loader category), and Vanilla targets pass (nothing to be wrong against).
+/// This is what stops the fallback chain from quietly installing a Fabric jar
+/// into a NeoForge instance when no exact-loader file exists.
+fn ensure_file_loader_matches(
+    file_loaders: &[CurseForgeFileLoader],
+    target: ModLoader,
+) -> Result<(), CurseForgeError> {
+    if target == ModLoader::Vanilla || file_loaders.is_empty() {
+        return Ok(());
+    }
+    let Some(want) = curseforge_loader_name(target) else {
+        return Ok(());
+    };
+    if file_loaders
+        .iter()
+        .any(|l| l.name.eq_ignore_ascii_case(want))
+    {
+        return Ok(());
+    }
+    Err(CurseForgeError::NotFound)
+}
+
+/// The mod ids this file declares as hard requirements (relationType 3),
+/// deduplicated. Optional/embedded/incompatible relations are ignored —
+/// installing optional deps unasked is wrong, and incompatible ones must
+/// obviously never be installed.
+fn required_dependency_mod_ids_of_file(file: &CurseForgeModFile) -> Vec<u32> {
+    let mut out = Vec::new();
+    for dep in &file.dependencies {
+        if dep.relation_type == 3 && !out.contains(&dep.mod_id) {
+            out.push(dep.mod_id);
+        }
+    }
+    out
 }
 
 /// Pulls the Sha1 out of a file's hash list, if CurseForge reported one —
