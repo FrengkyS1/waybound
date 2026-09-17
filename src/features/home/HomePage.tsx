@@ -58,6 +58,7 @@ export function HomePage({
 }: HomePageProps) {
   const [instances, setInstances] = useState<InstanceSummary[]>([]);
   const [versions, setVersions] = useState<string[]>([]);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -113,23 +114,25 @@ export function HomePage({
   }
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const [list, gameVersions] = await Promise.all([
-          fetchInstances(),
-          fetchMinecraftVersions(),
-        ]);
-        setInstances(list);
-        setVersions(gameVersions.map((v) => v.version));
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setLoading(false);
-      }
-    })();
+    let active = true;
+    // Local instances must remain accessible while remote metadata is unavailable.
+    void fetchInstances()
+      .then((list) => { if (active) setInstances(list); })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => { if (active) setLoading(false); });
+    void fetchMinecraftVersions()
+      .then((gameVersions) => {
+        if (active) setVersions(gameVersions.map((v) => v.version));
+      })
+      .catch(() => {
+        if (active) setVersionsError("Minecraft versions are unavailable. Connect to the internet and reopen this page to create an instance. Your saved instances are still available.");
+      });
     fetchCurseForgeStatus()
-      .then((status) => setCfConfigured(status.configured))
+      .then((status) => { if (active) setCfConfigured(status.configured); })
       .catch(() => {});
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -489,6 +492,7 @@ export function HomePage({
       {createOpen && (
         <CreateInstanceDialog
           versions={versions}
+          versionsError={versionsError}
           busy={creating}
           onClose={() => setCreateOpen(false)}
           onCreate={(input) => void handleCreate(input)}

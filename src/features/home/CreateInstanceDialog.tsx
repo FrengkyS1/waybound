@@ -14,6 +14,7 @@ const LOADERS: { value: ModLoader; label: string }[] = [
 
 interface CreateInstanceDialogProps {
   versions: string[];
+  versionsError: string | null;
   busy: boolean;
   onClose: () => void;
   onCreate: (input: {
@@ -26,12 +27,13 @@ interface CreateInstanceDialogProps {
 
 export function CreateInstanceDialog({
   versions,
+  versionsError,
   busy,
   onClose,
   onCreate,
 }: CreateInstanceDialogProps) {
   const [name, setName] = useState("");
-  const [mcVersion, setMcVersion] = useState(versions[0] ?? "1.21.1");
+  const [mcVersion, setMcVersion] = useState(versions[0] ?? "");
   const [loader, setLoader] = useState<ModLoader>("vanilla");
   const [icon, setIcon] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -135,7 +137,9 @@ export function CreateInstanceDialog({
             <legend className={styles.label}>Minecraft version</legend>
             <div className={styles.versionList}>
               {versions.length === 0 && (
-                <p className={styles.hint}>Loading versions…</p>
+                <p className={styles.hint} role={versionsError ? "alert" : "status"}>
+                  {versionsError ?? "Loading versions…"}
+                </p>
               )}
               {versions.map((version) => (
                 <button
