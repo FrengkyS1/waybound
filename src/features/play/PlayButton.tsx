@@ -78,9 +78,9 @@ export function PlayButton({
         onClick={handleClick}
         disabled={disabled || isBusyHere || checking}
       >
-        <span className={styles.icon} aria-hidden>
-          ?
-        </span>
+      <span className={styles.icon} aria-hidden>
+        ▶
+      </span>
         {label}
       </button>
       {signInOpen && (

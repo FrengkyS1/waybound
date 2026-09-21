@@ -33,6 +33,22 @@ struct ModMeta {
     icon: Option<String>,
     mod_id: Option<String>,
     launch: ModLaunchMeta,
+    /// Mod ids nested inside this jar via Jar-in-Jar — the loader loads
+    /// them as real mods, so they satisfy dependencies instance-wide.
+    embedded_ids: Vec<String>,
+    /// EVERY mod id this jar declares (a jar can ship several [[mods]]
+    /// entries — CyclopsMC jars carry the main mod plus a `-compat`
+    /// submodule that siblings depend on). First entry stays `mod_id`
+    /// for display/tracking; all of them count as installed.
+    all_mod_ids: Vec<String>,
+}
+
+fn push_mod_id(list: &mut Vec<String>, id: Option<&str>) {
+    if let Some(id) = non_empty(id) {
+        if !list.iter().any(|e| e == &id) {
+            list.push(id);
+        }
+    }
 }
 
 /// Loader/Minecraft-version/dependency signals from the same jar metadata —
@@ -41,17 +57,35 @@ struct ModMeta {
 /// Raw range strings are kept as-is (never evaluated here — the loader
 /// itself is the authority at runtime); only presence and loader family
 /// are judged.
+///
+/// One entry per metadata file found: multiloader ("merged") jars ship
+/// fabric + forge + neoforge metadata side by side and each loader reads
+/// only its own, so judging the jar by the first file found false-flags it
+/// everywhere else. The readiness check uses the entry matching the
+/// instance's loader and ignores the rest.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ModLaunchMeta {
-    /// "fabric" | "forge" | "neoforge" | "quilt", from whichever metadata
-    /// file identified the mod first.
-    pub loader: Option<String>,
-    /// Raw Minecraft version ranges (fabric `depends.minecraft`,
-    /// toml `[[dependencies.minecraft]]`), for display only.
+    pub loaders: Vec<LoaderMetaEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoaderMetaEntry {
+    pub loader: String,
     pub mc_versions: Vec<String>,
-    /// Required dependencies (mod id + raw range), loader/game pseudo-deps
-    /// already filtered out.
     pub dependencies: Vec<ModDependency>,
+}
+
+impl ModLaunchMeta {
+    fn entry_mut(&mut self, loader: &str) -> &mut LoaderMetaEntry {
+        if !self.loaders.iter().any(|e| e.loader == loader) {
+            self.loaders.push(LoaderMetaEntry {
+                loader: loader.to_string(),
+                mc_versions: Vec::new(),
+                dependencies: Vec::new(),
+            });
+        }
+        self.loaders.iter_mut().find(|e| e.loader == loader).expect("just inserted")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +109,7 @@ fn is_pseudo_dependency(id: &str) -> bool {
 /// lookups instead of the two separate full re-parses this used to do per
 /// mod.
 fn read_mod_metadata(jar_path: &Path) -> ModMeta {
-    let mut meta = ModMeta { name: None, icon: None, mod_id: None, launch: ModLaunchMeta::default() };
+    let mut meta = ModMeta { name: None, icon: None, mod_id: None, launch: ModLaunchMeta::default(), embedded_ids: Vec::new(), all_mod_ids: Vec::new() };
     let Ok(file) = fs::File::open(jar_path) else {
         return meta;
     };
@@ -88,19 +122,18 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
             meta.name = non_empty(value.get("name").and_then(|v| v.as_str()));
             meta.mod_id = non_empty(value.get("id").and_then(|v| v.as_str()));
-            if meta.launch.loader.is_none() {
-                meta.launch.loader = Some("fabric".to_string());
-            }
+            push_mod_id(&mut meta.all_mod_ids, value.get("id").and_then(|v| v.as_str()));
+            let entry = meta.launch.entry_mut("fabric");
             // `depends` maps mod id -> range ("*" included). Only required
             // deps live here (breaks/conflicts are separate keys).
             if let Some(depends) = value.get("depends").and_then(|v| v.as_object()) {
                 for (id, range) in depends {
                     if id == "minecraft" {
                         if let Some(r) = range.as_str() {
-                            meta.launch.mc_versions.push(r.to_string());
+                            entry.mc_versions.push(r.to_string());
                         }
                     } else if !is_pseudo_dependency(id) {
-                        meta.launch.dependencies.push(ModDependency {
+                        entry.dependencies.push(ModDependency {
                             mod_id: id.clone(),
                             version_range: range.as_str().map(str::to_string),
                         });
@@ -124,14 +157,16 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
 
     // Quilt (`quilt.mod.json`, schema 1): loader + `quilt_loader.depends`
     // entries of {id, versions} where versions is a string or an array.
-    if meta.launch.loader.is_none() {
-        if let Some(contents) = read_zip_entry(&mut archive, "quilt.mod.json") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let loader_obj = value.get("quilt_loader");
-                let has_loader_obj = loader_obj.is_some();
-                if has_loader_obj {
-                    meta.launch.loader = Some("quilt".to_string());
-                }
+    // Parsed whenever present (multiloader jars carry it next to fabric's).
+    if let Some(contents) = read_zip_entry(&mut archive, "quilt.mod.json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+            let loader_obj = value.get("quilt_loader");
+            if loader_obj.is_some() {
+                push_mod_id(
+                    &mut meta.all_mod_ids,
+                    loader_obj.and_then(|l| l.get("id")).and_then(|v| v.as_str()),
+                );
+                let entry = meta.launch.entry_mut("quilt");
                 if let Some(depends) = loader_obj.and_then(|l| l.get("depends")).and_then(|v| v.as_array()) {
                     for dep in depends {
                         let Some(id) = dep.get("id").and_then(|v| v.as_str()) else {
@@ -151,10 +186,10 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
                         };
                         if id == "minecraft" {
                             if let Some(r) = range {
-                                meta.launch.mc_versions.push(r);
+                                entry.mc_versions.push(r);
                             }
                         } else if !is_pseudo_dependency(id) {
-                            meta.launch.dependencies.push(ModDependency {
+                            entry.dependencies.push(ModDependency {
                                 mod_id: id.to_string(),
                                 version_range: range,
                             });
@@ -171,75 +206,83 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
     // all, so both names need checking. Same schema either way — NeoForge is
     // a Forge fork — and neoforge.mods.toml takes priority when both exist,
     // same as the loader itself resolves it.
-    if meta.name.is_none() || meta.icon.is_none() {
-        for entry_name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
-            if meta.name.is_some() && meta.icon.is_some() {
-                break;
-            }
-            let Some(contents) = read_zip_entry(&mut archive, entry_name) else {
-                continue;
-            };
-            let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
-                continue;
-            };
-            let first_mod = value.get("mods").and_then(|m| m.as_array()).and_then(|a| a.first());
-            if meta.name.is_none() {
-                meta.name = non_empty(
-                    first_mod
-                        .and_then(|m| m.get("displayName"))
-                        .and_then(|v| v.as_str()),
-                );
-            }
-            if meta.mod_id.is_none() {
-                meta.mod_id =
-                    non_empty(first_mod.and_then(|m| m.get("modId")).and_then(|v| v.as_str()));
-            }
-            // `[[dependencies.<modid>]]` entries carry the required-dep
-            // graph the loader enforces at runtime. Only `mandatory` ones
-            // (the default) count — optional deps missing is not a problem.
-            if meta.launch.loader.is_none() {
-                meta.launch.loader = Some(if entry_name.contains("neoforge") {
-                    "neoforge"
-                } else {
-                    "forge"
-                }.to_string());
-            }
-            if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
-                for (key, entries) in deps {
-                    let Some(list) = entries.as_array() else {
-                        continue;
+    //
+    // Display fields stay first-wins (gated below), but launch metadata is
+    // ALWAYS parsed per file: multiloader jars carry fabric + forge +
+    // neoforge side by side, and skipping the tomls just because Fabric
+    // already supplied a name is exactly what false-flagged them.
+    for entry_name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        let Some(contents) = read_zip_entry(&mut archive, entry_name) else {
+            continue;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
+            continue;
+        };
+        let loader = if entry_name.contains("neoforge") { "neoforge" } else { "forge" };
+        let entry = meta.launch.entry_mut(loader);
+        // `[[dependencies.<modid>]]` entries carry the required-dep
+        // graph the loader enforces at runtime. Only `mandatory` ones
+        // (the default) count — optional deps missing is not a problem.
+        if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
+            for (key, entries) in deps {
+                let Some(list) = entries.as_array() else {
+                    continue;
+                };
+                for dep in list {
+                    let dep_id = dep
+                        .get("modId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(key.as_str());
+                    let mandatory = match dep.get("type").and_then(|v| v.as_str()) {
+                        // Newer files use type="required"|"optional"|... —
+                        // it wins over `mandatory` when both are present.
+                        Some(t) => t.eq_ignore_ascii_case("required"),
+                        None => dep.get("mandatory").and_then(|v| v.as_bool()).unwrap_or(true),
                     };
-                    for entry in list {
-                        let dep_id = entry
-                            .get("modId")
+                    if dep_id == "minecraft" {
+                        if let Some(r) = dep.get("versionRange").and_then(|v| v.as_str()) {
+                            if !entry.mc_versions.iter().any(|v| v == r) {
+                                entry.mc_versions.push(r.to_string());
+                            }
+                        }
+                    } else if mandatory && !is_pseudo_dependency(dep_id) {
+                        let range = dep
+                            .get("versionRange")
                             .and_then(|v| v.as_str())
-                            .unwrap_or(key.as_str());
-                        let mandatory = entry
-                            .get("mandatory")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        if dep_id == "minecraft" {
-                            if let Some(r) = entry.get("versionRange").and_then(|v| v.as_str()) {
-                                if !meta.launch.mc_versions.iter().any(|v| v == r) {
-                                    meta.launch.mc_versions.push(r.to_string());
-                                }
-                            }
-                        } else if mandatory && !is_pseudo_dependency(dep_id) {
-                            let range = entry
-                                .get("versionRange")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string);
-                            if !meta.launch.dependencies.iter().any(|d| d.mod_id == dep_id) {
-                                meta.launch.dependencies.push(ModDependency {
-                                    mod_id: dep_id.to_string(),
-                                    version_range: range,
-                                });
-                            }
+                            .map(str::to_string);
+                        if !entry.dependencies.iter().any(|d| d.mod_id == dep_id) {
+                            entry.dependencies.push(ModDependency {
+                                mod_id: dep_id.to_string(),
+                                version_range: range,
+                            });
                         }
                     }
                 }
             }
-            if meta.icon.is_none() {
+        }
+        if meta.name.is_some() && meta.icon.is_some() && meta.mod_id.is_some() {
+            continue;
+        }
+        let first_mod = value.get("mods").and_then(|m| m.as_array()).and_then(|a| a.first());
+        // Every [[mods]] entry provides a real mod id (main mod plus
+        // -compat submodules); only the first feeds display/tracking.
+        if let Some(mods) = value.get("mods").and_then(|m| m.as_array()) {
+            for m in mods {
+                push_mod_id(&mut meta.all_mod_ids, m.get("modId").and_then(|v| v.as_str()));
+            }
+        }
+        if meta.name.is_none() {
+            meta.name = non_empty(
+                first_mod
+                    .and_then(|m| m.get("displayName"))
+                    .and_then(|v| v.as_str()),
+            );
+        }
+        if meta.mod_id.is_none() {
+            meta.mod_id =
+                non_empty(first_mod.and_then(|m| m.get("modId")).and_then(|v| v.as_str()));
+        }
+        if meta.icon.is_none() {
                 // `logoFile` is documented as a top-level key (applies to
                 // the whole file), but some mods — notably ones generated by
                 // Modrinth's packwiz/template tooling — declare it per-mod
@@ -260,22 +303,34 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
                 }
             }
         }
-    }
 
-    // Legacy Forge (1.12 and earlier) — name only, no icon convention.
+    // Legacy Forge (1.12 and earlier) — name only, no icon convention, and
+    // no dependency graph worth reading. Only consulted when nothing else
+    // identified the mod, same as the display fields.
     if meta.name.is_none() {
         if let Some(contents) = read_zip_entry(&mut archive, "mcmod.info") {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let first = value.as_array().and_then(|arr| arr.first()).or_else(|| {
-                    value.get("modList").and_then(|v| v.as_array()).and_then(|arr| arr.first())
-                });
+                let list: Vec<&serde_json::Value> = match &value {
+                    serde_json::Value::Array(arr) => arr.iter().collect(),
+                    _ => value
+                        .get("modList")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().collect())
+                        .unwrap_or_default(),
+                };
+                for m in &list {
+                    push_mod_id(&mut meta.all_mod_ids, m.get("modid").and_then(|v| v.as_str()));
+                }
+                let first = list.first().copied();
                 meta.name = non_empty(first.and_then(|m| m.get("name")).and_then(|v| v.as_str()));
-                if meta.name.is_some() && meta.launch.loader.is_none() {
-                    meta.launch.loader = Some("forge".to_string());
+                if meta.name.is_some() && meta.launch.loaders.is_empty() {
+                    meta.launch.entry_mut("forge");
                 }
             }
         }
     }
+
+    meta.embedded_ids = embedded_jar_mod_ids(&mut archive);
 
     meta
 }
@@ -288,6 +343,86 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
     let mut contents = String::new();
     entry.read_to_string(&mut contents).ok()?;
     Some(contents)
+}
+
+/// Mod ids embedded via NeoForge's Jar-in-Jar (`META-INF/jarjar/
+/// metadata.json` + nested jars): the loader adds every nested jar to the
+/// mod collection, so their ids satisfy `[[dependencies]]` exactly like
+/// top-level jars do. Without this, Create's flywheel/ponder, EnderIO's
+/// endercore, AE2WTLib's api and friends all false-flag as missing.
+fn embedded_jar_mod_ids<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Ok(mut meta_entry) = archive.by_name("META-INF/jarjar/metadata.json") else {
+        return ids;
+    };
+    if meta_entry.size() > 1024 * 1024 {
+        return ids;
+    }
+    let mut raw = String::new();
+    if meta_entry.read_to_string(&mut raw).is_err() {
+        return ids;
+    }
+    drop(meta_entry);
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return ids;
+    };
+    let Some(jars) = meta.get("jars").and_then(|j| j.as_array()) else {
+        return ids;
+    };
+    for jar in jars {
+        let Some(path) = jar.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        let Ok(mut nested_entry) = archive.by_name(path) else {
+            continue;
+        };
+        if nested_entry.size() > 64 * 1024 * 1024 {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if nested_entry.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        drop(nested_entry);
+        let Ok(mut nested) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            continue;
+        };
+        if let Some(id) = first_mod_id(&mut nested) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// First mod id out of a jar's metadata, NeoForge-first like the loader
+/// resolves it. Display parsing has its own richer version; this is just
+/// for dependency-satisfaction bookkeeping.
+fn first_mod_id<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> Option<String> {
+    for entry_name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        if let Some(contents) = read_zip_entry(archive, entry_name) {
+            if let Ok(value) = toml::from_str::<toml::Value>(&contents) {
+                if let Some(id) = value
+                    .get("mods")
+                    .and_then(|m| m.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|m| m.get("modId"))
+                    .and_then(|v| v.as_str())
+                {
+                    return non_empty(Some(id));
+                }
+            }
+        }
+    }
+    if let Some(contents) = read_zip_entry(archive, "fabric.mod.json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+            if let Some(id) = non_empty(value.get("id").and_then(|v| v.as_str())) {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 /// Reads a resource pack's `pack.png`, the standard convention for its icon.
@@ -700,19 +835,28 @@ fn resolve_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
 }
 
 /// One enabled jar's launch-relevant metadata for readiness assessment.
+#[derive(Debug, Clone)]
 pub(crate) struct FileLaunchMeta {
     pub file_name: String,
     pub mod_name: Option<String>,
     pub mod_id: Option<String>,
+    /// Every mod id the jar declares (main + submodules) — all count as
+    /// installed for dependency satisfaction.
+    pub all_mod_ids: Vec<String>,
     pub launch: ModLaunchMeta,
 }
 
 /// Judges parsed jar metadata against the instance's loader: loader-family
 /// mismatches plus required dependency ids no installed jar provides.
+/// Only the metadata entry matching the instance's loader counts — a
+/// multiloader jar's Fabric deps are meaningless on a NeoForge instance
+/// (and vice versa). A jar with no matching entry is flagged wrong-loader
+/// and its deps are skipped to avoid piling noise on the real problem.
 /// Pure (no I/O) so the rules are unit-testable without instance fixtures.
 pub(crate) fn assess_readiness(
     instance_loader: ModLoader,
     files: &[FileLaunchMeta],
+    embedded_ids: &[String],
 ) -> LaunchReadiness {
     let instance_loader_str = match instance_loader {
         ModLoader::Fabric => "fabric",
@@ -721,23 +865,42 @@ pub(crate) fn assess_readiness(
         ModLoader::Quilt => "quilt",
         ModLoader::Vanilla => "vanilla",
     };
-    let installed_ids: std::collections::HashSet<String> = files
+    let mut installed_ids: std::collections::HashSet<String> = files
         .iter()
-        .filter_map(|f| f.mod_id.as_deref().map(|id| id.to_ascii_lowercase()))
+        .flat_map(|f| {
+            f.mod_id
+                .iter()
+                .map(|id| id.to_ascii_lowercase())
+                .chain(f.all_mod_ids.iter().map(|id| id.to_ascii_lowercase()))
+        })
         .collect();
+    installed_ids.extend(embedded_ids.iter().map(|id| id.to_ascii_lowercase()));
     let mut wrong_loader = Vec::new();
     let mut missing_deps = Vec::new();
     for file in files {
-        if let Some(detected) = file.launch.loader.as_deref() {
-            if detected != instance_loader_str {
+        let matching = file
+            .launch
+            .loaders
+            .iter()
+            .find(|e| e.loader == instance_loader_str);
+        let Some(entry) = matching else {
+            if !file.launch.loaders.is_empty() {
+                let detected = file
+                    .launch
+                    .loaders
+                    .iter()
+                    .map(|e| e.loader.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 wrong_loader.push(WrongLoaderFile {
                     file_name: file.file_name.clone(),
                     mod_name: file.mod_name.clone(),
-                    detected_loader: detected.to_string(),
+                    detected_loader: detected,
                 });
             }
-        }
-        for dep in &file.launch.dependencies {
+            continue;
+        };
+        for dep in &entry.dependencies {
             if !installed_ids.contains(&dep.mod_id.to_ascii_lowercase()) {
                 missing_deps.push(MissingDep {
                     file_name: file.file_name.clone(),
@@ -772,8 +935,9 @@ pub async fn check_launch_readiness(
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
+        let mut embedded_ids = Vec::new();
         let Ok(entries) = std::fs::read_dir(root.join("mods")) else {
-            return out;
+            return (out, embedded_ids);
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -784,24 +948,26 @@ pub async fn check_launch_readiness(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // Same `.jar`-only convention as the mod counter: `.disabled`
+            // Same `.jar`-only convention as the mod count: `.disabled`
             // files don't load, so they can't break (or fix) a launch.
             if !name.ends_with(".jar") {
                 continue;
             }
             let meta = read_mod_metadata(&path);
+            embedded_ids.extend(meta.embedded_ids.clone());
             out.push(FileLaunchMeta {
                 file_name: name,
                 mod_name: meta.name,
                 mod_id: meta.mod_id,
+                all_mod_ids: meta.all_mod_ids,
                 launch: meta.launch,
             });
         }
-        out
+        (out, embedded_ids)
     })
     .await
     .map_err(|e| e.to_string())?;
-    Ok(assess_readiness(instance.loader, &files))
+    Ok(assess_readiness(instance.loader, &files.0, &files.1))
 }
 
 /// Resolves one file's display name + icon by opening just that jar/zip —
@@ -1342,6 +1508,10 @@ mod launch_meta_tests {
         modId = "optionalthing"
         versionRange = "[1.0,)"
         mandatory = false
+        [[dependencies.formations]]
+        modId = "newstyleoptional"
+        type = "optional"
+        versionRange = "[3.0,)"
     "#;
 
     const QUILT_JSON: &str = r#"{
@@ -1359,29 +1529,75 @@ mod launch_meta_tests {
     #[test]
     fn fabric_jar_reports_loader_mc_and_required_deps() {
         let meta = read_mod_metadata(&jar_with(&[("fabric.mod.json", FABRIC_JSON)]));
-        assert_eq!(meta.launch.loader.as_deref(), Some("fabric"));
-        assert_eq!(meta.launch.mc_versions, vec![">=1.20"]);
+        let entry = meta.launch.loaders.iter().find(|e| e.loader == "fabric").expect("fabric entry");
+        assert_eq!(entry.mc_versions, vec![">=1.20"]);
         // fabricloader/java are runtime, not mods; fabric-api is a real dep.
-        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        let ids: Vec<&str> = entry.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
         assert_eq!(ids, vec!["fabric-api"]);
     }
 
     #[test]
     fn neoforge_toml_reports_loader_and_mandatory_deps_only() {
         let meta = read_mod_metadata(&jar_with(&[("META-INF/neoforge.mods.toml", NEOFORGE_TOML)]));
-        assert_eq!(meta.launch.loader.as_deref(), Some("neoforge"));
-        assert_eq!(meta.launch.mc_versions, vec!["[1.21,1.22)"]);
-        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
-        // neoforge itself is pseudo; the optional dep is dropped.
+        let entry = meta.launch.loaders.iter().find(|e| e.loader == "neoforge").expect("neoforge entry");
+        assert_eq!(entry.mc_versions, vec!["[1.21,1.22)"]);
+        let ids: Vec<&str> = entry.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        // neoforge itself is pseudo; both optional styles are dropped.
         assert_eq!(ids, vec!["somelib"]);
     }
 
     #[test]
     fn quilt_jar_reports_quilt_loader() {
         let meta = read_mod_metadata(&jar_with(&[("quilt.mod.json", QUILT_JSON)]));
-        assert_eq!(meta.launch.loader.as_deref(), Some("quilt"));
-        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        assert!(meta.launch.loaders.iter().any(|e| e.loader == "quilt"));
+        let entry = meta.launch.loaders.iter().find(|e| e.loader == "quilt").unwrap();
+        let ids: Vec<&str> = entry.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
         assert_eq!(ids, vec!["qsl"]);
+    }
+
+    #[test]
+    fn multiloader_jar_registers_every_loader_it_ships() {
+        // Cursee-style "merged" jars carry fabric + forge + neoforge
+        // metadata side by side; the loader reads only its own. Judging by
+        // the first file found false-flagged these on every other loader.
+        let meta = read_mod_metadata(&jar_with(&[
+            ("fabric.mod.json", FABRIC_JSON),
+            ("META-INF/neoforge.mods.toml", NEOFORGE_TOML),
+        ]));
+        let loaders: Vec<&str> = meta.launch.loaders.iter().map(|e| e.loader.as_str()).collect();
+        assert!(loaders.contains(&"fabric"), "fabric entry missing: {loaders:?}");
+        assert!(loaders.contains(&"neoforge"), "neoforge entry missing: {loaders:?}");
+        // The Fabric-only dep (fabric-api) lives in the fabric entry; the
+        // NeoForge entry carries only the toml's own dep.
+        let neo = meta.launch.loaders.iter().find(|e| e.loader == "neoforge").unwrap();
+        let ids: Vec<&str> = neo.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        assert_eq!(ids, vec!["somelib"]);
+    }
+
+    #[test]
+    fn multiloader_jar_is_clean_on_each_of_its_loaders() {
+        // fabric-api (fabric entry) must not flag on a NeoForge instance,
+        // and somelib (neoforge entry) must not flag on a Fabric one —
+        // only the matching entry's deps count.
+        let meta = read_mod_metadata(&jar_with(&[
+            ("fabric.mod.json", FABRIC_JSON),
+            ("META-INF/neoforge.mods.toml", NEOFORGE_TOML),
+        ]));
+        let merged = file("merged.jar", Some("merged"), meta.launch.clone());
+        let neo_files = vec![
+            merged.clone(),
+            file("somelib.jar", Some("somelib"), launch_meta_single("neoforge", &[])),
+        ];
+        let neo_report = assess_readiness(ModLoader::NeoForge, &neo_files, &[]);
+        assert!(neo_report.wrong_loader.is_empty(), "{:?}", neo_report.wrong_loader);
+        assert!(neo_report.missing_deps.is_empty(), "{:?}", neo_report.missing_deps);
+        let fabric_files = vec![
+            merged,
+            file("fabric-api.jar", Some("fabric-api"), launch_meta_single("fabric", &[])),
+        ];
+        let fabric_report = assess_readiness(ModLoader::Fabric, &fabric_files, &[]);
+        assert!(fabric_report.wrong_loader.is_empty(), "{:?}", fabric_report.wrong_loader);
+        assert!(fabric_report.missing_deps.is_empty(), "{:?}", fabric_report.missing_deps);
     }
 
     fn file(name: &str, mod_id: Option<&str>, launch: ModLaunchMeta) -> FileLaunchMeta {
@@ -1389,25 +1605,32 @@ mod launch_meta_tests {
             file_name: name.to_string(),
             mod_name: None,
             mod_id: mod_id.map(str::to_string),
+            all_mod_ids: mod_id.map(|id| vec![id.to_string()]).unwrap_or_default(),
             launch,
         }
     }
 
     fn launch_with(loader: &str, deps: &[&str]) -> ModLaunchMeta {
+        launch_meta_single(loader, deps)
+    }
+
+    fn launch_meta_single(loader: &str, deps: &[&str]) -> ModLaunchMeta {
         ModLaunchMeta {
-            loader: Some(loader.to_string()),
-            mc_versions: Vec::new(),
-            dependencies: deps
-                .iter()
-                .map(|d| super::ModDependency { mod_id: d.to_string(), version_range: None })
-                .collect(),
+            loaders: vec![super::LoaderMetaEntry {
+                loader: loader.to_string(),
+                mc_versions: Vec::new(),
+                dependencies: deps
+                    .iter()
+                    .map(|d| super::ModDependency { mod_id: d.to_string(), version_range: None })
+                    .collect(),
+            }],
         }
     }
 
     #[test]
     fn neoforge_jar_on_forge_instance_is_flagged() {
         let files = vec![file("formations.jar", Some("formations"), launch_with("neoforge", &[]))];
-        let report = assess_readiness(ModLoader::Forge, &files);
+        let report = assess_readiness(ModLoader::Forge, &files, &[]);
         assert_eq!(report.checked_files, 1);
         assert_eq!(report.wrong_loader.len(), 1);
         assert_eq!(report.wrong_loader[0].detected_loader, "neoforge");
@@ -1420,7 +1643,7 @@ mod launch_meta_tests {
             file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"])),
             file("b.jar", Some("somelib"), launch_with("neoforge", &[])),
         ];
-        let report = assess_readiness(ModLoader::NeoForge, &files);
+        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
         assert!(report.wrong_loader.is_empty());
         assert!(report.missing_deps.is_empty());
     }
@@ -1428,9 +1651,49 @@ mod launch_meta_tests {
     #[test]
     fn missing_dep_names_the_requiring_file() {
         let files = vec![file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"]))];
-        let report = assess_readiness(ModLoader::NeoForge, &files);
+        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
         assert_eq!(report.missing_deps.len(), 1);
         assert_eq!(report.missing_deps[0].dep_mod_id, "somelib");
         assert_eq!(report.missing_deps[0].file_name, "a.jar");
+    }
+
+    #[test]
+    fn jarjar_embedded_ids_satisfy_dependencies() {
+        use std::io::Write;
+        // A host jar whose dep only exists nested inside it (Create's
+        // flywheel pattern): the nested id must count as installed.
+        let nested = {
+            let mut buf = Vec::new();
+            {
+                let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                w.start_file("META-INF/neoforge.mods.toml", zip::write::SimpleFileOptions::default()).unwrap();
+                w.write_all(b"[[mods]]\nmodId = \"flywheel\"\nversion = \"1.0.6\"\n").unwrap();
+                w.finish().unwrap();
+            }
+            buf
+        };
+        let dir = std::env::temp_dir().join("waybound-launch-meta-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("host-dep-test.jar");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = zip::ZipWriter::new(file);
+            w.start_file("META-INF/neoforge.mods.toml", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(
+                b"[[mods]]\nmodId = \"create\"\nversion = \"6.0.10\"\n[[dependencies.create]]\nmodId = \"flywheel\"\ntype = \"required\"\n",
+            )
+            .unwrap();
+            w.start_file("META-INF/jarjar/metadata.json", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"{\"jars\": [{\"path\": \"META-INF/jarjar/flywheel.jar\"}]}").unwrap();
+            w.start_file("META-INF/jarjar/flywheel.jar", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(&nested).unwrap();
+            w.finish().unwrap();
+        }
+        let meta = read_mod_metadata(&path);
+        assert!(meta.embedded_ids.iter().any(|id| id == "flywheel"), "{:?}", meta.embedded_ids);
+        let files = vec![file("host.jar", Some("create"), meta.launch.clone())];
+        let report = assess_readiness(ModLoader::NeoForge, &files, &meta.embedded_ids);
+        assert!(report.missing_deps.is_empty(), "{:?}", report.missing_deps);
+        let _ = std::fs::remove_file(&path);
     }
 }

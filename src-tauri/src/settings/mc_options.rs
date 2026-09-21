@@ -260,8 +260,6 @@ fn merge_options(existing: &str, options: &McOptions) -> String {
             managed.insert(key.to_string(), line.to_string());
         }
     }
-    let vanilla_binding_names = default_key_bindings();
-
     let mut output = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -276,15 +274,21 @@ fn merge_options(existing: &str, options: &McOptions) -> String {
             continue;
         };
         if let Some(binding_name) = key.strip_prefix("key_key.") {
-            if vanilla_binding_names.contains_key(binding_name) {
-                if let Some(value) = options.key_bindings.get(binding_name) {
-                    output.push(format!("key_key.{binding_name}:{value}"));
-                    seen.insert(key.to_string());
-                    continue;
-                }
+            // Any keybind the incoming options carry (vanilla or
+            // mod-added) replaces the file's line and marks it seen; one
+            // without an incoming value is kept as-is. (The vanilla-name
+            // check that used to gate this meant mod-added binds were kept
+            // WITHOUT marking seen, so the tail loops re-emitted them —
+            // and on a fresh file, where nothing is ever marked seen, the
+            // two tail loops each emitted every binding, doubling the
+            // whole key block and crashing NeoForge's strict early-display
+            // key parser with "Duplicate key".)
+            if let Some(value) = options.key_bindings.get(binding_name) {
+                output.push(format!("key_key.{binding_name}:{value}"));
+                seen.insert(key.to_string());
+            } else {
+                output.push(line.to_string());
             }
-            // Mod-added keybind (or one we have no incoming value for): keep as-is.
-            output.push(line.to_string());
             continue;
         }
         if let Some(managed_line) = managed.get(key) {
@@ -303,16 +307,10 @@ fn merge_options(existing: &str, options: &McOptions) -> String {
             }
         }
     }
-    let mut binding_keys: Vec<_> = options.key_bindings.keys().collect();
-    binding_keys.sort();
-    for key in binding_keys {
-        let full_key = format!("key_key.{key}");
-        if !seen.contains(&full_key) {
-            if let Some(value) = options.key_bindings.get(key) {
-                output.push(format!("key_key.{key}:{value}"));
-            }
-        }
-    }
+    // NOTE: no second pass over options.key_bindings here — serialize_options
+    // already emits every binding into managed_lines above, so a separate
+    // bindings loop re-emits the whole key block on any file where the
+    // first loop marked nothing seen (i.e. every fresh instance).
 
     // An existing version line (e.g. from modpack overrides) passed through
     // above; only a file without one gets the stamp.
@@ -728,8 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_file_gets_version_stamp_existing_version_survives() {
-        // No existing file: the stamp must be present or vanilla datafixes
+    fn fresh_file_gets_version_stamp_existing_version_survives() {        // No existing file: the stamp must be present or vanilla datafixes
         // the modern key names and discards everything.
         let fresh = merge_options("", &McOptions::default());
         assert!(
@@ -741,6 +738,49 @@ mod tests {
         let merged = merge_options("version:3465\nfullscreen:false\n", &McOptions::default());
         assert!(merged.contains("version:3465"), "{merged}");
         assert!(!merged.contains("version:99999999"), "{merged}");
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.lines().filter(|l| l.trim() == needle).count()
+    }
+
+    #[test]
+    fn merge_never_duplicates_keys_no_matter_the_history() {
+        // Double-apply (create, then modpack re-apply) must be a fixed
+        // point: every key exactly once. (This caught a real crash: the
+        // second tail loop re-emitted the whole key block on fresh files,
+        // and NeoForge's early-display parser throws on duplicate keys.)
+        let once = merge_options("", &McOptions::default());
+        let twice = merge_options(&once, &McOptions::default());
+        assert_eq!(once, twice, "second merge must be a no-op");
+        for line in once.lines() {
+            if line.trim().is_empty() || !line.contains(':') {
+                continue;
+            }
+            assert_eq!(
+                count_occurrences(&twice, line.trim()),
+                1,
+                "duplicated line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mod_added_binding_present_on_both_sides_is_not_tripled() {
+        // A mod keybind the pack ships AND the incoming options carry (e.g.
+        // parsed back from a previous merge): the keep-as-is path doesn't
+        // mark seen, so both tail loops must still not re-emit it.
+        let existing = "key_key.confluence.hook:key.keyboard.r\n";
+        let mut incoming = McOptions::default();
+        incoming
+            .key_bindings
+            .insert("confluence.hook".to_string(), "key.keyboard.r".to_string());
+        let merged = merge_options(existing, &incoming);
+        assert_eq!(
+            count_occurrences(&merged, "key_key.confluence.hook:key.keyboard.r"),
+            1,
+            "mod binding duplicated: {merged}"
+        );
     }
 }
 

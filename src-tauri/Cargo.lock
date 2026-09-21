@@ -4912,7 +4912,7 @@ dependencies = [
 
 [[package]]
 name = "waybound"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "dirs",
