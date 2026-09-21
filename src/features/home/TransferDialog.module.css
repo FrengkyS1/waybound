@@ -1,0 +1,130 @@
+.importDialog {
+  width: min(680px, 100%);
+}
+
+.detection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.detectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.scanRow {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.rootField {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.rootField input::placeholder {
+  color: var(--color-text-muted);
+}
+
+.instanceList {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.selectionHint {
+  padding: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+}
+
+.launcherGroup + .launcherGroup {
+  margin-top: var(--space-3);
+}
+
+.launcherName {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.sourcePath {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.launcherGroup > .sourcePath {
+  margin-bottom: var(--space-2);
+}
+
+.instanceRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid transparent;
+  border-bottom-color: var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.instanceRow:hover {
+  background: var(--color-surface-raised);
+}
+
+.instanceRow:has(input:focus-visible) {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.selectedRow {
+  border-color: var(--color-accent);
+  background: var(--color-surface-raised);
+}
+
+.instanceRow input {
+  flex: none;
+  margin: var(--space-1) 0 0;
+  accent-color: var(--color-accent);
+}
+
+.instanceRow:has(input:disabled) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.instanceDetails {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.instanceName {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.instanceMeta {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}

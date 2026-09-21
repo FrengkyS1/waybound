@@ -280,6 +280,37 @@ impl ModrinthClient {
     /// CurseForge's manifest, which lists `projectID` directly). Two batch
     /// calls total regardless of file count: hash -> project id, then
     /// project id -> name/icon.
+    /// Full-version variant of the `project_meta_by_sha1` lookup below:
+    /// `POST /version_files` returns the complete version object per hash
+    /// (project id, version id/number, files), which is what identifying an
+    /// untracked local jar needs — project + exact installed version in one
+    /// round trip. Strict (errors propagate): callers use this for a
+    /// deliberate user action, not background enrichment.
+    pub async fn lookup_versions_by_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, ModrinthVersion>, ModrinthError> {
+        #[derive(Serialize)]
+        struct HashLookupBody<'a> {
+            hashes: &'a [String],
+            algorithm: &'a str,
+        }
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let response = self
+            .http
+            .post(format!("{BASE_URL}/version_files"))
+            .json(&HashLookupBody { hashes, algorithm: "sha1" })
+            .send()
+            .await?
+            .error_for_status()?;
+        response
+            .json::<std::collections::HashMap<String, ModrinthVersion>>()
+            .await
+            .map_err(|e| ModrinthError::Decode(e.to_string()))
+    }
+
     pub async fn project_meta_by_sha1(&self, sha1_hashes: &[String]) -> std::collections::HashMap<String, ModrinthProjectMeta> {
         if sha1_hashes.is_empty() {
             return std::collections::HashMap::new();
@@ -398,8 +429,8 @@ impl ModrinthClient {
 
         let response = request.send().await?.error_for_status()?;
         let versions: Vec<ModrinthVersion> = decode_json(response).await?;
-        sort_versions_newest_first(versions)
-            .first()
+        let sorted = sort_versions_newest_first(versions);
+        pick_newest_stable(&sorted)
             .and_then(version_to_download)
             .ok_or(ModrinthError::NotFound)
     }
@@ -486,8 +517,8 @@ impl ModrinthClient {
 
         // Same ordering as `query_versions`, so the dependencies reported
         // belong to the version that actually gets downloaded.
-        sort_versions_newest_first(versions)
-            .first()
+        let sorted = sort_versions_newest_first(versions);
+        pick_newest_stable(&sorted)
             .map(|version| required_dependency_ids_of(version))
             .unwrap_or_default()
     }
@@ -628,6 +659,13 @@ pub struct ModrinthVersion {
     pub dependencies: Vec<ModrinthVersionDependency>,
     #[serde(default)]
     pub files: Vec<ModrinthVersionFile>,
+    /// Present on `version_files` / version-list responses; absent nowhere
+    /// that matters thanks to the default.
+    #[serde(default)]
+    pub project_id: String,
+    /// "release" | "beta" | "alpha". Empty reads as release (fail-open).
+    #[serde(default)]
+    pub version_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,7 +694,15 @@ struct ModrinthGalleryItem {
     description: Option<String>,
 }
 
-fn map_version_summary(version: &ModrinthVersion) -> ModVersionSummary {
+pub(crate) fn map_version_summary(version: &ModrinthVersion) -> ModVersionSummary {
+    // Mirror `version_to_download`'s file choice so the exposed filename is
+    // exactly what installing this version would place on disk.
+    let file_name = version
+        .files
+        .iter()
+        .find(|file| file.primary)
+        .or_else(|| version.files.first())
+        .map(|file| file.filename.clone());
     ModVersionSummary {
         id: version.id.clone(),
         name: version.name.clone(),
@@ -670,6 +716,12 @@ fn map_version_summary(version: &ModrinthVersion) -> ModVersionSummary {
             .collect(),
         downloads: version.downloads,
         changelog: version.changelog.clone(),
+        file_name,
+        channel: match version.version_type.as_str() {
+            "beta" => Some("beta".to_string()),
+            "alpha" => Some("alpha".to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -719,6 +771,23 @@ pub(crate) fn required_dependency_ids_of(version: &ModrinthVersion) -> Vec<Strin
     out
 }
 
+/// Stable channel for "newest" picking: releases first, beta/alpha only
+/// when no release exists (a beta-only mod still installs rather than
+/// erroring). Empty reads as release so responses lacking the field never
+/// demote a version.
+fn is_stable_channel(version_type: &str) -> bool {
+    version_type != "beta" && version_type != "alpha"
+}
+
+/// Newest-first input, stable-preferred pick — the shared "which version"
+/// rule for every unpinned resolution path.
+fn pick_newest_stable<'a>(versions: &'a [ModrinthVersion]) -> Option<&'a ModrinthVersion> {
+    versions
+        .iter()
+        .find(|v| is_stable_channel(&v.version_type))
+        .or_else(|| versions.first())
+}
+
 /// Modrinth's `/version` listing has no documented sort guarantee — relying
 /// on whatever order it happens to come back in silently installed a
 /// months-old release once (6.12.0 instead of a since-published 7.4.1,
@@ -739,6 +808,7 @@ fn version_to_download(version: &ModrinthVersion) -> Option<ResolvedDownload> {
     Some(ResolvedDownload {
         url: file.url.clone(),
         filename: file.filename.clone(),
+        hashes: file.hashes.clone(),
     })
 }
 
@@ -748,15 +818,22 @@ fn pick_mod_version(
     loader: ModLoader,
 ) -> Option<ResolvedDownload> {
     let loader_name = loader.as_modrinth();
-    for version in versions {
-        if !version.game_versions.iter().any(|v| v == mc_version) {
-            continue;
-        }
-        if version.loaders.iter().any(|l| l == loader_name)
-            || loader == ModLoader::Vanilla
-        {
-            if let Some(download) = version_to_download(version) {
-                return Some(download);
+    // Stable pass, then any pass: a beta-only mod still resolves rather
+    // than erroring, but never shadows a release.
+    for stable_only in [true, false] {
+        for version in versions {
+            if stable_only && !is_stable_channel(&version.version_type) {
+                continue;
+            }
+            if !version.game_versions.iter().any(|v| v == mc_version) {
+                continue;
+            }
+            if version.loaders.iter().any(|l| l == loader_name)
+                || loader == ModLoader::Vanilla
+            {
+                if let Some(download) = version_to_download(version) {
+                    return Some(download);
+                }
             }
         }
     }
@@ -796,6 +873,8 @@ pub struct ModrinthVersionFile {
     pub filename: String,
     #[serde(default)]
     pub primary: bool,
+    #[serde(default)]
+    pub hashes: std::collections::HashMap<String, String>,
 }
 
 impl ContentType {
@@ -889,6 +968,8 @@ mod version_tests {
             loaders: Vec::new(),
             dependencies: Vec::new(),
             files: Vec::new(),
+            project_id: String::new(),
+            version_type: String::new(),
         }
     }
 
@@ -935,6 +1016,8 @@ mod required_dependency_tests {
             loaders: Vec::new(),
             dependencies,
             files: Vec::new(),
+            project_id: String::new(),
+            version_type: String::new(),
         }
     }
 
@@ -983,5 +1066,94 @@ mod required_dependency_tests {
     #[test]
     fn a_version_with_no_dependencies_yields_none() {
         assert!(required_dependency_ids_of(&version_with(Vec::new())).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod version_files_lookup_tests {
+    use super::{map_version_summary, ModrinthVersion};
+
+    /// Shape of `POST /version_files` (hash -> full version object): the
+    /// project id plus files array are what identification needs.
+    const RESPONSE: &str = r#"{
+        "a9993e364706816aba3e25717850c26c9cd0d4d": {
+            "id": "Rvx75lGq",
+            "project_id": "AANobbMI",
+            "name": "Sodium 0.5.8",
+            "version_number": "0.5.8",
+            "date_published": "2024-01-01T00:00:00Z",
+            "downloads": 42,
+            "game_versions": ["1.20.1"],
+            "loaders": ["fabric"],
+            "files": [
+                {"url": "https://cdn.modrinth.com/x.jar", "filename": "sodium-0.5.8.jar", "primary": true, "hashes": {}},
+                {"url": "https://cdn.modrinth.com/x-sources.jar", "filename": "sodium-0.5.8-sources.jar", "primary": false, "hashes": {}}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn parses_hash_to_version_map_with_project_id() {
+        let map: std::collections::HashMap<String, ModrinthVersion> =
+            serde_json::from_str(RESPONSE).unwrap();
+        let version = map
+            .get("a9993e364706816aba3e25717850c26c9cd0d4d")
+            .expect("hash key present");
+        assert_eq!(version.project_id, "AANobbMI");
+        assert_eq!(version.id, "Rvx75lGq");
+        assert_eq!(version.version_number, "0.5.8");
+    }
+
+    #[test]
+    fn summary_prefers_the_primary_file_for_matching() {
+        let map: std::collections::HashMap<String, ModrinthVersion> =
+            serde_json::from_str(RESPONSE).unwrap();
+        let version = map.values().next().unwrap();
+        // The -sources.jar must not win: installs place the primary file.
+        assert_eq!(
+            map_version_summary(version).file_name.as_deref(),
+            Some("sodium-0.5.8.jar")
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::{is_stable_channel, pick_newest_stable, ModrinthVersion};
+
+    fn version(id: &str, version_type: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: id.to_string(),
+            name: String::new(),
+            version_number: String::new(),
+            date_published: "2026-01-01T00:00:00Z".to_string(),
+            changelog: None,
+            downloads: 0,
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            project_id: String::new(),
+            version_type: version_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn stable_wins_over_newer_prerelease_but_prerelease_still_resolves() {
+        // Newest-first input with a beta on top: the release still wins.
+        let versions = vec![version("beta", "beta"), version("release", "release")];
+        assert_eq!(pick_newest_stable(&versions).unwrap().id, "release");
+        // Beta-only project: resolves rather than erroring.
+        let versions = vec![version("beta", "beta")];
+        assert_eq!(pick_newest_stable(&versions).unwrap().id, "beta");
+        assert!(pick_newest_stable(&[]).is_none());
+    }
+
+    #[test]
+    fn empty_channel_reads_as_stable() {
+        assert!(is_stable_channel(""));
+        assert!(is_stable_channel("release"));
+        assert!(!is_stable_channel("beta"));
+        assert!(!is_stable_channel("alpha"));
     }
 }

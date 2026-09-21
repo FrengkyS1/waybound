@@ -5,10 +5,10 @@ use crate::dto::instance::{
 use crate::dto::{ContentType, ModSource, ModSummary};
 use crate::download::safe_join;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::search::AppState;
-use crate::instances::{InstanceError, InstanceService};
+use crate::instances::{operations::acquire, InstanceError, InstanceService};
 use crate::modpack::{pending_missing_mods, remove_pack_manifest_entry};
 
 /// Emitted while a modpack downloads its files, so the frontend can show
@@ -79,6 +79,7 @@ pub fn list_pending_missing_mods(state: State<'_, AppState>) -> Result<Vec<Pendi
 /// mod would nag on every restart forever without this.
 #[tauri::command]
 pub fn dismiss_missing_mod(instance_id: String, project_id: u32) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     let root = crate::instances::paths::instance_root(&instance_id).map_err(|e| e.to_string())?;
     remove_pack_manifest_entry(&root, project_id);
     Ok(())
@@ -109,6 +110,7 @@ pub fn rename_instance(
     instance_id: String,
     name: String,
 ) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     let name = name.trim();
     if name.len() < 2 {
         return Err("Instance name must be at least 2 characters.".to_string());
@@ -129,6 +131,20 @@ pub fn rename_instance(
     })
 }
 
+/// Cached loader-version index for an explicit loader + game version:
+/// latest + recommended builds with a daily TTL (see `loader_meta`), so
+/// version displays rarely touch the network and survive offline from
+/// yesterday's answers. Unlike `get_latest_loader_version` below this
+/// covers Fabric and Quilt too — not just Forge/NeoForge.
+#[tauri::command]
+pub async fn get_loader_version_info(
+    state: State<'_, AppState>,
+    loader: crate::dto::ModLoader,
+    mc_version: String,
+) -> Result<crate::loader_meta::LoaderVersionInfo, String> {
+    crate::loader_meta::get_loader_version_info(&state.db, loader, &mc_version).await
+}
+
 /// Looks up what the loader's own "recommended" build currently is for this
 /// instance's Minecraft version — the exact same lookup `resolve_version`
 /// falls back to at launch time when no build is pinned. `None` for
@@ -137,8 +153,7 @@ pub fn rename_instance(
 /// notion the way Forge/NeoForge's promotions do, and Quilt isn't a
 /// supported launch loader at all).
 #[tauri::command]
-pub async fn get_latest_loader_version(
-    state: State<'_, AppState>,
+pub async fn get_latest_loader_version(    state: State<'_, AppState>,
     instance_id: String,
 ) -> Result<Option<String>, String> {
     let instance = state
@@ -175,6 +190,7 @@ pub fn set_instance_loader_version(
     instance_id: String,
     loader_version: Option<String>,
 ) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     state
         .db
         .set_instance_loader_version(&instance_id, loader_version.as_deref())
@@ -187,6 +203,7 @@ pub fn set_instance_icon(
     instance_id: String,
     icon: Option<String>,
 ) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     state
         .db
         .set_instance_icon(&instance_id, icon.as_deref())
@@ -199,11 +216,13 @@ pub async fn duplicate_instance(
     state: State<'_, AppState>,
     instance_id: String,
 ) -> Result<InstanceSummary, String> {
+    let _operation = acquire(&instance_id)?;
     InstanceService::duplicate(&state.db, &instance_id).map_err(map_error)
 }
 
 #[tauri::command]
 pub fn delete_instance(state: State<'_, AppState>, instance_id: String) -> Result<DeleteResult, String> {
+    let _operation = acquire(&instance_id)?;
     InstanceService::delete(&state.db, &instance_id).map_err(map_error)?;
     Ok(DeleteResult { ok: true })
 }
@@ -258,6 +277,7 @@ pub async fn install_mod_to_instance(
     install_id: String,
 ) -> Result<InstallModResult, String> {
     let instance_id = resolve_install_target(&state, &input)?;
+    let _operation = acquire(&instance_id)?;
 
     let cancel = crate::download::CancelToken::new();
     state
@@ -309,6 +329,7 @@ pub async fn install_mod_to_instance(
         &input.mod_summary,
         input.source,
         input.version_id.as_deref(),
+        false,
         &cancel,
         &report,
     )
@@ -406,6 +427,28 @@ pub fn get_mod_summary_for_content(
     )
 }
 
+/// Identifies an on-disk jar by content hash (Modrinth `version_files`, then
+/// CurseForge fingerprints) — the fallback for files with no DB tracking
+/// row (modpack drops, manual adds, renames), which
+/// `get_mod_summary_for_content` rejects. Returns a real project summary
+/// plus the exact matched version, so the frontend can offer the same
+/// versions/update flow.
+#[tauri::command]
+pub async fn identify_mod_file(
+    state: State<'_, AppState>,
+    instance_id: String,
+    file_name: String,
+) -> Result<crate::identify::IdentifiedMod, String> {
+    crate::identify::identify_mod_file(
+        &state.modrinth,
+        &state.curseforge,
+        &state.config,
+        &instance_id,
+        &file_name,
+    )
+    .await
+}
+
 /// Re-resolves a Content-tab mod against its own project and installs
 /// whatever the instance's Minecraft version + loader currently resolve to
 /// — the same thing Browse's install button does, just re-triggered for a
@@ -420,7 +463,9 @@ pub async fn update_mod_in_instance(
     instance_id: String,
     file_name: String,
     install_id: String,
+    version_id: Option<String>,
 ) -> Result<InstallModResult, String> {
+    let _operation = acquire(&instance_id)?;
     let existing = state.db.list_instance_mods(&instance_id).map_err(|e| e.to_string())?;
     let row = existing
         .into_iter()
@@ -433,12 +478,6 @@ pub async fn update_mod_in_instance(
     )?;
     let preferred_source = summary.sources[0];
 
-    // Only the DB row is dropped here, not the file — `install_mod` refuses
-    // to touch a project it already sees tracked (`AlreadyInstalled`), so
-    // this is what lets it re-resolve the same project at all. Restored
-    // below if the update fails for any reason, so a flaky network call
-    // never costs the user a working mod.
-    let _ = state.db.delete_instance_mod(&instance_id, &row.mod_uid);
 
     let cancel = crate::download::CancelToken::new();
     state
@@ -483,54 +522,33 @@ pub async fn update_mod_in_instance(
         &instance_id,
         &summary,
         Some(preferred_source),
-        None,
+        version_id.as_deref(),
+        true,
         &cancel,
         &report,
     )
     .await;
 
-    match install_result {
-        Ok(mut result) => {
-            // A version bump almost always means a different filename — the
-            // old one is now dead weight. (The rare case where the resolved
-            // file happens to share the exact same name is left alone here
-            // rather than deleted-then-rewritten, since `install_mod` will
-            // already have overwritten it in place.)
-            if result.installed.as_ref().map(|m| m.file_name.as_str()) != Some(file_name.as_str()) {
-                if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
-                    if let Ok(old_path) = safe_join(&root.join("mods"), &file_name) {
-                        let _ = std::fs::remove_file(old_path);
-                    }
+    let mut result = install_result.map_err(map_error)?;
+    if result.installed.is_some() {
+        let _ = state.db.delete_content_meta_cache(&instance_id, "mod", &file_name);
+    }
+    if result.installed.is_some() {
+        // The replacement is verified on disk and tracked; only now is the
+        // superseded file deleted. Same filename means install_mod overwrote
+        // it in place, so there is nothing to remove.
+        if result.installed.as_ref().map(|m| m.file_name.as_str()) != Some(file_name.as_str()) {
+            if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
+                if let Ok(old_path) = safe_join(&root.join("mods"), &file_name) {
+                    let _ = std::fs::remove_file(old_path);
                 }
             }
-            let _ = state.db.delete_content_meta_cache(&instance_id, "mod", &file_name);
-            result.instance = state
-                .db
-                .get_instance(&instance_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Instance not found after update.".to_string())?;
-            Ok(result)
-        }
-        Err(err) => {
-            // The update attempt failed and the old file is still on disk,
-            // untouched — restore its tracking row exactly as it was so it
-            // isn't left orphaned (invisible to "already installed" checks,
-            // no icon/version history) just because an update was attempted.
-            if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
-                let file_path = root.join("mods").join(&row.file_name).display().to_string();
-                let _ = state.db.insert_instance_mod(
-                    &instance_id,
-                    &row.mod_uid,
-                    &row.mod_name,
-                    row.source,
-                    &row.file_name,
-                    &file_path,
-                    row.icon_url.as_deref(),
-                );
-            }
-            Err(map_error(err))
         }
     }
+    result.instance = state.db.get_instance(&instance_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Instance not found after update.".to_string())?;
+    Ok(result)
 }
 
 /// Signals the in-flight install (if any) to stop at its next chunk/file
@@ -545,24 +563,88 @@ pub fn cancel_install(state: State<'_, AppState>, install_id: String) -> Result<
 }
 
 #[tauri::command]
+pub fn pause_install(state: State<'_, AppState>, install_id: String) -> Result<(), String> {
+    if let Some(token) = state.installs.lock().map_err(|e| e.to_string())?.get(&install_id) {
+        token.pause();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_install(state: State<'_, AppState>, install_id: String) -> Result<(), String> {
+    if let Some(token) = state.installs.lock().map_err(|e| e.to_string())?.get(&install_id) {
+        token.resume();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn remove_mod_from_instance(
     state: State<'_, AppState>,
     instance_id: String,
     mod_uid: String,
 ) -> Result<DeleteResult, String> {
+    let _operation = acquire(&instance_id)?;
     InstanceService::remove_mod(&state.db, &instance_id, &mod_uid).map_err(map_error)?;
     Ok(DeleteResult { ok: true })
 }
 
+const VERSION_CACHE_KEY: &str = "durable:game-versions";
+const VERSION_REFRESH_SECS: u64 = 24 * 60 * 60;
+static VERSION_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn refresh_minecraft_versions(state: &AppState) -> Result<Vec<GameVersionOption>, String> {
+    let versions = tokio::time::timeout(
+        std::time::Duration::from_secs(5), state.modrinth.list_game_versions(),
+    ).await.map_err(|_| "Minecraft version lookup timed out.".to_string())?
+        .map_err(|e| e.to_string())?;
+    if versions.is_empty() { return Err("Minecraft version list was empty.".to_string()); }
+    if let Ok(json) = serde_json::to_string(&versions) {
+        let _ = state.db.put_cached_json(VERSION_CACHE_KEY, &json);
+    }
+    Ok(versions)
+}
+
+fn refresh_versions_in_background(app: AppHandle) {
+    use std::sync::atomic::Ordering;
+    if VERSION_REFRESHING.swap(true, Ordering::SeqCst) { return; }
+    tauri::async_runtime::spawn(async move {
+        struct RefreshGuard;
+        impl Drop for RefreshGuard {
+            fn drop(&mut self) { VERSION_REFRESHING.store(false, Ordering::SeqCst); }
+        }
+        let _guard = RefreshGuard;
+        let state = app.state::<AppState>();
+        let _ = refresh_minecraft_versions(&state).await;
+    });
+}
+
 #[tauri::command]
 pub async fn list_minecraft_versions(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<GameVersionOption>, String> {
-    state
-        .modrinth
-        .list_game_versions()
-        .await
-        .map_err(|err| err.to_string())
+    if let Ok(Some((json, fetched))) = state.db.get_cached_json(VERSION_CACHE_KEY) {
+        if let Ok(versions) = serde_json::from_str::<Vec<GameVersionOption>>(&json) {
+            if !versions.is_empty() {
+                if crate::db::now_unix().saturating_sub(fetched) >= VERSION_REFRESH_SECS {
+                    refresh_versions_in_background(app);
+                }
+                return Ok(versions);
+            }
+        }
+    }
+    let mut known = std::collections::BTreeSet::new();
+    for instance in state.db.list_instances().map_err(|e| e.to_string())? {
+        if !instance.minecraft_version.is_empty() { known.insert(instance.minecraft_version); }
+    }
+    if !known.is_empty() {
+        refresh_versions_in_background(app);
+        return Ok(known.into_iter().rev().map(|version| GameVersionOption {
+            version, version_type: "local".to_string(),
+        }).collect());
+    }
+    refresh_minecraft_versions(&state).await
 }
 
 fn resolve_install_target(

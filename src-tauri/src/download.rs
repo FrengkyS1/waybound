@@ -13,23 +13,48 @@ const USER_AGENT: &str = "Waybound/0.1.0 (personal mod manager; contact: local)"
 /// re-guessed magic number per call site.
 pub const DOWNLOAD_CONCURRENCY: usize = 8;
 
-/// A cheap, cloneable flag checked between download chunks so an in-flight
-/// install can be interrupted from a Tauri command (`cancel_install`)
-/// without needing to abort the whole async task from outside.
+/// Shared cancellation and pause control checked at download boundaries.
 #[derive(Debug, Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<DownloadControl>);
+
+#[derive(Debug, Default)]
+struct DownloadControl {
+    cancelled: AtomicBool,
+    paused: AtomicBool,
+    changed: tokio::sync::Notify,
+}
 
 impl CancelToken {
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
+    pub fn new() -> Self { Self::default() }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+
+    pub fn pause(&self) {
+        self.0.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.0.paused.store(false, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub async fn checkpoint(&self) -> Result<(), DownloadError> {
+        loop {
+            // Register before checking flags so resume/cancel cannot be lost.
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() { return Err(DownloadError::Cancelled); }
+            if !self.0.paused.load(Ordering::SeqCst) { return Ok(()); }
+            notified.await;
+        }
     }
 }
 
@@ -47,6 +72,8 @@ pub enum DownloadError {
     Cancelled,
     #[error("response exceeded the {0}-byte limit")]
     TooLarge(usize),
+    #[error("download hash mismatch ({0})")]
+    HashMismatch(String),
 }
 
 /// Joins `relative` onto `base`, rejecting anything that could escape
@@ -78,56 +105,46 @@ pub fn http_client() -> Result<Client, DownloadError> {
         .build()?)
 }
 
-pub async fn download_to_file(
-    client: &Client,
-    url: &str,
-    dest: &Path,
-    cancel: &CancelToken,
-) -> Result<(), DownloadError> {
-    let bytes = download_bytes(client, url, cancel).await?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(dest, bytes)?;
-    Ok(())
-}
 
 pub async fn download_bytes(
     client: &Client,
     url: &str,
     cancel: &CancelToken,
 ) -> Result<Vec<u8>, DownloadError> {
-    if cancel.is_cancelled() {
-        return Err(DownloadError::Cancelled);
-    }
+    cancel.checkpoint().await?;
     let response = client.get(url).send().await?;
     if !response.status().is_success() {
         return Err(DownloadError::Status(response.status().as_u16()));
     }
     let mut buf = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(DownloadError::Cancelled);
-        }
+    loop {
+        cancel.checkpoint().await?;
+        let Some(chunk) = stream.next().await else { break };
+        cancel.checkpoint().await?;
         buf.extend_from_slice(&chunk?);
     }
     Ok(buf)
 }
 
-/// Like `download_bytes`, but retries once after a short pause on a 401/403 —
-/// CurseForge's CDN (edge.forgecdn.net via CloudFront) intermittently returns
-/// one of these for a freshly-resolved, genuinely valid URL, then serves the
-/// same URL fine moments later. A 401/403 there is a transient edge/cache
-/// blip, not proof the URL is bad, so retrying beats surfacing an error that
-/// tells the user to do the exact same retry themselves.
+/// Like `download_bytes`, but retries once after a short pause on transient
+/// failures — CurseForge's CDN (edge.forgecdn.net via CloudFront)
+/// intermittently returns a 401/403 for a freshly-resolved, genuinely valid
+/// URL, then serves the same URL fine moments later; and any host can drop
+/// a connection or 5xx mid-pack. A retry beats surfacing an error that tells
+/// the user to do the exact same retry themselves. Non-transient statuses
+/// (e.g. 404) and cancellations never retry.
 pub async fn download_bytes_with_retry(
     client: &Client,
     url: &str,
     cancel: &CancelToken,
 ) -> Result<Vec<u8>, DownloadError> {
     match download_bytes(client, url, cancel).await {
-        Err(DownloadError::Status(401 | 403)) if !cancel.is_cancelled() => {
+        Err(DownloadError::Status(401 | 403 | 429 | 500 | 502 | 503 | 504)) if !cancel.is_cancelled() => {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            download_bytes(client, url, cancel).await
+        }
+        Err(DownloadError::Network(_)) if !cancel.is_cancelled() => {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             download_bytes(client, url, cancel).await
         }
@@ -146,19 +163,17 @@ pub async fn download_bytes_capped(
     cancel: &CancelToken,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DownloadError> {
-    if cancel.is_cancelled() {
-        return Err(DownloadError::Cancelled);
-    }
+    cancel.checkpoint().await?;
     let response = client.get(url).send().await?;
     if !response.status().is_success() {
         return Err(DownloadError::Status(response.status().as_u16()));
     }
     let mut buf = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(DownloadError::Cancelled);
-        }
+    loop {
+        cancel.checkpoint().await?;
+        let Some(chunk) = stream.next().await else { break };
+        cancel.checkpoint().await?;
         let chunk = chunk?;
         if buf.len() + chunk.len() > max_bytes {
             return Err(DownloadError::TooLarge(max_bytes));
@@ -166,6 +181,56 @@ pub async fn download_bytes_capped(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+pub fn verify_hashes(bytes: &[u8], hashes: &std::collections::HashMap<String, String>) -> Result<(), DownloadError> {
+    use sha1::Digest;
+    for (algorithm, expected) in hashes {
+        let actual = match algorithm.as_str() {
+            "sha1" => hex::encode(sha1::Sha1::digest(bytes)),
+            "sha256" => hex::encode(sha2::Sha256::digest(bytes)),
+            "sha512" => hex::encode(sha2::Sha512::digest(bytes)),
+            _ => continue,
+        };
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(DownloadError::HashMismatch(algorithm.clone()));
+        }
+    }
+    Ok(())
+}
+
+pub async fn download_to_file_verified(
+    client: &Client, url: &str, dest: &Path, cancel: &CancelToken,
+    hashes: &std::collections::HashMap<String, String>,
+) -> Result<(), DownloadError> {
+    let bytes = download_bytes(client, url, cancel).await?;
+    verify_hashes(&bytes, hashes)?;
+    cancel.checkpoint().await?;
+    atomic_write(dest, &bytes)
+}
+
+/// Prepare a complete sibling file before replacing the destination.
+pub fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<(), DownloadError> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = dest.parent().ok_or_else(|| DownloadError::UnsafePath(dest.display().to_string()))?;
+    std::fs::create_dir_all(parent)?;
+    let (temp, mut file) = loop {
+        let temp = parent.join(format!(".waybound-download-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    };
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, dest)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result.map_err(DownloadError::Io)
 }
 
 #[cfg(test)]

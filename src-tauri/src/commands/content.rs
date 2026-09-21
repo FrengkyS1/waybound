@@ -10,11 +10,16 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 
 use crate::download::safe_join;
-use crate::dto::instance::{ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent};
+use crate::dto::instance::{
+    ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent, LaunchReadiness, MissingDep,
+    WrongLoaderFile,
+};
+use crate::dto::ModLoader;
 use crate::instances::paths::instance_root;
 use tauri::State;
 
 use super::search::AppState;
+use crate::instances::operations::acquire;
 
 pub(crate) const DISABLED_SUFFIX: &str = ".disabled";
 
@@ -27,6 +32,42 @@ struct ModMeta {
     name: Option<String>,
     icon: Option<String>,
     mod_id: Option<String>,
+    launch: ModLaunchMeta,
+}
+
+/// Loader/Minecraft-version/dependency signals from the same jar metadata —
+/// what the pre-launch readiness check uses to catch "NeoForge jar on a
+/// Forge instance" and missing required deps before the game dies on them.
+/// Raw range strings are kept as-is (never evaluated here — the loader
+/// itself is the authority at runtime); only presence and loader family
+/// are judged.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ModLaunchMeta {
+    /// "fabric" | "forge" | "neoforge" | "quilt", from whichever metadata
+    /// file identified the mod first.
+    pub loader: Option<String>,
+    /// Raw Minecraft version ranges (fabric `depends.minecraft`,
+    /// toml `[[dependencies.minecraft]]`), for display only.
+    pub mc_versions: Vec<String>,
+    /// Required dependencies (mod id + raw range), loader/game pseudo-deps
+    /// already filtered out.
+    pub dependencies: Vec<ModDependency>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModDependency {
+    pub mod_id: String,
+    pub version_range: Option<String>,
+}
+
+/// Entries that appear in dependency maps but are never installable mods:
+/// the game itself, the loader, and the language runtimes.
+fn is_pseudo_dependency(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().as_str(),
+        "minecraft" | "forge" | "neoforge" | "fabric" | "fabricloader" | "quilt" | "quilt_loader"
+            | "java"
+    )
 }
 
 /// Reads name + icon + modId from a jar's Fabric/Quilt, Forge/NeoForge, or
@@ -34,7 +75,7 @@ struct ModMeta {
 /// lookups instead of the two separate full re-parses this used to do per
 /// mod.
 fn read_mod_metadata(jar_path: &Path) -> ModMeta {
-    let mut meta = ModMeta { name: None, icon: None, mod_id: None };
+    let mut meta = ModMeta { name: None, icon: None, mod_id: None, launch: ModLaunchMeta::default() };
     let Ok(file) = fs::File::open(jar_path) else {
         return meta;
     };
@@ -47,6 +88,25 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
             meta.name = non_empty(value.get("name").and_then(|v| v.as_str()));
             meta.mod_id = non_empty(value.get("id").and_then(|v| v.as_str()));
+            if meta.launch.loader.is_none() {
+                meta.launch.loader = Some("fabric".to_string());
+            }
+            // `depends` maps mod id -> range ("*" included). Only required
+            // deps live here (breaks/conflicts are separate keys).
+            if let Some(depends) = value.get("depends").and_then(|v| v.as_object()) {
+                for (id, range) in depends {
+                    if id == "minecraft" {
+                        if let Some(r) = range.as_str() {
+                            meta.launch.mc_versions.push(r.to_string());
+                        }
+                    } else if !is_pseudo_dependency(id) {
+                        meta.launch.dependencies.push(ModDependency {
+                            mod_id: id.clone(),
+                            version_range: range.as_str().map(str::to_string),
+                        });
+                    }
+                }
+            }
             let icon_path = match value.get("icon") {
                 Some(serde_json::Value::String(path)) => non_empty(Some(path)),
                 Some(serde_json::Value::Object(sizes)) => sizes
@@ -58,6 +118,49 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
             };
             if let Some(path) = icon_path {
                 meta.icon = read_zip_image_entry(&mut archive, &path);
+            }
+        }
+    }
+
+    // Quilt (`quilt.mod.json`, schema 1): loader + `quilt_loader.depends`
+    // entries of {id, versions} where versions is a string or an array.
+    if meta.launch.loader.is_none() {
+        if let Some(contents) = read_zip_entry(&mut archive, "quilt.mod.json") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                let loader_obj = value.get("quilt_loader");
+                let has_loader_obj = loader_obj.is_some();
+                if has_loader_obj {
+                    meta.launch.loader = Some("quilt".to_string());
+                }
+                if let Some(depends) = loader_obj.and_then(|l| l.get("depends")).and_then(|v| v.as_array()) {
+                    for dep in depends {
+                        let Some(id) = dep.get("id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let range = match dep.get("versions") {
+                            Some(serde_json::Value::String(r)) => Some(r.clone()),
+                            Some(serde_json::Value::Array(arr)) => {
+                                let joined = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                if joined.is_empty() { None } else { Some(joined) }
+                            }
+                            _ => None,
+                        };
+                        if id == "minecraft" {
+                            if let Some(r) = range {
+                                meta.launch.mc_versions.push(r);
+                            }
+                        } else if !is_pseudo_dependency(id) {
+                            meta.launch.dependencies.push(ModDependency {
+                                mod_id: id.to_string(),
+                                version_range: range,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -91,6 +194,51 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
                 meta.mod_id =
                     non_empty(first_mod.and_then(|m| m.get("modId")).and_then(|v| v.as_str()));
             }
+            // `[[dependencies.<modid>]]` entries carry the required-dep
+            // graph the loader enforces at runtime. Only `mandatory` ones
+            // (the default) count — optional deps missing is not a problem.
+            if meta.launch.loader.is_none() {
+                meta.launch.loader = Some(if entry_name.contains("neoforge") {
+                    "neoforge"
+                } else {
+                    "forge"
+                }.to_string());
+            }
+            if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
+                for (key, entries) in deps {
+                    let Some(list) = entries.as_array() else {
+                        continue;
+                    };
+                    for entry in list {
+                        let dep_id = entry
+                            .get("modId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(key.as_str());
+                        let mandatory = entry
+                            .get("mandatory")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if dep_id == "minecraft" {
+                            if let Some(r) = entry.get("versionRange").and_then(|v| v.as_str()) {
+                                if !meta.launch.mc_versions.iter().any(|v| v == r) {
+                                    meta.launch.mc_versions.push(r.to_string());
+                                }
+                            }
+                        } else if mandatory && !is_pseudo_dependency(dep_id) {
+                            let range = entry
+                                .get("versionRange")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            if !meta.launch.dependencies.iter().any(|d| d.mod_id == dep_id) {
+                                meta.launch.dependencies.push(ModDependency {
+                                    mod_id: dep_id.to_string(),
+                                    version_range: range,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             if meta.icon.is_none() {
                 // `logoFile` is documented as a top-level key (applies to
                 // the whole file), but some mods — notably ones generated by
@@ -122,6 +270,9 @@ fn read_mod_metadata(jar_path: &Path) -> ModMeta {
                     value.get("modList").and_then(|v| v.as_array()).and_then(|arr| arr.first())
                 });
                 meta.name = non_empty(first.and_then(|m| m.get("name")).and_then(|v| v.as_str()));
+                if meta.name.is_some() && meta.launch.loader.is_none() {
+                    meta.launch.loader = Some("forge".to_string());
+                }
             }
         }
     }
@@ -548,9 +699,114 @@ fn resolve_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
     None
 }
 
+/// One enabled jar's launch-relevant metadata for readiness assessment.
+pub(crate) struct FileLaunchMeta {
+    pub file_name: String,
+    pub mod_name: Option<String>,
+    pub mod_id: Option<String>,
+    pub launch: ModLaunchMeta,
+}
+
+/// Judges parsed jar metadata against the instance's loader: loader-family
+/// mismatches plus required dependency ids no installed jar provides.
+/// Pure (no I/O) so the rules are unit-testable without instance fixtures.
+pub(crate) fn assess_readiness(
+    instance_loader: ModLoader,
+    files: &[FileLaunchMeta],
+) -> LaunchReadiness {
+    let instance_loader_str = match instance_loader {
+        ModLoader::Fabric => "fabric",
+        ModLoader::Forge => "forge",
+        ModLoader::NeoForge => "neoforge",
+        ModLoader::Quilt => "quilt",
+        ModLoader::Vanilla => "vanilla",
+    };
+    let installed_ids: std::collections::HashSet<String> = files
+        .iter()
+        .filter_map(|f| f.mod_id.as_deref().map(|id| id.to_ascii_lowercase()))
+        .collect();
+    let mut wrong_loader = Vec::new();
+    let mut missing_deps = Vec::new();
+    for file in files {
+        if let Some(detected) = file.launch.loader.as_deref() {
+            if detected != instance_loader_str {
+                wrong_loader.push(WrongLoaderFile {
+                    file_name: file.file_name.clone(),
+                    mod_name: file.mod_name.clone(),
+                    detected_loader: detected.to_string(),
+                });
+            }
+        }
+        for dep in &file.launch.dependencies {
+            if !installed_ids.contains(&dep.mod_id.to_ascii_lowercase()) {
+                missing_deps.push(MissingDep {
+                    file_name: file.file_name.clone(),
+                    mod_name: file.mod_name.clone(),
+                    dep_mod_id: dep.mod_id.clone(),
+                    version_range: dep.version_range.clone(),
+                });
+            }
+        }
+    }
+    LaunchReadiness {
+        checked_files: files.len() as u32,
+        wrong_loader,
+        missing_deps,
+    }
+}
+
+/// Pre-launch readiness check: reads every ENABLED jar's own metadata and
+/// reports loader-family mismatches plus required deps no installed jar
+/// provides. Disabled (`.disabled`) files don't load, so they're skipped.
+/// Advisory only — empty lists are not a guarantee the game will start.
+#[tauri::command]
+pub async fn check_launch_readiness(
+    state: State<'_, AppState>,
+    instance_id: String,
+) -> Result<LaunchReadiness, String> {
+    let instance = state
+        .db
+        .get_instance(&instance_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Instance not found.".to_string())?;
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let files = tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root.join("mods")) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Same `.jar`-only convention as the mod counter: `.disabled`
+            // files don't load, so they can't break (or fix) a launch.
+            if !name.ends_with(".jar") {
+                continue;
+            }
+            let meta = read_mod_metadata(&path);
+            out.push(FileLaunchMeta {
+                file_name: name,
+                mod_name: meta.name,
+                mod_id: meta.mod_id,
+                launch: meta.launch,
+            });
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(assess_readiness(instance.loader, &files))
+}
+
 /// Resolves one file's display name + icon by opening just that jar/zip —
-/// the frontend calls this per row as it scrolls into view, instead of the
-/// whole instance paying for every file's metadata up front.
+// the frontend calls this per row as it scrolls into view, instead of the
+// whole instance paying for every file's metadata up front.
 #[tauri::command]
 pub async fn get_content_meta(
     state: State<'_, AppState>,
@@ -647,6 +903,7 @@ pub fn set_content_enabled(
     file_name: String,
     enabled: bool,
 ) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
     let dir = root.join(category_dir(&category)?);
     let current = resolve_file(&dir, &file_name)
@@ -674,6 +931,7 @@ pub fn remove_content_file(
     let dir = root.join(category_dir(&category)?);
     let file = resolve_file(&dir, &file_name)
         .ok_or_else(|| format!("'{file_name}' was not found in this instance."))?;
+    let _operation = acquire(&instance_id)?;
 
     if file.is_dir() {
         fs::remove_dir_all(&file).map_err(|e| e.to_string())?;
@@ -770,6 +1028,7 @@ pub fn write_config_file(
     relative_path: String,
     contents: String,
 ) -> Result<(), String> {
+    let _operation = acquire(&instance_id)?;
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
     let path = safe_join(&root.join("config"), &relative_path).map_err(|e| e.to_string())?;
     fs::write(&path, contents).map_err(|e| e.to_string())
@@ -1028,5 +1287,150 @@ mod config_matching_tests {
         assert!(is_text_config_file("enigmaticlegacy-client.omniconf"));
         assert!(!is_text_config_file("icon.png"));
         assert!(!is_text_config_file("resourcepack.zip"));
+    }
+}
+
+#[cfg(test)]
+mod launch_meta_tests {
+    use super::{assess_readiness, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
+    use crate::dto::ModLoader;
+    use std::io::Write;
+
+    fn jar_with(entries: &[(&str, &str)]) -> std::path::PathBuf {
+        // Unique filename per call — tests run in parallel threads and
+        // would otherwise all stomp the same fixture jar mid-write.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join("waybound-launch-meta-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("mod-{id}.jar"));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    const FABRIC_JSON: &str = r#"{
+        "schemaVersion": 1, "id": "sodium", "name": "Sodium",
+        "depends": {"minecraft": ">=1.20", "fabricloader": ">=0.15", "fabric-api": "*", "java": ">=17"}
+    }"#;
+
+    const NEOFORGE_TOML: &str = r#"
+        [[mods]]
+        modId = "formations"
+        version = "1.0.4"
+        displayName = "Formations"
+        [[dependencies.formations]]
+        modId = "neoforge"
+        versionRange = "[21.0.113-beta,)"
+        mandatory = true
+        [[dependencies.formations]]
+        modId = "minecraft"
+        versionRange = "[1.21,1.22)"
+        mandatory = true
+        [[dependencies.formations]]
+        modId = "somelib"
+        versionRange = "[2.0,)"
+        mandatory = true
+        [[dependencies.formations]]
+        modId = "optionalthing"
+        versionRange = "[1.0,)"
+        mandatory = false
+    "#;
+
+    const QUILT_JSON: &str = r#"{
+        "schema_version": 1,
+        "quilt_loader": {
+            "id": "qmod", "version": "1.0",
+            "depends": [
+                {"id": "minecraft", "versions": ">=1.20"},
+                {"id": "quilt_loader", "versions": ">=0.20"},
+                {"id": "qsl", "versions": "*"}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn fabric_jar_reports_loader_mc_and_required_deps() {
+        let meta = read_mod_metadata(&jar_with(&[("fabric.mod.json", FABRIC_JSON)]));
+        assert_eq!(meta.launch.loader.as_deref(), Some("fabric"));
+        assert_eq!(meta.launch.mc_versions, vec![">=1.20"]);
+        // fabricloader/java are runtime, not mods; fabric-api is a real dep.
+        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        assert_eq!(ids, vec!["fabric-api"]);
+    }
+
+    #[test]
+    fn neoforge_toml_reports_loader_and_mandatory_deps_only() {
+        let meta = read_mod_metadata(&jar_with(&[("META-INF/neoforge.mods.toml", NEOFORGE_TOML)]));
+        assert_eq!(meta.launch.loader.as_deref(), Some("neoforge"));
+        assert_eq!(meta.launch.mc_versions, vec!["[1.21,1.22)"]);
+        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        // neoforge itself is pseudo; the optional dep is dropped.
+        assert_eq!(ids, vec!["somelib"]);
+    }
+
+    #[test]
+    fn quilt_jar_reports_quilt_loader() {
+        let meta = read_mod_metadata(&jar_with(&[("quilt.mod.json", QUILT_JSON)]));
+        assert_eq!(meta.launch.loader.as_deref(), Some("quilt"));
+        let ids: Vec<&str> = meta.launch.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
+        assert_eq!(ids, vec!["qsl"]);
+    }
+
+    fn file(name: &str, mod_id: Option<&str>, launch: ModLaunchMeta) -> FileLaunchMeta {
+        FileLaunchMeta {
+            file_name: name.to_string(),
+            mod_name: None,
+            mod_id: mod_id.map(str::to_string),
+            launch,
+        }
+    }
+
+    fn launch_with(loader: &str, deps: &[&str]) -> ModLaunchMeta {
+        ModLaunchMeta {
+            loader: Some(loader.to_string()),
+            mc_versions: Vec::new(),
+            dependencies: deps
+                .iter()
+                .map(|d| super::ModDependency { mod_id: d.to_string(), version_range: None })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn neoforge_jar_on_forge_instance_is_flagged() {
+        let files = vec![file("formations.jar", Some("formations"), launch_with("neoforge", &[]))];
+        let report = assess_readiness(ModLoader::Forge, &files);
+        assert_eq!(report.checked_files, 1);
+        assert_eq!(report.wrong_loader.len(), 1);
+        assert_eq!(report.wrong_loader[0].detected_loader, "neoforge");
+        assert!(report.missing_deps.is_empty());
+    }
+
+    #[test]
+    fn matching_loader_and_satisfied_dep_is_clean() {
+        let files = vec![
+            file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"])),
+            file("b.jar", Some("somelib"), launch_with("neoforge", &[])),
+        ];
+        let report = assess_readiness(ModLoader::NeoForge, &files);
+        assert!(report.wrong_loader.is_empty());
+        assert!(report.missing_deps.is_empty());
+    }
+
+    #[test]
+    fn missing_dep_names_the_requiring_file() {
+        let files = vec![file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"]))];
+        let report = assess_readiness(ModLoader::NeoForge, &files);
+        assert_eq!(report.missing_deps.len(), 1);
+        assert_eq!(report.missing_deps[0].dep_mod_id, "somelib");
+        assert_eq!(report.missing_deps[0].file_name, "a.jar");
     }
 }

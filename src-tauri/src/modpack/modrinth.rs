@@ -1,11 +1,13 @@
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
 use futures::stream::StreamExt;
 use serde::Deserialize;
 
 use super::{ModpackError, ModpackImportResult};
-use crate::download::{download_bytes, http_client, safe_join, CancelToken, DOWNLOAD_CONCURRENCY};
+use super::transaction::{validate_pack_path, PackTransaction};
+use crate::download::{download_bytes_with_retry, http_client, safe_join, verify_hashes, CancelToken, DOWNLOAD_CONCURRENCY};
 use crate::sources::modrinth::ModrinthClient;
 
 #[derive(Debug, Deserialize)]
@@ -15,28 +17,25 @@ pub struct ModrinthPackIndex {
     #[serde(default, rename = "versionId")]
     pub version_id: String,
     pub files: Vec<ModrinthPackFile>,
+    /// `{"minecraft": "1.21.1", "neoforge": "21.1.172", ...}` — the only
+    /// loader signal an `.mrpack` carries. Same role as CurseForge's
+    /// `manifest.minecraft.modLoaders`; see `declared_loader_from_bytes`.
+    #[serde(default)]
+    pub dependencies: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModrinthPackFile {
     pub path: String,
     pub downloads: Vec<String>,
     #[serde(default)]
     pub env: Option<ModrinthPackEnv>,
     #[serde(default)]
-    pub hashes: Option<ModrinthPackFileHashes>,
+    pub hashes: Option<HashMap<String, String>>,
 }
 
-/// The `.mrpack` index carries a content hash per file but no project id or
-/// icon — unlike CurseForge's manifest, which lists `projectID` directly.
-/// `sha1` is what lets an installed file be matched back to its Modrinth
-/// project afterward, for an icon.
-#[derive(Debug, Deserialize)]
-pub struct ModrinthPackFileHashes {
-    pub sha1: String,
-}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModrinthPackEnv {
     #[serde(default)]
     pub client: String,
@@ -54,135 +53,90 @@ pub async fn import_modrinth_mrpack_bytes(
     let index = read_index_from_mrpack(bytes)?;
     let client = http_client()?;
     let client = &client;
-
-    // Fully-owned job per file (url + resolved dest + content hash, when the
-    // index carries one) so downloads can run concurrently instead of
-    // one-at-a-time — a pack with hundreds of files downloading sequentially
-    // could take minutes; buffer_unordered caps concurrency the same way the
-    // launch pipeline's asset/library downloads already do.
-    let jobs: Vec<(String, PathBuf, Option<String>)> = index
-        .files
-        .iter()
-        .filter(|f| !should_skip_file(f))
-        .filter_map(|file| {
-            let url = file.downloads.first()?.clone();
-            let sha1 = file.hashes.as_ref().map(|h| h.sha1.clone());
-            Some((url, file.path.clone(), sha1))
-        })
-        .map(|(url, path, sha1)| Ok::<_, ModpackError>((url, safe_join(instance_root, &path)?, sha1)))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let total = jobs.len() as u32;
-    let mut files_installed = 0u32;
-    // Every successfully-downloaded file's destination + hash — the hash is
-    // what lets a follow-up call resolve this exact file back to its
-    // Modrinth project, and hence its icon, since the mrpack index itself
-    // never carries a project id or icon (unlike CurseForge's manifest).
-    let mut downloaded: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(jobs.len());
-    report(0, total, "");
-
-    let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, dest, sha1)| async move {
-        if cancel.is_cancelled() {
-            return (dest, sha1, Err(ModpackError::from(crate::download::DownloadError::Cancelled)));
-        }
-        let result: Result<(), ModpackError> = async {
-            let data = download_bytes(client, &url, cancel).await?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, data)?;
-            Ok(())
-        }
-        .await;
-        (dest, sha1, result)
-    }))
-    .buffer_unordered(DOWNLOAD_CONCURRENCY);
-
-    // A dead mirror or one deleted file shouldn't fail the whole import when
-    // the other ~100 files installed fine — CurseForge's importer already
-    // tolerates per-file failures this way (`skipped_files`); this brings
-    // the Modrinth importer up to the same standard instead of aborting the
-    // entire pack on the first bad download.
-    let mut failed_files: Vec<String> = Vec::new();
-
-    while let Some((dest, sha1, result)) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(ModpackError::from(crate::download::DownloadError::Cancelled));
-        }
-        match result {
-            Ok(()) => {
-                files_installed += 1;
-                let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                report(files_installed, total, name);
-                downloaded.push((dest, sha1));
-            }
-            Err(_) => {
-                let name = dest
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown file")
-                    .to_string();
-                failed_files.push(name);
-            }
-        }
+    let mut transaction = PackTransaction::new(instance_root)?;
+    let mut jobs = Vec::new();
+    for file in index.files.iter().filter(|file| !should_skip_file(file)).cloned() {
+        validate_pack_path(&file.path)?;
+        safe_join(instance_root, &file.path)?;
+        jobs.push(file);
     }
-
-    // One batched hash->project lookup for every downloaded file that had a
-    // hash, instead of a per-file API call — mirrors how the CurseForge
-    // importer batches its own lookup by project id.
-    let sha1_hashes: Vec<String> = downloaded.iter().filter_map(|(_, sha1)| sha1.clone()).collect();
+    let total = jobs.len() as u32;
+    report(0, total, "");
+    let mut stream = futures::stream::iter(jobs.into_iter().map(|file| async move {
+        cancel.checkpoint().await?;
+        // Every mirror in order: the first URL is usually the CDN, the rest
+        // author-provided fallbacks. A dead or corrupt mirror must not fail
+        // a file another mirror can serve — but a cancel stops everything.
+        for url in &file.downloads {
+            match download_bytes_with_retry(client, url, cancel).await {
+                Err(crate::download::DownloadError::Cancelled) => {
+                    return Err::<_, ModpackError>(
+                        crate::download::DownloadError::Cancelled.into(),
+                    );
+                }
+                Err(_) => continue,
+                Ok(data) => {
+                    if let Some(hashes) = &file.hashes {
+                        if verify_hashes(&data, hashes).is_err() {
+                            continue;
+                        }
+                    }
+                    return Ok((file, data));
+                }
+            }
+        }
+        Err(ModpackError::Other(format!(
+            "No download for {}; previous pack retained",
+            file.path
+        )))
+    })).buffer_unordered(DOWNLOAD_CONCURRENCY);
+    let mut downloaded = Vec::new();
+    while let Some(result) = stream.next().await {
+        let (file, data) = result?;
+        cancel.checkpoint().await?;
+        transaction.stage(&file.path, &data)?;
+        let path = file.path.clone();
+        downloaded.push(file);
+        report(downloaded.len() as u32, total, &path);
+    }
+    let sha1_hashes: Vec<String> = downloaded.iter().filter_map(|file| file.hashes.as_ref()?.get("sha1").cloned()).collect();
     let meta_by_hash = modrinth.project_meta_by_sha1(&sha1_hashes).await;
-    let mut icons: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut content_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut project_uids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (dest, sha1) in &downloaded {
-        let Some(meta) = sha1.as_ref().and_then(|h| meta_by_hash.get(h)) else {
-            continue;
-        };
-        let Some(filename) = dest.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
+    let mut icons = HashMap::new();
+    let mut content_names = HashMap::new();
+    let mut project_uids = HashMap::new();
+    for file in &downloaded {
+        let Some(meta) = file.hashes.as_ref().and_then(|hashes| hashes.get("sha1")).and_then(|hash| meta_by_hash.get(hash)) else { continue };
+        let Some(filename) = std::path::Path::new(&file.path).file_name().and_then(|name| name.to_str()) else { continue };
         content_names.insert(filename.to_string(), meta.name.clone());
         project_uids.insert(filename.to_string(), format!("modrinth:{}", meta.project_id));
-        if let Some(icon) = &meta.icon {
-            icons.insert(filename.to_string(), icon.clone());
+        if let Some(icon) = &meta.icon { icons.insert(filename.to_string(), icon.clone()); }
+    }
+    let overrides_applied = transaction.overrides(bytes, &["overrides", "client-overrides"], cancel).await?;
+    let manifest_path = instance_root.join(".modrinth-pack-manifest.json");
+    let old_paths: Vec<String> = match std::fs::read(&manifest_path) {
+        Ok(data) => serde_json::from_slice(&data)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let paths: Vec<&str> = downloaded.iter().map(|file| file.path.as_str()).collect();
+    for old in old_paths {
+        if !paths.contains(&old.as_str()) {
+            validate_pack_path(&old)?;
+            // Only tracked content is reconciled, never saves or configuration.
+            if ["mods/", "resourcepacks/", "shaderpacks/"].iter().any(|prefix| old.starts_with(prefix)) {
+                let path = safe_join(instance_root, &old)?;
+                if path.exists() { transaction.remove(&path)?; }
+                let disabled = safe_join(instance_root, &format!("{old}.disabled"))?;
+                if disabled.exists() { transaction.remove(&disabled)?; }
+            }
         }
     }
-
-    // Runs on a blocking-pool thread (large packs' overrides can be many MB
-    // of resource packs/configs) so it doesn't stall the async runtime, and
-    // checks `cancel` periodically like the download loop above it — this
-    // sync zip-extraction loop previously had no cancellation awareness at
-    // all despite CancelToken being passed in.
-    let owned_bytes = bytes.to_vec();
-    let owned_root = instance_root.to_path_buf();
-    let owned_cancel = cancel.clone();
-    let overrides_applied =
-        tokio::task::spawn_blocking(move || extract_overrides(&owned_bytes, &owned_root, &owned_cancel))
-            .await
-            .map_err(|e| ModpackError::Other(format!("override extraction task panicked: {e}")))??;
-
-    let label = if index.name.is_empty() {
-        "Modrinth modpack".to_string()
-    } else {
-        format!("{} {}", index.name, index.version_id)
-    };
-
-    let mut message = format!(
-        "Imported {label}: {files_installed} files downloaded, {overrides_applied} override files applied."
-    );
-    let has_skipped = !failed_files.is_empty();
-    if has_skipped {
-        message.push_str(&format!(
-            "\n\n{} file(s) failed to download and were skipped: {}",
-            failed_files.len(),
-            failed_files.join(", ")
-        ));
-    }
-
+    transaction.stage(".modrinth-pack-manifest.json", &serde_json::to_vec_pretty(&paths)?)?;
+    transaction.commit(cancel).await?;
+    let label = if index.name.is_empty() { "Modrinth modpack".to_string() } else { format!("{} {}", index.name, index.version_id) };
     Ok(ModpackImportResult {
-        message,
-        has_skipped,
+        message: format!("Imported {label}: {total} files downloaded, {overrides_applied} override files applied."),
+        has_skipped: false,
         icons,
         content_names,
         project_uids,
@@ -213,45 +167,6 @@ pub fn read_mrpack_index(bytes: &[u8]) -> Result<ModrinthPackIndex, ModpackError
     Ok(serde_json::from_str(&json)?)
 }
 
-fn extract_overrides(
-    bytes: &[u8],
-    instance_root: &Path,
-    cancel: &CancelToken,
-) -> Result<u32, ModpackError> {
-    let cursor = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-    let mut applied = 0u32;
-
-    for i in 0..archive.len() {
-        if i % 20 == 0 && cancel.is_cancelled() {
-            return Err(crate::download::DownloadError::Cancelled.into());
-        }
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        if entry.is_dir() {
-            continue;
-        }
-
-        let relative = if let Some(path) = name.strip_prefix("overrides/") {
-            path
-        } else if let Some(path) = name.strip_prefix("overrides-client/") {
-            path
-        } else {
-            continue;
-        };
-
-        let dest = safe_join(instance_root, relative)?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut buffer = Vec::new();
-        entry.read_to_end(&mut buffer)?;
-        std::fs::write(&dest, buffer)?;
-        applied += 1;
-    }
-
-    Ok(applied)
-}
 
 pub fn is_mrpack_bytes(bytes: &[u8]) -> bool {
     let cursor = Cursor::new(bytes);
@@ -315,7 +230,7 @@ mod mrpack_index_tests {
         assert_eq!(index.version_id, "2.1.0", "`versionId` is what becomes ModpackImportResult::version_label");
         assert_eq!(index.files.len(), 2);
         assert_eq!(index.files[0].path, "mods/sodium.jar");
-        assert_eq!(index.files[0].hashes.as_ref().unwrap().sha1, "aabbcc");
+        assert_eq!(index.files[0].hashes.as_ref().unwrap()["sha1"], "aabbcc");
         assert!(index.files[1].hashes.is_none(), "a file with no hashes block is still valid");
         assert_eq!(index.files[1].env.as_ref().unwrap().client, "unsupported");
     }

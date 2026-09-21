@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { usePlayStore } from "./store";
 import { useEscapeKey } from "../../hooks/useEscapeKey";
+import { useModalFocus } from "../../hooks/useModalFocus";
 import styles from "./SignInDialog.module.css";
 
 interface SignInDialogProps {
@@ -21,6 +22,7 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
 
   useEffect(() => () => clearDevicePrompt(), [clearDevicePrompt]);
   useEscapeKey(onClose, !signingIn);
+  const modalRef = useModalFocus();
 
   // Once a code arrives, open the Microsoft sign-in page automatically.
   useEffect(() => {
@@ -57,6 +59,8 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
     >
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="signin-title"

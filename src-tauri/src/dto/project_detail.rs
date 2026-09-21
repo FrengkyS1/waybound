@@ -47,6 +47,16 @@ pub struct ModVersionSummary {
     pub downloads: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changelog: Option<String>,
+    /// The actual installer filename for this version (primary file, else
+    /// first). Lets the frontend highlight which version is currently
+    /// installed by exact filename match — CurseForge's `version_number`
+    /// already IS the filename, but Modrinth's is just "1.2.3".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// Release channel ("beta"/"alpha") — `None` for stable releases, so
+    /// the frontend only tags what isn't one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

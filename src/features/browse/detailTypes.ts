@@ -18,6 +18,11 @@ export interface ModVersionSummary {
   loaders: ModLoader[];
   downloads: number;
   changelog?: string;
+  /** Actual installer filename — exact-match against the installed file to
+   * highlight the current version. */
+  fileName?: string;
+  /** Release channel — present only for beta/alpha (stable has no tag). */
+  channel?: string;
 }
 
 export type ModpackContentKind =

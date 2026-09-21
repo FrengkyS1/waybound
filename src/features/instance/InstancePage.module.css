@@ -655,6 +655,40 @@
   cursor: not-allowed;
 }
 
+.versionsBtn {
+  flex: none;
+  height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+.versionsBtn:hover:not(:disabled) {
+  color: var(--color-accent);
+  border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-border));
+}
+.versionsBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.packVersionsLink {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--color-accent);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.packVersionsLink:hover {
+  color: var(--color-accent-bright);
+}
+
 .configBtn {
   flex: none;
   height: 32px;

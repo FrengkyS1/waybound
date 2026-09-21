@@ -249,6 +249,11 @@ export function ProjectDetailPage({
                 </div>
 
                 <p className={styles.tagline}>{data.description}</p>
+                {data.projectType === "shader" && (
+                  <p className={styles.tagline} role="note">
+                    Shader installation is manual: install a shader runtime compatible with your Minecraft version and loader (for example Iris), then download the shader ZIP from the project links below. Open your instance folder, place the ZIP in shaderpacks, and select it in Minecraft’s shader settings. Vanilla Minecraft cannot load shaders on its own.
+                  </p>
+                )}
 
                 <div className={styles.metaRow}>
                   <SourceBadges sources={data.sources} />

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   listModConfigs,
   readConfigFile,
@@ -6,6 +6,7 @@ import {
   type ConfigFileEntry,
 } from "../instances/api";
 import { useEscapeKey } from "../../hooks/useEscapeKey";
+import { useModalFocus } from "../../hooks/useModalFocus";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import styles from "./ConfigEditorModal.module.css";
 
@@ -42,9 +43,18 @@ export function ConfigEditorModal({
   // confirmation can gate either "close the whole modal" or "switch to a
   // different file" through the same dialog.
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  const request = useRef(0);
+  const saveInFlight = useRef(false);
+  const modalRef = useModalFocus();
 
   useEffect(() => {
     let cancelled = false;
+    setState({ stage: "loading-list" });
+    setSelected(null);
+    setContent("");
+    setSavedContent("");
+    setFileError(null);
+    request.current += 1;
     void listModConfigs(instanceId, fileName)
       .then((configs) => {
         if (cancelled) return;
@@ -64,28 +74,36 @@ export function ConfigEditorModal({
       });
     return () => {
       cancelled = true;
+      request.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instanceId, fileName]);
 
   async function openFile(entry: ConfigFileEntry) {
+    if (saveInFlight.current) return;
+    const generation = ++request.current;
+    setContent("");
+    setSavedContent("");
     setFileError(null);
     setLoadingFile(true);
     setSelected(entry);
     try {
       const text = await readConfigFile(instanceId, entry.relativePath);
+      if (generation !== request.current) return;
       setContent(text);
       setSavedContent(text);
     } catch (err) {
+      if (generation !== request.current) return;
       setFileError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoadingFile(false);
+      if (generation === request.current) setLoadingFile(false);
     }
   }
 
   const dirty = content !== savedContent;
 
   function guarded(action: () => void) {
+    if (saveInFlight.current) return;
     if (dirty) {
       setPendingAction(() => action);
     } else {
@@ -94,20 +112,24 @@ export function ConfigEditorModal({
   }
 
   async function handleSave() {
-    if (!selected) return;
+    if (!selected || loadingFile || saveInFlight.current) return;
+    saveInFlight.current = true;
+    const generation = request.current;
+    const saved = content;
     setSaving(true);
     setFileError(null);
     try {
-      await writeConfigFile(instanceId, selected.relativePath, content);
-      setSavedContent(content);
+      await writeConfigFile(instanceId, selected.relativePath, saved);
+      if (generation === request.current) setSavedContent(saved);
     } catch (err) {
-      setFileError(err instanceof Error ? err.message : String(err));
+      if (generation === request.current) setFileError(err instanceof Error ? err.message : String(err));
     } finally {
-      setSaving(false);
+      saveInFlight.current = false;
+      if (generation === request.current) setSaving(false);
     }
   }
 
-  useEscapeKey(() => guarded(onClose), !pendingAction);
+  useEscapeKey(() => guarded(onClose), !pendingAction && !saving);
 
   const showPicker = state.stage === "ready" && state.configs.length > 1;
 
@@ -115,6 +137,8 @@ export function ConfigEditorModal({
     <div className={styles.backdrop} role="presentation" onClick={() => guarded(onClose)}>
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={`Edit config for ${modLabel}`}
@@ -128,6 +152,7 @@ export function ConfigEditorModal({
           <button
             type="button"
             className={styles.closeBtn}
+            disabled={saving}
             aria-label="Close"
             onClick={() => guarded(onClose)}
           >
@@ -142,6 +167,7 @@ export function ConfigEditorModal({
                 <li key={entry.relativePath}>
                   <button
                     type="button"
+                    disabled={saving}
                     className={`${styles.fileItem} ${
                       selected?.relativePath === entry.relativePath ? styles.fileItemActive : ""
                     }`}
@@ -170,6 +196,7 @@ export function ConfigEditorModal({
                 <textarea
                   className={styles.textarea}
                   value={content}
+                  disabled={saving}
                   onChange={(e) => setContent(e.target.value)}
                   spellCheck={false}
                   aria-label={`Editing ${selected.displayName}`}

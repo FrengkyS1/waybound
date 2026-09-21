@@ -11,6 +11,73 @@
   padding-right: 2px;
 }
 
+/* Slim header row carrying the minimize control — muted on purpose so the
+   cards below stay the visual focus. */
+.dockHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.dockTitle {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.minimize {
+  width: 24px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  line-height: 1;
+}
+
+.minimize:hover {
+  color: var(--color-text);
+  background: var(--color-surface-hover);
+  border-color: var(--color-border);
+}
+
+/* Minimized peek tab: a small remnant on the bottom-right edge so the dock
+   stays discoverable (and live progress stays glanceable) while hidden. */
+.peek {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-sheen), var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+  border-right: none;
+  box-shadow: var(--shadow-md), var(--edge-light);
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.peek:hover {
+  color: var(--color-text);
+}
+
+.peek .dot {
+  width: 10px;
+  height: 10px;
+}
+
+.minimize:focus-visible,
+.peek:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 .notification {
   display: block;
   width: 100%;

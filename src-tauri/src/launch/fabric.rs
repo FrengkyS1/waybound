@@ -42,22 +42,74 @@ pub async fn latest_loader_version(
         .ok_or_else(|| LaunchError::Parse(format!("no Fabric loader for {game_version}")))
 }
 
-/// Fetch the Fabric profile JSON that layers onto vanilla for the given
-/// game + loader versions.
-pub async fn fetch_profile(
+/// URL of the profile JSON for a (game, loader) pair. Split out so the launch
+/// pipeline can cache the same URL it would have fetched.
+pub fn profile_url(game_version: &str, loader_version: &str) -> String {
+    format!("{FABRIC_META}/loader/{game_version}/{loader_version}/profile/json")
+}
+
+/// Fabric and Quilt both publish vanilla-compatible inheritance profiles.
+pub async fn cached_profile(
     client: &Client,
+    root: &std::path::Path,
     game_version: &str,
-    loader_version: &str,
+    requested: Option<String>,
+    quilt: bool,
 ) -> Result<VersionJson, LaunchError> {
-    let url = format!("{FABRIC_META}/loader/{game_version}/{loader_version}/profile/json");
-    let profile: VersionJson = client
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await
-        .map_err(|e| LaunchError::Parse(format!("fabric profile: {e}")))?;
+    let kind = if quilt { "quilt" } else { "fabric" };
+    let base = if quilt { "https://meta.quiltmc.org/v3/versions" } else { FABRIC_META };
+    let coordinate = if quilt { "org.quiltmc:quilt-loader:" } else { "net.fabricmc:fabric-loader:" };
+    let selection_key = format!("{kind}/{game_version}/selected.json");
+    let requested = requested.filter(|v| !v.trim().is_empty());
+    let mut selected = requested.clone().or_else(|| super::offline::read_json(root, &selection_key));
+    // Retrofit standard launcher profiles and the cache from earlier builds.
+    let candidates = [root.join("versions"), super::offline::cache_root(root).join(kind).join(game_version)];
+    for directory in candidates {
+        let Ok(entries) = std::fs::read_dir(directory) else { continue };
+        for entry in entries.flatten() {
+            let path = if entry.path().is_dir() {
+                entry.path().join(format!("{}.json", entry.file_name().to_string_lossy()))
+            } else { entry.path() };
+            let Ok(raw) = std::fs::read(path) else { continue };
+            let Ok(profile) = serde_json::from_slice::<VersionJson>(&raw) else { continue };
+            if profile.inherits_from.as_deref() != Some(game_version) { continue; }
+            let Some(version) = profile.libraries.iter().find_map(|lib| lib.name.strip_prefix(coordinate)) else { continue };
+            if selected.as_deref().is_some_and(|wanted| wanted != version) { continue; }
+            super::offline::put_bytes(root, &format!("{kind}/{game_version}/{version}.json"), &raw)?;
+            selected = Some(version.to_owned());
+            break;
+        }
+        if selected.is_some() { break; }
+    }
+    let version = match selected {
+        Some(version) => version,
+        None => {
+            let entries: Vec<LoaderEntry> = super::offline::fetch_json_cached(
+                client, root, &format!("{kind}/{game_version}/loaders.json"),
+                &format!("{base}/loader/{game_version}"),
+            ).await?;
+            entries.into_iter().map(|entry| entry.loader.version)
+                .max_by_key(|version| (!version.contains('-'), version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>()))
+                .ok_or_else(|| LaunchError::Parse(format!("No {kind} loader supports Minecraft {game_version}")))?
+        }
+    };
+    let profile: VersionJson = super::offline::fetch_json_cached(
+        client, root, &format!("{kind}/{game_version}/{version}.json"),
+        &format!("{base}/loader/{game_version}/{version}/profile/json"),
+    ).await?;
+    validate_profile(&profile, game_version, &format!("{coordinate}{version}"))?;
+    super::offline::put_bytes(root, &selection_key, &serde_json::to_vec(&version).map_err(|e| LaunchError::Parse(e.to_string()))?)?;
     Ok(profile)
+}
+
+fn validate_profile(profile: &VersionJson, game_version: &str, coordinate: &str) -> Result<(), LaunchError> {
+    if profile.inherits_from.as_deref() != Some(game_version)
+        || profile.main_class.as_deref().is_none_or(str::is_empty)
+        || !profile.libraries.iter().any(|lib| lib.name == coordinate)
+    {
+        return Err(LaunchError::Parse(format!("Loader profile does not match Minecraft {game_version} and {coordinate}")));
+    }
+    Ok(())
 }
 
 /// Merge a Fabric (or any `inheritsFrom`) profile onto its parent vanilla JSON.
@@ -150,6 +202,7 @@ mod profile_merge_tests {
     #[test]
     fn assets_client_download_and_java_version_still_come_from_vanilla() {
         let merged = merge_onto_parent(fabric_profile(), vanilla());
+
         assert_eq!(merged.asset_index.as_ref().unwrap().id, "5");
         assert_eq!(
             merged.downloads.as_ref().unwrap().client.as_ref().unwrap().sha1.as_deref(),
@@ -213,5 +266,69 @@ mod profile_merge_tests {
         let child = json(r#"{ "id": "1.12.2-forge", "minecraftArguments": "--tweakClass forge" }"#);
         let merged = merge_onto_parent(child, parent);
         assert_eq!(merged.minecraft_arguments.as_deref(), Some("--tweakClass forge"));
+    }
+}
+#[cfg(test)]
+mod loader_cache_tests {
+    use super::*;
+    use super::super::offline;
+
+    fn loader_version() -> String {
+        "1.0".into()
+    }
+
+    fn profile(game_version: &str, coordinate: &str) -> String {
+        format!(
+            r#"{{"id":"loader-{game_version}","inheritsFrom":"{game_version}","mainClass":"knot.KnotClient","libraries":[{{"name":"{coordinate}"}}]}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_selected_loader_cache_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        offline::put_bytes(
+            dir.path(),
+            "quilt/1.20.1/1.0.json",
+            profile("1.20.1", "org.quiltmc:quilt-loader:1.0").as_bytes(),
+        )
+        .unwrap();
+        offline::put_bytes(dir.path(), "quilt/1.20.1/selected.json", br#""1.0""#).unwrap();
+        let client = reqwest::Client::new();
+        let resolved = cached_profile(&client, dir.path(), "1.20.1", None, true).await.unwrap();
+        assert_eq!(resolved.main_class.as_deref(), Some("knot.KnotClient"));
+        assert_eq!(resolved.id, "loader-1.20.1");
+        assert!(!offline::cache_root(dir.path()).join("quilt/1.20.1/loaders.json").exists());
+    }
+
+    #[tokio::test]
+    async fn profile_mismatch_is_rejected_not_silently_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        offline::put_bytes(
+            dir.path(),
+            "fabric/1.20.1/1.0.json",
+            profile("1.19.4", "net.fabricmc:fabric-loader:1.0").as_bytes(),
+        )
+        .unwrap();
+        offline::put_bytes(dir.path(), "fabric/1.20.1/selected.json", br#""1.0""#).unwrap();
+        let error = cached_profile(&reqwest::Client::new(), dir.path(), "1.20.1", None, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pinned_request_must_not_accept_a_different_loader_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        offline::put_bytes(
+            dir.path(),
+            "fabric/1.20.1/1.0.json",
+            profile("1.20.1", "net.fabricmc:fabric-loader:2.0").as_bytes(),
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+        let error = cached_profile(&client, dir.path(), "1.20.1", Some(loader_version()), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Loader profile does not match"), "{error}");
     }
 }

@@ -7,6 +7,7 @@ import type { ModDetail } from "../detailTypes";
 import type { VersionPrefill } from "../../settings/types";
 import { installVerb } from "../detailTypes";
 import { useEscapeKey } from "../../../hooks/useEscapeKey";
+import { useModalFocus } from "../../../hooks/useModalFocus";
 import styles from "./InstallTargetDialog.module.css";
 
 const LOADERS: ModLoader[] = ["fabric", "forge", "neoforge", "quilt"];
@@ -61,6 +62,7 @@ export function InstallTargetDialog({
   const startInstall = useInstallStore((s) => s.startInstall);
 
   useEscapeKey(onClose);
+  const modalRef = useModalFocus();
 
   const versions =
     detail.gameVersions.length > 0 ? detail.gameVersions : [suggestedMc];
@@ -129,6 +131,8 @@ export function InstallTargetDialog({
     <div className={styles.backdrop} onClick={onClose} role="presentation">
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="install-target-title"

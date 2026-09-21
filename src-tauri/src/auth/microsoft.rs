@@ -43,6 +43,24 @@ pub enum AuthError {
     Unexpected(&'static str, String),
 }
 
+impl AuthError {
+    /// Only transport interruptions and explicit service throttling/outages
+    /// permit use of an already authenticated, persisted account offline.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Network(error) => error.status().map_or_else(
+                || error.is_timeout() || error.is_connect() || error.is_body(),
+                transient_status,
+            ),
+            _ => false,
+        }
+    }
+}
+
+fn transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 /// The device-code prompt shown to the user while we poll for completion.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -227,6 +245,9 @@ pub async fn refresh_msa_token(
         .send()
         .await?;
 
+    if transient_status(resp.status()) {
+        return Err(AuthError::Network(resp.error_for_status().unwrap_err()));
+    }
     if !resp.status().is_success() {
         return Err(AuthError::Declined);
     }
@@ -260,9 +281,10 @@ pub async fn complete_minecraft_login(
         }))
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await
-        .map_err(|e| AuthError::Unexpected("Xbox Live", e.to_string()))?;
+        .map_err(AuthError::Network)?;
 
     // 2. XSTS token (authorize against Minecraft services relying party).
     let xsts_resp = client
@@ -278,6 +300,9 @@ pub async fn complete_minecraft_login(
         .send()
         .await?;
 
+    if transient_status(xsts_resp.status()) {
+        return Err(AuthError::Network(xsts_resp.error_for_status().unwrap_err()));
+    }
     if xsts_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         let err: XstsErrorResponse = xsts_resp
             .json()
@@ -291,9 +316,10 @@ pub async fn complete_minecraft_login(
     }
 
     let xsts: XboxResponse = xsts_resp
+        .error_for_status()?
         .json()
         .await
-        .map_err(|e| AuthError::Unexpected("XSTS", e.to_string()))?;
+        .map_err(AuthError::Network)?;
     let uhs = xsts
         .display_claims
         .xui
@@ -309,9 +335,10 @@ pub async fn complete_minecraft_login(
         }))
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await
-        .map_err(|e| AuthError::Unexpected("Minecraft login", e.to_string()))?;
+        .map_err(AuthError::Network)?;
 
     // 4. Fetch the profile (proves ownership; gives uuid + name).
     let profile_resp = client
@@ -320,14 +347,18 @@ pub async fn complete_minecraft_login(
         .send()
         .await?;
 
-    if !profile_resp.status().is_success() {
+    if transient_status(profile_resp.status()) {
+        return Err(AuthError::Network(profile_resp.error_for_status().unwrap_err()));
+    }
+    if profile_resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(AuthError::NoMinecraft);
     }
 
     let profile: MinecraftProfile = profile_resp
+        .error_for_status()?
         .json()
         .await
-        .map_err(|_| AuthError::NoMinecraft)?;
+        .map_err(AuthError::Network)?;
 
     Ok(Account {
         uuid: profile.id,

@@ -27,6 +27,12 @@ pub struct InstanceSummary {
     /// instance or one that only ever had individual mods installed.
     #[serde(default)]
     pub modpack_version_label: Option<String>,
+    /// The installed modpack's project uid (e.g. `"curseforge:12345"`),
+    /// recorded at import time. Lets the instance offer the pack's other
+    /// versions for in-place switching — without it there's no project to
+    /// re-resolve against, only a display label.
+    #[serde(default)]
+    pub modpack_project_uid: Option<String>,
 }
 
 /// A single content file inside an instance (mod, resource pack, or shader).
@@ -92,6 +98,41 @@ pub struct ConfigFileEntry {
 pub struct ContentMeta {
     pub name: Option<String>,
     pub icon: Option<String>,
+}
+
+/// A jar whose embedded metadata says it's built for a different loader
+/// than the instance runs — e.g. a NeoForge jar on a Forge instance, which
+/// the game silently refuses to load (then dies on "missing" dependencies
+/// that are all sitting in `mods/`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrongLoaderFile {
+    pub file_name: String,
+    pub mod_name: Option<String>,
+    pub detected_loader: String,
+}
+
+/// A required dependency (by mod id) no installed jar provides. Version
+/// ranges are NOT evaluated — only presence — the loader itself judges
+/// ranges at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingDep {
+    pub file_name: String,
+    pub mod_name: Option<String>,
+    pub dep_mod_id: String,
+    pub version_range: Option<String>,
+}
+
+/// Pre-launch readiness: blockers found by reading every enabled jar's own
+/// metadata. Empty lists mean "nothing obviously wrong" — never a guarantee
+/// the game will start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchReadiness {
+    pub checked_files: u32,
+    pub wrong_loader: Vec<WrongLoaderFile>,
+    pub missing_deps: Vec<MissingDep>,
 }
 
 /// Per-instance launch overrides. Empty/None fields fall back to global config.

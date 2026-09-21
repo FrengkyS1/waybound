@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateInstanceInput,
+  DetectedLauncher,
   GameVersionOption,
   InstalledMod,
   InstanceSummary,
@@ -12,6 +13,18 @@ export async function fetchInstances(): Promise<InstanceSummary[]> {
 
 export async function createInstance(input: CreateInstanceInput): Promise<InstanceSummary> {
   return invoke<InstanceSummary>("create_instance", { input });
+}
+
+export async function importInstance(sourcePath: string, name?: string): Promise<InstanceSummary> {
+  return invoke<InstanceSummary>("import_instance", { sourcePath, name });
+}
+
+export async function detectImportableLaunchers(rootPath?: string | null): Promise<DetectedLauncher[]> {
+  return invoke<DetectedLauncher[]>("detect_importable_launchers", { rootPath: rootPath ?? null });
+}
+
+export async function exportInstance(instanceId: string, destinationPath: string): Promise<string> {
+  return invoke<string>("export_instance", { instanceId, destinationPath });
 }
 
 export async function deleteInstance(instanceId: string): Promise<void> {
@@ -99,8 +112,9 @@ export async function updateModInInstance(
   instanceId: string,
   fileName: string,
   installId: string,
+  versionId?: string,
 ): Promise<import("../browse/detailTypes").InstallModResult> {
-  return invoke("update_mod_in_instance", { instanceId, fileName, installId });
+  return invoke("update_mod_in_instance", { instanceId, fileName, installId, versionId });
 }
 
 /** Resolves a Content-tab mod back to a `ModSummary` for opening its project
@@ -111,6 +125,24 @@ export async function fetchModSummaryForContent(
   fileName: string,
 ): Promise<import("../browse/types").ModSummary> {
   return invoke("get_mod_summary_for_content", { instanceId, fileName });
+}
+
+export interface IdentifiedMod {
+  fileName: string;
+  summary: import("../browse/types").ModSummary;
+  versionId: string;
+  versionNumber: string;
+  matchedFileName?: string;
+}
+
+/** Identifies an on-disk jar by content hash (Modrinth, then CurseForge
+ * fingerprints) — the fallback for files `fetchModSummaryForContent`
+ * rejects. Returns the project plus the exact matched version. */
+export async function identifyModFile(
+  instanceId: string,
+  fileName: string,
+): Promise<IdentifiedMod> {
+  return invoke<IdentifiedMod>("identify_mod_file", { instanceId, fileName });
 }
 
 export interface ConfigFileEntry {
@@ -166,6 +198,25 @@ export async function setInstanceLoaderVersion(
   loaderVersion: string | null,
 ): Promise<void> {
   await invoke("set_instance_loader_version", { instanceId, loaderVersion });
+}
+
+export interface LoaderVersionInfo {
+  loader: string;
+  minecraftVersion: string;
+  latest: string | null;
+  recommended: string | null;
+  fromCache: boolean;
+  fetchedAtUnix: number | null;
+}
+
+/** Cached latest + recommended loader builds for a loader + game version
+ * (daily TTL, offline-tolerant). Covers Fabric and Quilt too — unlike
+ * `getLatestLoaderVersion`, which only knows Forge/NeoForge. */
+export async function getLoaderVersionInfo(
+  loader: string,
+  mcVersion: string,
+): Promise<LoaderVersionInfo> {
+  return invoke<LoaderVersionInfo>("get_loader_version_info", { loader, mcVersion });
 }
 
 export async function fetchInstanceMods(instanceId: string): Promise<InstalledMod[]> {

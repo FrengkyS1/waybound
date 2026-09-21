@@ -132,6 +132,18 @@ impl Database {
                 icon TEXT,
                 PRIMARY KEY (instance_id, category, file_name)
             );
+
+            -- Loader-version index (latest + recommended builds per loader
+            -- and game version, refreshed at most daily). Served from here
+            -- so version displays work offline from yesterday's answers.
+            CREATE TABLE IF NOT EXISTS loader_meta_cache (
+                loader TEXT NOT NULL,
+                mc TEXT NOT NULL,
+                latest TEXT,
+                recommended TEXT,
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (loader, mc)
+            );
             ",
         )?;
 
@@ -148,17 +160,27 @@ impl Database {
             "ALTER TABLE content_meta_cache ADD COLUMN written_version TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE content_meta_cache ADD COLUMN mod_id TEXT",
             "ALTER TABLE instances ADD COLUMN modpack_version_label TEXT",
+            "ALTER TABLE instances ADD COLUMN modpack_project_uid TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }
 
+        // Upstream version identifiers are not processed search results. Move
+        // historical keys before pruning so upgrades retain offline choices.
+        conn.execute(
+            "INSERT OR IGNORE INTO search_cache (cache_key, payload_json, fetched_at)
+             SELECT 'durable:game-versions', payload_json, fetched_at FROM search_cache
+             WHERE cache_key = 'game-versions' OR cache_key LIKE '%:game-versions'
+             ORDER BY fetched_at DESC LIMIT 1",
+            [],
+        )?;
         // Every cache row this version writes is prefixed/tagged with its
         // own version (see `cache_key_prefix`/`APP_VERSION`) — anything left
         // over from a previous version was computed by different processing
         // logic and is never read back under the new version anyway, so it
         // would just sit here forever without this.
         let _ = conn.execute(
-            "DELETE FROM search_cache WHERE cache_key NOT LIKE ?1",
+            "DELETE FROM search_cache WHERE cache_key NOT LIKE ?1 AND cache_key != 'durable:game-versions'",
             params![format!("{}%", cache_key_prefix())],
         );
         let _ = conn.execute(
@@ -391,6 +413,33 @@ mod schema_tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn game_versions_migrate_and_survive_restarts_and_upgrades() {
+        let temp = TempDb::new("durable-game-versions");
+        let old = r#"[{"version":"1.20.1","versionType":"release"}]"#;
+        let latest = r#"[{"version":"1.21.1","versionType":"release"}]"#;
+        {
+            let db = temp.open();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO search_cache (cache_key, payload_json, fetched_at) VALUES (?1, ?2, ?3)",
+                params!["game-versions", old, 1],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO search_cache (cache_key, payload_json, fetched_at) VALUES (?1, ?2, ?3)",
+                params!["previous-app:game-versions", latest, 2],
+            ).unwrap();
+        }
+        for _ in 0..2 {
+            let db = temp.open();
+            let (json, fetched) = db.get_cached_json("durable:game-versions").unwrap().unwrap();
+            let versions: Vec<crate::dto::instance::GameVersionOption> = serde_json::from_str(&json).unwrap();
+            assert_eq!(versions[0].version, "1.21.1");
+            assert_eq!(fetched, 2);
+            assert!(db.get_cached_json("previous-app:game-versions").unwrap().is_none());
         }
     }
 

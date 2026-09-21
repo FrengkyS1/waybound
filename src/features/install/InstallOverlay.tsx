@@ -34,16 +34,58 @@ export function InstallOverlay() {
   const notifications = useInstallStore((s) => s.notifications);
   const dismissNotification = useInstallStore((s) => s.dismissNotification);
   const cancel = useInstallStore((s) => s.cancel);
+  const setPaused = useInstallStore((s) => s.setPaused);
   const dismiss = useInstallStore((s) => s.dismiss);
   const startMissingModsDownload = useInstallStore((s) => s.startMissingModsDownload);
   const stepMissingMods = useInstallStore((s) => s.stepMissingMods);
   const openAllMissingMods = useInstallStore((s) => s.openAllMissingMods);
   const dismissMissingMod = useInstallStore((s) => s.dismissMissingMod);
+  const dockMinimized = useInstallStore((s) => s.dockMinimized);
+  const setDockMinimized = useInstallStore((s) => s.setDockMinimized);
 
   if (installs.length === 0 && notifications.length === 0) return null;
 
+  const total = installs.length + notifications.length;
+
+  // Minimized: just a peek tab on the bottom-right edge — the dock's
+  // presence stays discoverable without covering anything. Clicking it
+  // brings the full dock back.
+  if (dockMinimized) {
+    const anyActive = installs.some((e) => e.status === "installing");
+    return (
+      <button
+        type="button"
+        className={styles.peek}
+        onClick={() => setDockMinimized(false)}
+        aria-label={`Show ${total} notification${total === 1 ? "" : "s"}`}
+        title="Show notifications"
+      >
+        <span
+          className={`${styles.dot} ${anyActive ? styles.dot_installing : styles.dot_done}`}
+          aria-hidden
+        />
+        <span aria-hidden>▴</span>
+        <span>{total}</span>
+      </button>
+    );
+  }
+
   return (
     <div className={styles.dock} role="status" aria-live="polite">
+      <div className={styles.dockHeader}>
+        <span className={styles.dockTitle}>
+          {total} background {total === 1 ? "item" : "items"}
+        </span>
+        <button
+          type="button"
+          className={styles.minimize}
+          onClick={() => setDockMinimized(true)}
+          aria-label="Minimize notifications"
+          title="Minimize"
+        >
+          ▾
+        </button>
+      </div>
       {notifications.map((n) => (
         <button
           key={n.id}
@@ -56,7 +98,7 @@ export function InstallOverlay() {
       ))}
       {installs.map((entry) => {
         const hasProgress =
-          entry.status === "installing" && entry.total !== undefined && entry.total > 0;
+          entry.status === "installing" && entry.current !== undefined && entry.total !== undefined && entry.total > 0;
         const pct = hasProgress ? Math.round((entry.current! / entry.total!) * 100) : null;
         const statusText =
           entry.status === "installing"
@@ -91,6 +133,17 @@ export function InstallOverlay() {
                 </div>
               )}
               <span className={styles.status}>{renderStatusText(statusText)}</span>
+              {entry.status === "installing" && entry.paused && <span className={styles.status}>Paused — resume to continue</span>}
+              {entry.status === "installing" && !entry.paused && entry.etaSeconds !== undefined && (
+                <span className={styles.status}>About {entry.etaSeconds < 60 ? `${entry.etaSeconds}s` : `${Math.ceil(entry.etaSeconds / 60)} min`} remaining (file-count estimate)</span>
+              )}
+              {entry.controlError && <span role="alert" className={styles.status}>{entry.controlError}</span>}
+              {entry.status === "installing" && (
+                <button type="button" className={styles.missingModsButton} disabled={entry.controlPending}
+                  onClick={() => setPaused(entry.id, !entry.paused)}>
+                  {entry.controlPending ? "Updating…" : entry.paused ? "Resume" : "Pause"}
+                </button>
+              )}
               {entry.status === "done" && entry.missingMods && remainingMissingMods.length > 0 && (
                 entry.missingModsIndex === undefined ? (
                   <div className={styles.missingModsActions}>

@@ -2,6 +2,7 @@ use crate::instances::paths::instance_root;
 use crate::settings::{read_options, write_options, McOptions, McOptionsError};
 use serde::Serialize;
 use tauri::State;
+use crate::instances::operations::acquire;
 
 use super::search::AppState;
 
@@ -35,6 +36,7 @@ pub fn save_instance_options(
         return Err("Instance not found.".to_string());
     }
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let _operation = acquire(&instance_id)?;
     write_options(&root, &options).map_err(map_options_error)
 }
 
@@ -77,6 +79,12 @@ pub fn apply_global_mc_options_to_all_instances(state: State<'_, AppState>) -> R
     let instances = state.db.list_instances().map_err(|e| e.to_string())?;
     let mut applied = 0u32;
     for instance in instances {
+        // One busy instance (an install or a running game) is skipped, not a
+        // reason to leave the instances already written in a half-applied
+        // batch — the returned count reports exactly what was written.
+        let Ok(_operation) = acquire(&instance.id) else {
+            continue;
+        };
         let root = instance_root(&instance.id).map_err(|e| e.to_string())?;
         write_options(&root, &options).map_err(map_options_error)?;
         applied += 1;

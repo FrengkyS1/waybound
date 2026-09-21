@@ -20,6 +20,7 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { ContextMenu, type ContextMenuItem } from "../../components/ContextMenu";
 import { CreateInstanceDialog } from "./CreateInstanceDialog";
 import { InstanceCard } from "./InstanceCard";
+import { TransferDialog } from "./TransferDialog";
 import { InstancePage, type Tab as InstanceTab } from "../instance/InstancePage";
 import { usePlayStore } from "../play/store";
 import { useInstallStore } from "../install/installStore";
@@ -62,6 +63,8 @@ export function HomePage({
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [transfer, setTransfer] = useState<"import" | InstanceSummary | null>(null);
+  const [versionsAttempt, setVersionsAttempt] = useState(0);
   // Separate from per-instance ops below — creating a new instance isn't
   // "about" any existing one, so it shouldn't disable/be disabled by them.
   const [creating, setCreating] = useState(false);
@@ -80,6 +83,7 @@ export function HomePage({
   const iconFileRef = useRef<HTMLInputElement>(null);
   const { message, showMessage } = useTimedMessage();
   const [error, setError] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const refreshTick = usePlayStore((s) => s.refreshTick);
   const installTick = useInstallStore((s) => s.refreshTick);
   const account = usePlayStore((s) => s.account);
@@ -103,13 +107,14 @@ export function HomePage({
   }, [instances, search]);
 
   async function refresh(selectId?: string | null) {
-    const list = await fetchInstances();
-    setInstances(list);
-    const nextId = selectId === null ? null : (selectId ?? selectedId ?? null);
-    if (nextId && list.some((i) => i.id === nextId)) {
-      setSelectedId(nextId);
-    } else {
-      setSelectedId(null);
+    try {
+      const list = await fetchInstances();
+      setInstances(list);
+      setRefreshError(null);
+      const nextId = selectId === null ? null : (selectId ?? selectedId ?? null);
+      setSelectedId(nextId && list.some((i) => i.id === nextId) ? nextId : null);
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -119,21 +124,30 @@ export function HomePage({
     void fetchInstances()
       .then((list) => { if (active) setInstances(list); })
       .catch((err) => {
-        if (active) setError(err instanceof Error ? err.message : String(err));
+        if (active) setRefreshError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => { if (active) setLoading(false); });
-    void fetchMinecraftVersions()
-      .then((gameVersions) => {
-        if (active) setVersions(gameVersions.map((v) => v.version));
-      })
-      .catch(() => {
-        if (active) setVersionsError("Minecraft versions are unavailable. Connect to the internet and reopen this page to create an instance. Your saved instances are still available.");
-      });
     fetchCurseForgeStatus()
       .then((status) => { if (active) setCfConfigured(status.configured); })
       .catch(() => {});
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    setVersionsError(null);
+    void fetchMinecraftVersions()
+      .then((gameVersions) => {
+        if (active) {
+          setVersions(gameVersions.map((v) => v.version));
+          if (!gameVersions.length) setVersionsError("No cached versions are available. Connect to the internet and retry. Saved instances remain available.");
+        }
+      })
+      .catch(() => {
+        if (active) setVersionsError("Could not refresh Minecraft versions. Use an available version below, or connect to the internet and retry. Saved instances remain available.");
+      });
+    return () => { active = false; };
+  }, [versionsAttempt]);
 
   useEffect(() => {
     if (!reopenInstanceId) return;
@@ -167,7 +181,11 @@ export function HomePage({
         loader: input.loader,
       });
       if (input.icon) {
-        await setInstanceIcon(created.id, input.icon);
+        try {
+          await setInstanceIcon(created.id, input.icon);
+        } catch (err) {
+          setError(`Instance created, but its image could not be saved: ${String(err)}. Use Change image to retry.`);
+        }
       }
       setCreateOpen(false);
       showMessage(`Created "${created.name}".`);
@@ -274,6 +292,7 @@ export function HomePage({
       { label: "Change image", onClick: () => pickIcon(instance.id) },
       { label: "Open folder", onClick: () => void openInFileManager(instance.rootPath) },
       { label: "Add mods", onClick: () => onAddMods(instance) },
+      { label: "Export .mrpack", onClick: () => setTransfer(instance) },
       {
         label: "Delete instance",
         danger: true,
@@ -290,6 +309,9 @@ export function HomePage({
   // Full-page instance view takes over when an instance is open.
   if (selected) {
     return (
+      <>
+      {refreshError && <p className={styles.error} role="alert">{refreshError} <button type="button" onClick={() => void refresh(selectedId)}>Retry library</button></p>}
+      {error && <p className={styles.error} role="alert">{error}</p>}
       <InstancePage
         instance={selected}
         busy={busyInstanceId === selected.id}
@@ -307,6 +329,7 @@ export function HomePage({
         tab={instanceTab}
         onTabChange={onInstanceTabChange}
       />
+      </>
     );
   }
 
@@ -322,6 +345,7 @@ export function HomePage({
             <span aria-hidden>+</span> Create
           </button>
         </div>
+        <button type="button" className={styles.createBtn} onClick={() => setTransfer("import")}>Import</button>
         <div className={styles.toolbarRight}>
           <input
             type="search"
@@ -335,7 +359,8 @@ export function HomePage({
       </header>
 
       {message && <p className={styles.message}>{message}</p>}
-      {error && <p className={styles.error}>{error}</p>}
+      {error && <p className={styles.error} role="alert">{error}</p>}
+      {refreshError && <p className={styles.error} role="alert">{refreshError} <button type="button" onClick={() => void refresh()}>Retry library</button></p>}
 
       {loading && <p className={styles.status}>Loading instances…</p>}
 
@@ -441,6 +466,7 @@ export function HomePage({
               key={instance.id}
               instance={instance}
               onOpen={() => void handleOpenDetail(instance.id)}
+              onKeyboardMenu={(x, y) => setContextMenu({ x, y, instanceId: instance.id })}
               onContextMenu={(e) => {
                 e.preventDefault();
                 setContextMenu({ x: e.clientX, y: e.clientY, instanceId: instance.id });
@@ -488,11 +514,18 @@ export function HomePage({
       )}
 
       {signInOpen && <SignInDialog onClose={() => setSignInOpen(false)} />}
+      {transfer && <TransferDialog instance={transfer === "import" ? undefined : transfer}
+        onClose={() => setTransfer(null)} onImported={(created) => {
+          showMessage(`Imported "${created.name}".`);
+          void refresh(null);
+        }} />}
 
       {createOpen && (
         <CreateInstanceDialog
-          versions={versions}
+          versions={Array.from(new Set([...versions, ...instances.map((instance) => instance.minecraftVersion)]))}
           versionsError={versionsError}
+          onRetryVersions={() => setVersionsAttempt((attempt) => attempt + 1)}
+          error={error}
           busy={creating}
           onClose={() => setCreateOpen(false)}
           onCreate={(input) => void handleCreate(input)}

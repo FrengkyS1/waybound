@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useTimedMessage } from "../../hooks/useTimedMessage";
-import { getLatestLoaderVersion } from "../instances/api";
+import { getLatestLoaderVersion, getLoaderVersionInfo } from "../instances/api";
 import type { InstanceSummary } from "../instances/types";
 import {
   getInstanceLaunchConfig,
@@ -25,7 +25,7 @@ interface LaunchOverridesProps {
   onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
 }
 
-const LOADER_HAS_LATEST_BUILD = new Set(["forge", "neoforge"]);
+const LOADER_HAS_LATEST_BUILD = new Set(["fabric", "forge", "neoforge", "quilt"]);
 
 /**
  * Per-instance launch overrides. Any field left on "Use global" falls back to
@@ -42,6 +42,8 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
   const [error, setError] = useState<string | null>(null);
 
   const [latestLoaderVersion, setLatestLoaderVersion] = useState<string | null>(null);
+  const [recommendedLoaderVersion, setRecommendedLoaderVersion] = useState<string | null>(null);
+  const [loaderInfoStale, setLoaderInfoStale] = useState(false);
   const [checkingLoader, setCheckingLoader] = useState(false);
   const [applyingLoader, setApplyingLoader] = useState(false);
   const [loaderError, setLoaderError] = useState<string | null>(null);
@@ -69,6 +71,8 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
   // across a navigation.
   useEffect(() => {
     setLatestLoaderVersion(null);
+    setRecommendedLoaderVersion(null);
+    setLoaderInfoStale(false);
     setLoaderError(null);
   }, [instanceId]);
 
@@ -78,9 +82,30 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
     setCheckingLoader(true);
     setLoaderError(null);
     try {
-      setLatestLoaderVersion(await getLatestLoaderVersion(instanceId));
+      // The cached index covers every loader (including Fabric/Quilt, which
+      // the legacy lookup below doesn't know) and reports recommended
+      // separately; Forge keeps its conservative recommended-first offer.
+      const info = await getLoaderVersionInfo(instance.loader, instance.minecraftVersion);
+      const offer =
+        instance.loader === "forge" ? (info.recommended ?? info.latest) : info.latest;
+      setLatestLoaderVersion(offer);
+      setRecommendedLoaderVersion(
+        info.recommended && info.recommended !== offer ? info.recommended : null,
+      );
+      setLoaderInfoStale(info.fromCache);
     } catch (err) {
-      setLoaderError(err instanceof Error ? err.message : String(err));
+      // Fall back to the legacy direct lookup rather than failing outright
+      // (e.g. a cold cache with no network for the index but a reachable
+      // promotions endpoint is near-impossible, but cheap to cover).
+      try {
+        setLatestLoaderVersion(await getLatestLoaderVersion(instanceId));
+        setRecommendedLoaderVersion(null);
+        setLoaderInfoStale(false);
+      } catch (fallbackErr) {
+        setLoaderError(
+          fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+        );
+      }
     } finally {
       setCheckingLoader(false);
     }
@@ -215,11 +240,15 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
             ? `Loader version: ${instance.loaderVersion}`
             : "Loader version: automatic (uses whatever build is currently recommended at launch)."}
           {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
-            <> — a newer build, {latestLoaderVersion}, is available.</>
+            <> - a newer build, {latestLoaderVersion}, is available.</>
           )}
           {latestLoaderVersion && latestLoaderVersion === instance.loaderVersion && (
             <> You're on the latest recommended build.</>
           )}
+          {recommendedLoaderVersion && (
+            <> Recommended build: {recommendedLoaderVersion}.</>
+          )}
+          {loaderInfoStale && latestLoaderVersion && <> (from cache — offline)</>}
         </p>
         {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
           <button

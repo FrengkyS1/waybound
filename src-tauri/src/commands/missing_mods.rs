@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 use crate::dto::instance::MissingMod;
 use crate::instances::paths::instance_root;
 use crate::launch::files::file_sha1;
+use crate::instances::operations::acquire;
 
 const BROWSER_WINDOW_LABEL: &str = "missing-mods-browser";
 const LOGIN_WINDOW_LABEL: &str = "curseforge-login";
@@ -332,6 +333,12 @@ pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<Mis
                 // transient lock on the just-downloaded file (a real
                 // possibility on Windows: AV scan, indexer) left a correctly
                 // placed mod reported as still missing.
+                // Exclusive for just this placement transaction — a long
+                // watch must never pin the instance busy, but a single
+                // rename/copy must never race an install or the game.
+                let Ok(_operation) = acquire(&instance_id) else {
+                    continue;
+                };
                 let placed = std::fs::rename(&source, &dest).is_ok() || {
                     let copied = std::fs::copy(&source, &dest).is_ok();
                     if copied {
@@ -339,7 +346,6 @@ pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<Mis
                     }
                     copied
                 };
-
                 if placed {
                     let (original_index, entry) = remaining.remove(idx);
                     hash_cache.remove(&source);

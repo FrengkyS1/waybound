@@ -23,7 +23,11 @@ import { CopyNameButton } from "../browse/components/CopyNameButton";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { SegmentGroup } from "../../components/SegmentGroup";
 import { ConfigEditorModal } from "./ConfigEditorModal";
+import { ModVersionModal } from "./ModVersionModal";
+import { ModpackVersionModal } from "./ModpackVersionModal";
 import { LaunchOverrides } from "./LaunchOverrides";
+import { InstanceGameSettings } from "./InstanceGameSettings";
+import { ContextMenu } from "../../components/ContextMenu";
 import styles from "./InstancePage.module.css";
 
 export type Tab = "overview" | "content" | "logs" | "settings";
@@ -56,7 +60,7 @@ interface InstancePageProps {
   onTabChange: (tab: Tab) => void;
 }
 
-const LAUNCHABLE = new Set(["vanilla", "fabric", "forge", "neoforge"]);
+const LAUNCHABLE: Record<string, true> = { vanilla: true, fabric: true, forge: true, neoforge: true, quilt: true };
 
 export function InstancePage({
   instance,
@@ -98,23 +102,6 @@ export function InstancePage({
     }
   }
 
-  // Close the kebab menu on outside click or Escape.
-  useEffect(() => {
-    if (!menuOpen) return;
-    function onPointer(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node))
-        setMenuOpen(false);
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setMenuOpen(false);
-    }
-    document.addEventListener("mousedown", onPointer);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onPointer);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [menuOpen]);
 
   async function handlePickImage(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -128,7 +115,7 @@ export function InstancePage({
   }
 
   const initial = instance.name.trim().charAt(0).toUpperCase() || "?";
-  const launchable = LAUNCHABLE.has(instance.loader);
+  const launchable = Boolean(LAUNCHABLE[instance.loader]);
 
   function confirmDelete() {
     setDeleteConfirmOpen(true);
@@ -262,63 +249,18 @@ export function InstancePage({
               ⋯
             </button>
             {menuOpen && (
-              <div className={styles.menu} role="menu">
-                <button
-                  type="button"
-                  className={styles.menuItem}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setNameDraft(instance.name);
-                  }}
-                >
-                  Rename
-                </button>
-                <button
-                  type="button"
-                  className={styles.menuItem}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onDuplicate();
-                  }}
-                >
-                  Duplicate
-                </button>
-                <button
-                  type="button"
-                  className={styles.menuItem}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    fileRef.current?.click();
-                  }}
-                >
-                  Change image
-                </button>
-                <button
-                  type="button"
-                  className={styles.menuItem}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onBack();
-                  }}
-                >
-                  Back to instances
-                </button>
-                <button
-                  type="button"
-                  className={`${styles.menuItem} ${styles.menuDanger}`}
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    confirmDelete();
-                  }}
-                >
-                  Delete instance
-                </button>
-              </div>
+              <ContextMenu
+                x={menuRef.current?.getBoundingClientRect().left ?? 0}
+                y={menuRef.current?.getBoundingClientRect().bottom ?? 0}
+                onClose={() => setMenuOpen(false)}
+                items={[
+                  { label: "Rename", onClick: () => setNameDraft(instance.name) },
+                  { label: "Duplicate", onClick: onDuplicate },
+                  { label: "Change image", onClick: () => fileRef.current?.click() },
+                  { label: "Back to instances", onClick: onBack },
+                  { label: "Delete instance", danger: true, onClick: confirmDelete },
+                ]}
+              />
             )}
           </div>
         </div>
@@ -433,6 +375,7 @@ function OverviewTab({
   loaderLabel: string;
   launchable: boolean;
 }) {
+  const [packVersionsOpen, setPackVersionsOpen] = useState(false);
   return (
     <div className={styles.overview}>
       <div className={styles.infoCard}>
@@ -456,7 +399,19 @@ function OverviewTab({
           {instance.modpackVersionLabel && (
             <div>
               <dt>Modpack version</dt>
-              <dd>{instance.modpackVersionLabel}</dd>
+              <dd>
+                {instance.modpackVersionLabel}{" "}
+                {instance.modpackProjectUid && (
+                  <button
+                    type="button"
+                    className={styles.packVersionsLink}
+                    onClick={() => setPackVersionsOpen(true)}
+                    title="Switch this instance to a different version of the modpack"
+                  >
+                    Change
+                  </button>
+                )}
+              </dd>
             </div>
           )}
           <div>
@@ -471,6 +426,14 @@ function OverviewTab({
           </p>
         )}
       </div>
+      {packVersionsOpen && instance.modpackProjectUid && (
+        <ModpackVersionModal
+          instanceId={instance.id}
+          minecraftVersion={instance.minecraftVersion}
+          packLabel={instance.modpackVersionLabel ?? ""}
+          onClose={() => setPackVersionsOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -747,6 +710,17 @@ function ContentTab({
     fileName: string;
   } | null>(null);
 
+  const [versionTarget, setVersionTarget] = useState<{
+    fileName: string;
+    label: string;
+  } | null>(null);
+
+  function handleVersionInstalled(installedMessage: string) {
+    setMessage(installedMessage);
+    setTimeout(() => setMessage(null), 6000);
+    void load();
+  }
+
   function confirmRemove() {
     if (!removeTarget) return;
     const { category, fileName } = removeTarget;
@@ -943,6 +917,22 @@ function ContentTab({
                         {updatingFiles.has(entry.fileName) ? "Updating…" : "Update"}
                       </button>
                     )}
+                    {group.category === "mod" && (
+                      <button
+                        type="button"
+                        className={styles.versionsBtn}
+                        disabled={busy || updatingFiles.has(entry.fileName)}
+                        title="Pick which version of this mod is installed"
+                        onClick={() =>
+                          setVersionTarget({
+                            fileName: entry.fileName,
+                            label: entry.name ?? humanizeFileName(entry.fileName),
+                          })
+                        }
+                      >
+                        Versions
+                      </button>
+                    )}
                     <button
                       type="button"
                       className={`${styles.toggleBtn} ${
@@ -993,6 +983,18 @@ function ContentTab({
           fileName={configTarget.fileName}
           modLabel={configTarget.label}
           onClose={() => setConfigTarget(null)}
+        />
+      )}
+
+      {versionTarget && (
+        <ModVersionModal
+          instanceId={instance.id}
+          minecraftVersion={instance.minecraftVersion}
+          loader={instance.loader}
+          fileName={versionTarget.fileName}
+          modLabel={versionTarget.label}
+          onClose={() => setVersionTarget(null)}
+          onInstalled={handleVersionInstalled}
         />
       )}
 
@@ -1167,6 +1169,7 @@ function SettingsTab({
   return (
     <div className={styles.settings}>
       <LaunchOverrides instance={instance} onLoaderVersionChange={onLoaderVersionChange} />
+      <InstanceGameSettings key={instance.id} instanceId={instance.id} busy={busy} />
 
       <section className={styles.dangerCard}>
         <div>

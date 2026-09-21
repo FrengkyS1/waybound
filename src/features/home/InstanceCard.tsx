@@ -3,7 +3,7 @@ import type { InstanceSummary } from "../instances/types";
 import { usePlayStore } from "../play/store";
 import styles from "./InstanceCard.module.css";
 
-const LAUNCHABLE = new Set(["vanilla", "fabric", "forge", "neoforge"]);
+const LAUNCHABLE: Record<string, true> = { vanilla: true, fabric: true, forge: true, neoforge: true, quilt: true };
 
 const LOADER_LABEL: Record<string, string> = {
   fabric: "Fabric",
@@ -17,6 +17,7 @@ interface InstanceCardProps {
   instance: InstanceSummary;
   onOpen: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
+  onKeyboardMenu?: (x: number, y: number) => void;
   renaming?: boolean;
   onRenameCommit?: (name: string) => void;
   onRenameCancel?: () => void;
@@ -26,6 +27,7 @@ export function InstanceCard({
   instance,
   onOpen,
   onContextMenu,
+  onKeyboardMenu,
   renaming = false,
   onRenameCommit,
   onRenameCancel,
@@ -40,7 +42,7 @@ export function InstanceCard({
   const launch = usePlayStore((s) => s.launches[instance.id]);
   const launchBusy =
     !!launch && (launch.phase === "preparing" || launch.phase === "running");
-  const canQuickPlay = LAUNCHABLE.has(instance.loader) && !renaming;
+  const canQuickPlay = Boolean(LAUNCHABLE[instance.loader]) && !renaming;
 
   function handleQuickPlay(e: React.MouseEvent) {
     e.stopPropagation();
@@ -68,7 +70,13 @@ export function InstanceCard({
       tabIndex={0}
       onClick={renaming ? undefined : onOpen}
       onKeyDown={(e) => {
-        if (renaming) return;
+        if (renaming || e.target !== e.currentTarget) return;
+        if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+          e.preventDefault();
+          const rect = e.currentTarget.getBoundingClientRect();
+          onKeyboardMenu?.(rect.left, rect.top);
+          return;
+        }
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onOpen();

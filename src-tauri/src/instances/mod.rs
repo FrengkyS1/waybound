@@ -1,4 +1,5 @@
 pub mod paths;
+pub mod operations;
 
 
 
@@ -14,8 +15,8 @@ use crate::config::ConfigStore;
 use crate::db::Database;
 
 use crate::download::{
-    download_bytes, download_bytes_with_retry, download_to_file, http_client, safe_join,
-    CancelToken,
+    download_bytes_with_retry, download_to_file_verified, http_client, safe_join,
+    verify_hashes, CancelToken,
 };
 use base64::Engine;
 
@@ -156,16 +157,6 @@ fn is_reserved_windows_name(candidate: &str) -> bool {
     RESERVED_WINDOWS_NAMES.contains(&candidate)
 }
 
-fn unique_instance_id(base_slug: &str) -> Result<String, InstanceError> {
-    let root_dir = instances_root()?;
-    let mut candidate = base_slug.to_string();
-    let mut suffix = 2;
-    while root_dir.join(&candidate).exists() || is_reserved_windows_name(&candidate) {
-        candidate = format!("{base_slug}-{suffix}");
-        suffix += 1;
-    }
-    Ok(candidate)
-}
 
 pub struct InstanceService;
 
@@ -182,89 +173,75 @@ impl InstanceService {
 
 
     pub fn create(
-
         db: &Database,
-
         name: &str,
-
         minecraft_version: &str,
-
         loader: ModLoader,
-
         loader_version: Option<String>,
-
     ) -> Result<InstanceSummary, InstanceError> {
+        Self::publish_prepared(db, name, minecraft_version, loader, loader_version, None, None)
+    }
 
+    /// Copy into private, same-volume staging; publish files before any DB row.
+    /// The caller retains ownership of `staged_root`, including on failure.
+    pub fn publish_staged(
+        db: &Database,
+        name: &str,
+        minecraft_version: &str,
+        loader: ModLoader,
+        loader_version: Option<String>,
+        staged_root: &Path,
+    ) -> Result<InstanceSummary, InstanceError> {
+        Self::publish_prepared(db, name, minecraft_version, loader, loader_version, Some(staged_root), None)
+    }
+
+    fn publish_prepared(
+        db: &Database,
+        name: &str,
+        minecraft_version: &str,
+        loader: ModLoader,
+        loader_version: Option<String>,
+        staged_root: Option<&Path>,
+        duplicate: Option<&InstanceSummary>,
+    ) -> Result<InstanceSummary, InstanceError> {
         let name = name.trim();
-
         if name.len() < 2 || name.chars().count() > MAX_INSTANCE_NAME_LEN {
-
             return Err(InstanceError::InvalidName);
-
         }
-
-
-
-        let id = unique_instance_id(&slugify(name))?;
-
-        let root = instance_root(&id)?;
-
-        ensure_instance_dirs(&id)?;
-
-
-
+        let reservation = paths::InstanceReservation::reserve(&instances_root()?, &slugify(name))?;
+        let staging = reservation.staging_root();
+        if let Some(source) = staged_root {
+            copy_dir_recursive(source, &staging)?;
+        }
+        std::fs::create_dir_all(staging.join("mods"))?;
+        reservation.publish(&staging)?;
         let instance = InstanceSummary {
-
-            id: id.clone(),
-
+            id: reservation.id.clone(),
             name: name.to_string(),
-
             minecraft_version: minecraft_version.to_string(),
-
             loader,
-
             loader_version,
-
-            mod_count: 0,
-
+            mod_count: duplicate.map_or(0, |source| source.mod_count),
             created_at: crate::db::now_unix(),
-
-            root_path: root.display().to_string(),
-
-            icon: None,
-
+            root_path: reservation.root.display().to_string(),
+            icon: duplicate.and_then(|source| source.icon.clone()),
             last_played: None,
-
             total_play_seconds: 0,
-
-            modpack_version_label: None,
-
+            modpack_version_label: duplicate.and_then(|source| source.modpack_version_label.clone()),
+            modpack_project_uid: duplicate.and_then(|source| source.modpack_project_uid.clone()),
         };
-
-
-
-        if let Err(err) = db.insert_instance(&instance) {
-
-            if let Ok(path) = instance_root(&id) {
-
-                let _ = std::fs::remove_dir_all(path);
-
-            }
-
+        let result = match duplicate {
+            Some(source) => db.insert_duplicate_instance(source, &instance),
+            None => db.insert_instance(&instance),
+        };
+        if let Err(err) = result {
             if err.to_string().contains("UNIQUE") {
-
                 return Err(InstanceError::NameTaken);
-
             }
-
-            return Err(InstanceError::Db(err));
-
+            return Err(err.into());
         }
-
-
-
+        reservation.commit();
         Ok(instance)
-
     }
 
 
@@ -286,55 +263,15 @@ impl InstanceService {
             n += 1;
         }
 
-        let copy = Self::create(
+        Self::publish_prepared(
             db,
             &name,
             &source.minecraft_version,
             source.loader,
             source.loader_version.clone(),
-        )?;
-
-        let from_root = instance_root(id)?;
-        let to_root = instance_root(&copy.id)?;
-        if let Err(err) = copy_dir_recursive(&from_root, &to_root) {
-            let _ = Self::delete(db, &copy.id);
-            return Err(err.into());
-        }
-
-        if let Err(err) = db.duplicate_instance_mods(id, &copy.id, &source.root_path, &copy.root_path) {
-            // Same rollback as the file-copy failure above — without it the
-            // user is left with a new instance row plus fully copied files on
-            // disk, reported as a failed duplicate, with no mods tracked and
-            // no obvious way to know it "half-exists".
-            let _ = Self::delete(db, &copy.id);
-            return Err(err.into());
-        }
-        if let Some(icon) = source.icon.as_deref() {
-            if db.set_instance_icon(&copy.id, Some(icon)).is_err() {
-                crate::activity::append_log(
-                    &format!("Duplicated {} but couldn't copy its icon.", source.name),
-                    "warn",
-                    None,
-                );
-            }
-        }
-        if let Some(label) = source.modpack_version_label.as_deref() {
-            let _ = db.set_modpack_version_label(&copy.id, Some(label));
-        }
-        if let Ok(launch) = db.get_instance_launch_config(id) {
-            if db.set_instance_launch_config(&copy.id, &launch).is_err() {
-                crate::activity::append_log(
-                    &format!(
-                        "Duplicated {} but couldn't copy its launch settings.",
-                        source.name
-                    ),
-                    "warn",
-                    None,
-                );
-            }
-        }
-
-        Ok(db.get_instance(&copy.id)?.ok_or(InstanceError::NotFound)?)
+            Some(&instance_root(id)?),
+            Some(&source),
+        )
     }
 
     pub fn delete(db: &Database, id: &str) -> Result<(), InstanceError> {
@@ -391,6 +328,7 @@ impl InstanceService {
         preferred_source: Option<ModSource>,
 
         version_id: Option<&str>,
+        update_existing: bool,
 
         cancel: &crate::download::CancelToken,
 
@@ -446,7 +384,7 @@ impl InstanceService {
 
 
 
-        if db.get_instance_mod(instance_id, &summary.uid)?.is_some() {
+        if !update_existing && db.get_instance_mod(instance_id, &summary.uid)?.is_some() {
 
             return Err(InstanceError::AlreadyInstalled);
 
@@ -551,7 +489,7 @@ impl InstanceService {
 
         let client = http_client().map_err(map_download_error)?;
 
-        download_to_file(&client, &download.url, &dest_path, cancel)
+        download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
 
             .await
 
@@ -712,7 +650,7 @@ async fn install_dependency(
     let dest_path = safe_join(&dest_dir, &download.filename).map_err(map_download_error)?;
 
     let client = http_client().map_err(map_download_error)?;
-    download_to_file(&client, &download.url, &dest_path, cancel)
+    download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
         .await
         .map_err(map_download_error)?;
 
@@ -960,7 +898,7 @@ async fn install_required_dependencies(
                             let dest_path = safe_join(&dest_dir, &download.filename)
                                 .map_err(map_download_error)?;
                             let client = http_client().map_err(map_download_error)?;
-                            download_to_file(&client, &download.url, &dest_path, cancel)
+                            download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
                                 .await
                                 .map_err(map_download_error)?;
 
@@ -1126,14 +1064,55 @@ async fn install_modpack(
 
     let client = http_client().map_err(map_download_error)?;
 
-    let bytes = if source == crate::dto::ModSource::Curseforge {
-        download_bytes_with_retry(&client, &download.url, cancel).await
-    } else {
-        download_bytes(&client, &download.url, cancel).await
+    let bytes = download_bytes_with_retry(&client, &download.url, cancel)
+        .await
+        .map_err(map_download_error)?;
+    verify_hashes(&bytes, &download.hashes).map_err(map_download_error)?;
+
+    // A pack archive declares its own loader (CurseForge `manifest.json` /
+    // the mrpack index) — the only reliable signal. The Browse suggestion
+    // that created this instance is a category guess defaulting to Forge,
+    // which is how a NeoForge pack ends up on a Forge instance: every
+    // NeoForge jar then fails to register and the game dies on "missing"
+    // mandatory dependencies that are all sitting in `mods/`. Correct the
+    // instance BEFORE importing so per-file resolution and the launch both
+    // use the pack's real loader.
+    let mut effective_loader = instance.loader;
+    let mut loader_note: Option<String> = None;
+    if let Some(declared) = crate::modpack::declared_loader_from_bytes(&bytes) {
+        if declared.loader != effective_loader {
+            db.set_instance_loader(&instance.id, declared.loader)?;
+            // A pin for the old loader is meaningless under the new one.
+            db.set_instance_loader_version(&instance.id, None)?;
+            effective_loader = declared.loader;
+        }
+        // Pin the pack's exact build when it declares one and the instance
+        // has no explicit pin — the pack was built and tested against
+        // exactly this. An existing user pin for the same loader is left
+        // alone.
+        if instance.loader_version.is_none() {
+            if let Some(build) = declared.version.as_deref() {
+                db.set_instance_loader_version(&instance.id, Some(build))?;
+            }
+        }
+        if declared.loader != instance.loader {
+            let name = match declared.loader {
+                ModLoader::Fabric => "Fabric",
+                ModLoader::Forge => "Forge",
+                ModLoader::NeoForge => "NeoForge",
+                ModLoader::Quilt => "Quilt",
+                ModLoader::Vanilla => "Vanilla",
+            };
+            loader_note = Some(format!(
+                "Instance loader set to {name}{} from the pack itself.",
+                declared
+                    .version
+                    .as_deref()
+                    .map(|b| format!(" {b}"))
+                    .unwrap_or_default()
+            ));
+        }
     }
-    .map_err(map_download_error)?;
-
-
 
     let instance_root = instance_root(&instance.id)?;
 
@@ -1159,7 +1138,7 @@ async fn install_modpack(
             &api_key,
             modrinth,
             &instance.minecraft_version,
-            instance.loader,
+            effective_loader,
             cancel,
             report,
         )
@@ -1194,6 +1173,10 @@ async fn install_modpack(
         .clone()
         .unwrap_or_else(|| strip_pack_extension(&download.filename));
     let _ = db.set_modpack_version_label(&instance.id, Some(&modpack_version_label));
+    // Remember which pack project this came from — without the uid the
+    // instance can show the pack's version label but never offer its other
+    // versions for in-place switching.
+    let _ = db.set_modpack_project_uid(&instance.id, Some(&summary.uid));
 
 
 
@@ -1296,8 +1279,13 @@ async fn install_modpack(
 
 
 
+    let mut message = import.message;
+    if let Some(note) = loader_note {
+        message = format!("{message} {note}");
+    }
+
     Ok(InstallModResult {
-        message: import.message,
+        message,
         installed: Some(installed),
         instance: instance.clone(),
         has_skipped: import.has_skipped,
@@ -1878,6 +1866,9 @@ fn map_download_error(err: crate::download::DownloadError) -> InstanceError {
         )),
 
         crate::download::DownloadError::Cancelled => InstanceError::Cancelled,
+        crate::download::DownloadError::HashMismatch(algorithm) => InstanceError::Other(format!(
+            "Downloaded file failed {algorithm} integrity verification; previous files were retained."
+        )),
 
         crate::download::DownloadError::TooLarge(max) => InstanceError::Other(format!(
 
@@ -1920,6 +1911,7 @@ pub struct ResolvedDownload {
     pub url: String,
 
     pub filename: String,
+    pub hashes: std::collections::HashMap<String, String>,
 
 }
 

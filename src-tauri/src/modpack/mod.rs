@@ -1,6 +1,7 @@
 mod curseforge;
 mod modrinth;
 mod preview;
+mod transaction;
 
 pub use curseforge::import_curseforge_modpack_zip;
 pub use curseforge::is_curseforge_modpack_zip;
@@ -10,6 +11,8 @@ pub use modrinth::is_mrpack_bytes;
 pub use preview::{preview_curseforge_modpack, preview_modrinth_modpack};
 
 use thiserror::Error;
+
+use crate::dto::ModLoader;
 
 #[derive(Debug, Error)]
 pub enum ModpackError {
@@ -27,8 +30,7 @@ pub enum ModpackError {
     Other(String),
 }
 
-pub struct ModpackImportResult {
-    pub message: String,
+pub struct ModpackImportResult {    pub message: String,
     /// True when one or more files couldn't be resolved automatically (a
     /// CurseForge author disabled third-party distribution, or the file was
     /// otherwise unreachable) — `message` lists them with a manual-download
@@ -64,4 +66,133 @@ pub struct ModpackImportResult {
     /// `None` and the caller falls back to the downloaded archive's
     /// filename instead.
     pub version_label: Option<String>,
+}
+
+/// The loader (and exact build) a pack archive declares for itself.
+///
+/// A CurseForge pack's per-file list carries no loader signal — the truth
+/// lives in `manifest.json`'s `minecraft.modLoaders[].id` (e.g.
+/// `"neoforge-21.1.172"`); an `.mrpack`'s lives in `modrinth.index.json`'s
+/// `dependencies` map (`"neoforge": "21.1.172"`). The Browse detail page
+/// can't see either without downloading the archive, so its suggested
+/// loader is a category guess that defaults to Forge — this is what put a
+/// NeoForge pack (ATM10) on a Forge instance, where every NeoForge jar
+/// silently fails to register and the game dies on "missing" mandatory
+/// dependencies that are all sitting in `mods/`. The installer calls this
+/// on the downloaded bytes and corrects the instance before importing.
+pub struct PackDeclaredLoader {
+    pub loader: ModLoader,
+    /// Exact build from the manifest, when the pack pins one.
+    pub version: Option<String>,
+}
+
+pub fn declared_loader_from_bytes(bytes: &[u8]) -> Option<PackDeclaredLoader> {
+    if let Ok(manifest) = curseforge::read_cf_manifest(bytes) {
+        let mut loaders = manifest.minecraft.map(|m| m.mod_loaders).unwrap_or_default();
+        // Prefer the author's primary loader; fall back to the first listed.
+        loaders.sort_by_key(|l| !l.primary);
+        for entry in &loaders {
+            let Some((kind, build)) = entry.id.split_once('-') else {
+                continue;
+            };
+            let loader = match kind {
+                "fabric" => ModLoader::Fabric,
+                "forge" => ModLoader::Forge,
+                "neoforge" => ModLoader::NeoForge,
+                "quilt" => ModLoader::Quilt,
+                _ => continue,
+            };
+            return Some(PackDeclaredLoader {
+                loader,
+                version: (!build.is_empty()).then(|| build.to_string()),
+            });
+        }
+    }
+    if let Ok(index) = modrinth::read_mrpack_index(bytes) {
+        for (key, value) in &index.dependencies {
+            let loader = match key.as_str() {
+                "fabric-loader" => ModLoader::Fabric,
+                "forge" => ModLoader::Forge,
+                "neoforge" => ModLoader::NeoForge,
+                "quilt-loader" => ModLoader::Quilt,
+                // "minecraft" and anything future — not a loader.
+                _ => continue,
+            };
+            return Some(PackDeclaredLoader {
+                loader,
+                version: (!value.is_empty()).then(|| value.clone()),
+            });
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod declared_loader_tests {
+    use super::{declared_loader_from_bytes, PackDeclaredLoader};
+    use crate::dto::ModLoader;
+    use std::io::Write;
+
+    fn zip_with(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for (name, contents) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(contents.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    fn check(bytes: &[u8]) -> Option<(ModLoader, Option<String>)> {
+        declared_loader_from_bytes(bytes)
+            .map(|PackDeclaredLoader { loader, version }| (loader, version))
+    }
+
+    #[test]
+    fn cf_manifest_primary_loader_wins() {
+        let bytes = zip_with(&[(
+            "manifest.json",
+            r#"{"manifestType":"minecraftModpack","manifestVersion":1,"name":"ATM10",
+                "minecraft":{"version":"1.21.1","modLoaders":[
+                    {"id":"forge-1.21.1-52.0.0","primary":false},
+                    {"id":"neoforge-21.1.172","primary":true}]},
+                "files":[]}"#,
+        )]);
+        let (loader, version) = check(&bytes).expect("declares a loader");
+        assert_eq!(loader, ModLoader::NeoForge);
+        assert_eq!(version.as_deref(), Some("21.1.172"));
+    }
+
+    #[test]
+    fn cf_manifest_without_minecraft_section_declares_nothing() {
+        let bytes = zip_with(&[(
+            "manifest.json",
+            r#"{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Pack","files":[]}"#,
+        )]);
+        assert!(check(&bytes).is_none());
+    }
+
+    #[test]
+    fn mrpack_dependencies_declare_loader() {
+        let bytes = zip_with(&[(
+            "modrinth.index.json",
+            r#"{"formatVersion":1,"game":"minecraft","versionId":"8.1","name":"ATM10",
+                "dependencies":{"minecraft":"1.21.1","neoforge":"21.1.172"},"files":[]}"#,
+        )]);
+        let (loader, version) = check(&bytes).expect("declares a loader");
+        assert_eq!(loader, ModLoader::NeoForge);
+        assert_eq!(version.as_deref(), Some("21.1.172"));
+    }
+
+    #[test]
+    fn garbage_bytes_declare_nothing() {
+        assert!(check(b"definitely not a zip").is_none());
+        // A zip with neither manifest is not a pack at all.
+        assert!(check(&zip_with(&[("overrides/x.txt", "hi")])).is_none());
+    }
 }

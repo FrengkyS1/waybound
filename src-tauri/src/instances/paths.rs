@@ -55,6 +55,68 @@ pub fn ensure_instance_dirs(instance_id: &str) -> Result<PathBuf, PathError> {
     Ok(mods_dir)
 }
 
+// Reservations remain private to the instance publisher.
+/// Holds the name across the empty-directory-to-staged-directory rename on
+/// Windows, where rename cannot replace an existing directory.
+pub(crate) struct InstanceReservation {
+    pub id: String,
+    pub root: PathBuf,
+    marker: PathBuf,
+    committed: bool,
+}
+
+impl InstanceReservation {
+    pub fn reserve(root: &std::path::Path, base: &str) -> Result<Self, PathError> {
+        let markers = root.join(".reservations");
+        std::fs::create_dir_all(&markers)?;
+        for suffix in 1u64.. {
+            let id = if suffix == 1 { base.to_string() } else { format!("{base}-{suffix}") };
+            if super::is_reserved_windows_name(&id) {
+                continue;
+            }
+            let marker = markers.join(&id);
+            match std::fs::create_dir(&marker) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+            let path = root.join(&id);
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { id, root: path, marker, committed: false }),
+                Err(err) => {
+                    let _ = std::fs::remove_dir(&marker);
+                    if err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+        unreachable!("instance suffix space exhausted")
+    }
+
+    pub fn publish(&self, staged: &std::path::Path) -> Result<(), PathError> {
+        std::fs::remove_dir(&self.root)?;
+        std::fs::rename(staged, &self.root)?;
+        Ok(())
+    }
+    pub fn staging_root(&self) -> PathBuf {
+        self.marker.join("staged")
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InstanceReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+        let _ = std::fs::remove_dir_all(&self.marker);
+    }
+}
+
 #[cfg(test)]
 mod instance_id_containment_tests {
     use super::*;

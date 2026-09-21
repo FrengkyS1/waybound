@@ -229,7 +229,7 @@ impl CurseForgeClient {
             .header("x-api-key", api_key)
             .header("Accept", "application/json")
             .query(&[
-                ("pageSize", "1"),
+                ("pageSize", "25"),
                 ("index", "0"),
                 ("sortField", "2"),
                 ("sortOrder", "desc"),
@@ -249,10 +249,18 @@ impl CurseForgeClient {
 
         let response = request.send().await?.error_for_status()?;
         let payload: CurseForgeApiResponse<Vec<CurseForgeModFile>> = response.json().await?;
-        let file = payload
-            .data
-            .into_iter()
-            .next()
+        // Newest-first from the API; prefer an available stable file, then
+        // any available file, then whatever came back (whose failure then
+        // surfaces the real reason — restricted, loader mismatch — instead
+        // of a bare NotFound).
+        let files = payload.data;
+        let file = files
+            .iter()
+            .filter(|f| f.is_available)
+            .find(|f| is_stable_release(f.release_type))
+            .or_else(|| files.iter().filter(|f| f.is_available).next())
+            .or_else(|| files.first())
+            .cloned()
             .ok_or(CurseForgeError::NotFound)?;
 
         ensure_file_loader_matches(&file.loaders, validate_loader)?;
@@ -281,6 +289,7 @@ impl CurseForgeClient {
             ResolvedDownload {
                 url: download_url,
                 filename: file.file_name,
+                hashes: download_hashes(&file.hashes),
             },
             required_dependencies,
         ))
@@ -537,6 +546,50 @@ impl CurseForgeClient {
             .collect()
     }
 
+    /// Matches local files to CurseForge projects by content fingerprint
+    /// (`POST /fingerprints`) — PrismLauncher's update/match flow on the CF
+    /// side. Strict (errors propagate): used for a deliberate user action.
+    /// Returns one entry per exactly-matched file.
+    pub async fn match_fingerprints(
+        &self,
+        fingerprints: &[u32],
+        api_key: &str,
+    ) -> Result<Vec<FingerprintExactMatch>, CurseForgeError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            fingerprints: &'a [u32],
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            data: FingerprintData,
+        }
+        #[derive(Deserialize)]
+        struct FingerprintData {
+            #[serde(default, rename = "exactMatches")]
+            exact_matches: Vec<FingerprintExactMatch>,
+        }
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self
+            .http
+            .post(format!("{BASE_URL}/fingerprints"))
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .json(&Body { fingerprints })
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| {
+                CurseForgeError::Rejected {
+                    status: e.status().map(|s| s.as_u16()).unwrap_or(0),
+                    message: e.to_string(),
+                }
+            })?;
+        let payload = response.json::<Response>().await?;
+        Ok(payload.data.exact_matches)
+    }
+
     /// Batch mod name + slug + icon lookup (`/mods`, the mod-level
     /// counterpart to `files_batch`) — used both to build a manual-download
     /// link for files a modpack install couldn't resolve automatically, and
@@ -655,6 +708,7 @@ impl CurseForgeClient {
             ResolvedDownload {
                 url,
                 filename: file.file_name,
+                hashes: download_hashes(&file.hashes),
             },
             required_dependencies,
         ))
@@ -749,6 +803,14 @@ impl CurseForgeClient {
         let files_payload: CurseForgeApiResponse<Vec<CurseForgeFileDetail>> =
             files_response.json().await?;
 
+        // Unavailable files are dead entries: never suggest from them and
+        // never list them as installable versions.
+        let files: Vec<CurseForgeFileDetail> = files_payload
+            .data
+            .into_iter()
+            .filter(|f| f.is_available)
+            .collect();
+
         let mut updated_summary = summary.clone();
         updated_summary.name = item.name.clone();
         updated_summary.description = strip_html(&item.summary);
@@ -756,8 +818,7 @@ impl CurseForgeClient {
         updated_summary.updated_at = item.date_modified.clone();
 
         let loaders = ModLoader::from_curseforge_categories(&item.categories);
-        let mut game_versions: Vec<String> = files_payload
-            .data
+        let mut game_versions: Vec<String> = files
             .iter()
             .flat_map(|f| f.game_versions.clone())
             .filter(|v| is_real_game_version(v))
@@ -765,13 +826,12 @@ impl CurseForgeClient {
         game_versions.sort_by(|a, b| b.cmp(a));
         game_versions.dedup();
 
-        let version_summaries: Vec<ModVersionSummary> = files_payload
-            .data
+        let version_summaries: Vec<ModVersionSummary> = files
             .iter()
             .map(map_cf_version_summary)
             .collect();
 
-        let (mc, loader) = pick_cf_suggested(&files_payload.data, &loaders);
+        let (mc, loader) = pick_cf_suggested(&files, &loaders);
         let external_url = item
             .links
             .as_ref()
@@ -1297,6 +1357,25 @@ struct CurseForgePagination {
     total_count: u32,
 }
 
+/// One `exactMatches[]` entry from `POST /fingerprints`: the file id plus
+/// the file object carrying its project id and filename. Unknown fields
+/// are ignored — the response carries far more than matching needs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintExactMatch {
+    pub id: u32,
+    pub file: FingerprintMatchedFile,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintMatchedFile {
+    #[serde(default)]
+    pub mod_id: u32,
+    #[serde(default)]
+    pub file_name: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeModDetail {
@@ -1352,9 +1431,13 @@ struct CurseForgeFileDetail {
     game_versions: Vec<String>,
     #[serde(default)]
     mod_loaders: Vec<CurseForgeFileLoader>,
+    #[serde(default = "default_true")]
+    is_available: bool,
+    #[serde(default)]
+    release_type: u8,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeFileLoader {
     name: String,
@@ -1380,6 +1463,12 @@ fn map_cf_version_summary(file: &CurseForgeFileDetail) -> ModVersionSummary {
             .collect(),
         downloads: file.download_count as u64,
         changelog: None,
+        file_name: Some(file.file_name.clone()),
+        channel: match file.release_type {
+            2 => Some("beta".to_string()),
+            3 => Some("alpha".to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -1443,7 +1532,7 @@ struct CurseForgeMod {
     links: Option<CurseForgeLinks>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeModFile {
     id: u32,
@@ -1460,16 +1549,36 @@ struct CurseForgeModFile {
     loaders: Vec<CurseForgeFileLoader>,
     #[serde(default)]
     dependencies: Vec<CurseForgeFileDependency>,
+    /// Explicit `false` means CurseForge pulled the file — never resolve to
+    /// it when picking "newest". Missing means available (fail-open: older
+    /// cached shapes predate the field).
+    #[serde(default = "default_true")]
+    is_available: bool,
+    /// 1 = release, 2 = beta, 3 = alpha. 0/unknown reads as release so a
+    /// missing field never demotes a file.
+    #[serde(default)]
+    release_type: u8,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+/// Stable channel for "newest" picking: releases first, everything else
+/// only when no release exists (a beta-only mod still installs — Prism
+/// parity — rather than erroring).
+fn is_stable_release(release_type: u8) -> bool {
+    release_type != 2 && release_type != 3
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct CurseForgeFileHash {
     value: String,
     // 1 = Sha1, 2 = Md5 per CurseForge's API.
     algo: u8,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeFileDependency {
     mod_id: u32,
@@ -1533,6 +1642,17 @@ fn required_dependency_mod_ids_of_file(file: &CurseForgeModFile) -> Vec<u32> {
 /// duplicate save.
 fn sha1_of(hashes: &[CurseForgeFileHash]) -> Option<String> {
     hashes.iter().find(|h| h.algo == 1).map(|h| h.value.to_lowercase())
+}
+
+fn download_hashes(hashes: &[CurseForgeFileHash]) -> std::collections::HashMap<String, String> {
+    hashes.iter().filter_map(|hash| {
+        let algorithm = match hash.algo {
+            1 => "sha1",
+            2 => "md5",
+            _ => return None,
+        };
+        Some((algorithm.to_string(), hash.value.clone()))
+    }).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1608,6 +1728,25 @@ mod distribution_restriction_tests {
     #[test]
     fn empty_hash_list_returns_none() {
         assert_eq!(sha1_of(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_match_tests {
+    use super::FingerprintExactMatch;
+
+    #[test]
+    fn parses_exact_match_shape() {
+        // Shape of POST /fingerprints data.exactMatches[] (trimmed — the
+        // real objects carry far more fields, all ignored here).
+        let raw = r#"{
+            "id": 1234567,
+            "file": {"modId": 56789, "fileName": "sodium-fabric-0.5.8.jar", "downloadUrl": "https://edge.forgecdn.net/…"}
+        }"#;
+        let m: FingerprintExactMatch = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.id, 1234567);
+        assert_eq!(m.file.mod_id, 56789);
+        assert_eq!(m.file.file_name, "sodium-fabric-0.5.8.jar");
     }
 }
 

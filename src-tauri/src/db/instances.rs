@@ -10,7 +10,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT i.id, i.name, i.minecraft_version, i.loader, i.loader_version,
                     i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds,
-                    i.modpack_version_label
+                    i.modpack_version_label, i.modpack_project_uid
              FROM instances i
              ORDER BY i.created_at DESC",
         )?;
@@ -24,7 +24,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT i.id, i.name, i.minecraft_version, i.loader, i.loader_version,
                     i.created_at, i.root_path, i.icon, i.last_played, i.total_play_seconds,
-                    i.modpack_version_label
+                    i.modpack_version_label, i.modpack_project_uid
              FROM instances i
              WHERE i.id = ?1",
         )?;
@@ -76,9 +76,23 @@ impl Database {
         Ok(())
     }
 
+    /// Switches the instance's loader outright (e.g. Forge -> NeoForge).
+    /// Used by the modpack installer when the pack archive declares a
+    /// different loader than the instance was created with — launching a
+    /// NeoForge pack under Forge leaves every NeoForge jar unregistered and
+    /// the game fails on "missing" dependencies that are all on disk.
+    pub fn set_instance_loader(&self, id: &str, loader: ModLoader) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instances SET loader = ?2 WHERE id = ?1",
+            params![id, loader_to_str(loader)],
+        )?;
+        Ok(())
+    }
+
     /// Overwrites the instance's pinned loader build (e.g. `"47.4.14"`).
     /// `None` clears the pin, reverting to whatever the loader's own
-    /// "recommended" build resolves to at the next launch — see
+    /// "recommended" build resolves to at the next launch - see
     /// `launch::forge::resolve_version`.
     pub fn set_instance_loader_version(
         &self,
@@ -92,14 +106,59 @@ impl Database {
         )?;
         Ok(())
     }
-
     /// Records the modpack's own version/filename label at import time, for
-    /// display only — see `instances::install_modpack`.
+    /// display only - see `instances::install_modpack`.
     pub fn set_modpack_version_label(&self, id: &str, label: Option<&str>) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
             "UPDATE instances SET modpack_version_label = ?2 WHERE id = ?1",
             params![id, label],
+        )?;
+        Ok(())
+    }
+
+    /// One cached loader-version row (see `loader_meta`).
+    pub fn get_loader_meta(&self, loader: &str, mc: &str) -> Result<Option<LoaderMetaRow>, DbError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT latest, recommended, fetched_at FROM loader_meta_cache WHERE loader = ?1 AND mc = ?2",
+        )?;
+        let mut rows = stmt.query(params![loader, mc])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(LoaderMetaRow {
+                latest: row.get(0)?,
+                recommended: row.get(1)?,
+                fetched_at: row.get::<_, i64>(2)? as u64,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn set_loader_meta(
+        &self,
+        loader: &str,
+        mc: &str,
+        latest: Option<&str>,
+        recommended: Option<&str>,
+        fetched_at: u64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO loader_meta_cache (loader, mc, latest, recommended, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![loader, mc, latest, recommended, fetched_at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records which modpack project this instance was installed from, so
+    /// the instance can offer the pack's other versions for in-place
+    /// switching. `None` clears it (a manually-created instance has none).
+    pub fn set_modpack_project_uid(&self, id: &str, uid: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instances SET modpack_project_uid = ?2 WHERE id = ?1",
+            params![id, uid],
         )?;
         Ok(())
     }
@@ -170,22 +229,30 @@ impl Database {
         Ok(())
     }
 
-    /// Copies all tracked mod rows from one instance to another, rewriting the
-    /// stored absolute file paths from the old instance root to the new one.
-    pub fn duplicate_instance_mods(
+    /// Files are published first; the instance and all tracking become visible
+    /// together only after this transaction commits.
+    pub fn insert_duplicate_instance(
         &self,
-        from_id: &str,
-        to_id: &str,
-        old_root: &str,
-        new_root: &str,
+        source: &InstanceSummary,
+        instance: &InstanceSummary,
     ) -> Result<(), DbError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
-             SELECT ?2, mod_uid, mod_name, source, file_name, REPLACE(file_path, ?3, ?4), installed_at, icon_url
-             FROM instance_mods WHERE instance_id = ?1",
-            params![from_id, to_id, old_root, new_root],
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO instances (id, name, minecraft_version, loader, loader_version, root_path, created_at,
+                                    icon, modpack_version_label, modpack_project_uid, java_path, max_memory_mb, jvm_args)
+             SELECT ?2, ?3, minecraft_version, loader, loader_version, ?4, ?5,
+                    icon, modpack_version_label, modpack_project_uid, java_path, max_memory_mb, jvm_args
+             FROM instances WHERE id = ?1",
+            params![source.id, instance.id, instance.name, instance.root_path, instance.created_at as i64],
         )?;
+        tx.execute(
+            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
+             SELECT ?2, mod_uid, mod_name, source, file_name, ?4 || substr(file_path, length(?3) + 1), installed_at, icon_url
+             FROM instance_mods WHERE instance_id = ?1",
+            params![source.id, instance.id, source.root_path, instance.root_path],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -218,9 +285,10 @@ impl Database {
         file_path: &str,
         icon_url: Option<&str>,
     ) -> Result<InstalledMod, DbError> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
         let installed_at = super::now_unix() as i64;
-        conn.execute(
+        tx.execute(
             "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(instance_id, mod_uid) DO UPDATE SET
@@ -242,17 +310,14 @@ impl Database {
             ],
         )?;
 
-        let id = conn.last_insert_rowid();
-        Ok(InstalledMod {
-            id,
-            instance_id: instance_id.to_string(),
-            mod_uid: mod_uid.to_string(),
-            mod_name: mod_name.to_string(),
-            source,
-            file_name: file_name.to_string(),
-            installed_at: installed_at as u64,
-            icon_url: icon_url.map(str::to_string),
-        })
+        let installed = tx.query_row(
+            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url
+             FROM instance_mods WHERE instance_id = ?1 AND mod_uid = ?2",
+            params![instance_id, mod_uid],
+            map_installed_mod_row,
+        )?;
+        tx.commit()?;
+        Ok(installed)
     }
 
     /// Same upsert as `insert_instance_mod`, but for many mods in one
@@ -506,6 +571,13 @@ pub struct CachedContentMeta {
     pub mod_id: Option<String>,
 }
 
+/// One cached loader-version index row (see `loader_meta`).
+pub struct LoaderMetaRow {
+    pub latest: Option<String>,
+    pub recommended: Option<String>,
+    pub fetched_at: u64,
+}
+
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
     let loader_raw: String = row.get(3)?;
     let root_path: String = row.get(6)?;
@@ -522,6 +594,7 @@ fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
         last_played: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         total_play_seconds: row.get::<_, i64>(9)? as u64,
         modpack_version_label: row.get(10)?,
+        modpack_project_uid: row.get(11)?,
     })
 }
 
@@ -641,6 +714,7 @@ mod instance_db_tests {
             last_played: None,
             total_play_seconds: 0,
             modpack_version_label: None,
+            modpack_project_uid: None,
         }
     }
 
@@ -683,8 +757,10 @@ mod instance_db_tests {
 
         db.set_instance_loader_version("a", Some("47.4.14")).unwrap();
         db.set_modpack_version_label("a", Some("Ascendra-2.1.0")).unwrap();
+        db.set_instance_loader("a", ModLoader::NeoForge).unwrap();
 
         let got = db.get_instance("a").unwrap().unwrap();
+        assert_eq!(got.loader, ModLoader::NeoForge);
         assert_eq!(got.loader_version.as_deref(), Some("47.4.14"));
         assert_eq!(got.modpack_version_label.as_deref(), Some("Ascendra-2.1.0"));
         // Same values must survive the list query, which selects the columns
@@ -700,6 +776,31 @@ mod instance_db_tests {
         let cleared = db.get_instance("a").unwrap().unwrap();
         assert!(cleared.loader_version.is_none());
         assert!(cleared.modpack_version_label.is_none());
+    }
+
+    #[test]
+    fn loader_meta_cache_round_trip() {
+        let temp = TempDb::new("loader-meta");
+        let db = &temp.db;
+
+        assert!(db.get_loader_meta("neoforge", "1.21.1").unwrap().is_none());
+
+        db.set_loader_meta("neoforge", "1.21.1", Some("21.1.209"), None, 1000).unwrap();
+        let row = db.get_loader_meta("neoforge", "1.21.1").unwrap().expect("just wrote it");
+        assert_eq!(row.latest.as_deref(), Some("21.1.209"));
+        assert_eq!(row.recommended, None);
+        assert_eq!(row.fetched_at, 1000);
+
+        // A refresh overwrites in place (no duplicate-key error).
+        db.set_loader_meta("neoforge", "1.21.1", Some("21.1.210"), None, 2000).unwrap();
+        let row = db.get_loader_meta("neoforge", "1.21.1").unwrap().unwrap();
+        assert_eq!(row.latest.as_deref(), Some("21.1.210"));
+        assert_eq!(row.fetched_at, 2000);
+
+        // Different pairs are independent rows.
+        db.set_loader_meta("forge", "1.20.1", Some("47.4.0"), Some("47.2.0"), 3000).unwrap();
+        let row = db.get_loader_meta("forge", "1.20.1").unwrap().unwrap();
+        assert_eq!(row.recommended.as_deref(), Some("47.2.0"));
     }
 
     #[test]

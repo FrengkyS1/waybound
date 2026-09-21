@@ -152,7 +152,9 @@ pub(crate) async fn download_verified(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(dest, &bytes)?;
+    // Atomic so a killed launch-prep can never leave a half-written jar
+    // that then passes the cache-hit path (no hash) forever after.
+    crate::download::atomic_write(dest, &bytes).map_err(|e| LaunchError::Parse(e.to_string()))?;
     Ok(())
 }
 
@@ -171,6 +173,8 @@ struct PendingDownload {
     url: String,
     sha1: Option<String>,
     dest: PathBuf,
+    /// Per-library `extract.exclude` prefixes, for native jars only.
+    extract_exclude: Vec<String>,
 }
 
 /// Resolve which libraries apply to this platform and where each jar lives.
@@ -202,6 +206,11 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
                                 url: artifact.url.clone(),
                                 sha1: artifact.sha1.clone(),
                                 dest,
+                                extract_exclude: lib
+                                    .extract
+                                    .as_ref()
+                                    .map(|e| e.exclude.clone())
+                                    .unwrap_or_default(),
                             });
                         }
                     }
@@ -221,6 +230,11 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
                         url: artifact.url.clone(),
                         sha1: artifact.sha1.clone(),
                         dest: dest.clone(),
+                        extract_exclude: lib
+                            .extract
+                            .as_ref()
+                            .map(|e| e.exclude.clone())
+                            .unwrap_or_default(),
                     };
                     if is_native {
                         // Modern (1.19+) natives ship as classifier jars. They
@@ -251,6 +265,7 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
                     url,
                     sha1: None,
                     dest,
+                    extract_exclude: Vec::new(),
                 });
             }
         } else {
@@ -352,7 +367,7 @@ where
     let native_total = resolved.natives.len() as u64;
     for (i, pending) in resolved.natives.iter().enumerate() {
         download_verified(client, &pending.url, &pending.dest, pending.sha1.as_deref(), false).await?;
-        extract_native(&pending.dest, &natives_dir)?;
+        extract_native(&pending.dest, &natives_dir, &pending.extract_exclude)?;
         report(ProgressUpdate::stage(
             "Preparing natives",
             (i + 1) as u64,
@@ -364,8 +379,9 @@ where
 }
 
 /// Extract the platform libraries (.dll/.so/.dylib) from a native jar,
-/// skipping metadata files.
-fn extract_native(jar: &Path, dest_dir: &Path) -> Result<(), LaunchError> {
+/// skipping metadata files plus any per-library `extract.exclude` prefixes
+/// from the version JSON.
+fn extract_native(jar: &Path, dest_dir: &Path, exclude: &[String]) -> Result<(), LaunchError> {
     let file = std::fs::File::open(jar)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LaunchError::Extract(format!("{}: {e}", jar.display())))?;
@@ -375,6 +391,9 @@ fn extract_native(jar: &Path, dest_dir: &Path) -> Result<(), LaunchError> {
             .map_err(|e| LaunchError::Extract(e.to_string()))?;
         let name = entry.name().to_string();
         if entry.is_dir() || name.starts_with("META-INF") {
+            continue;
+        }
+        if exclude.iter().any(|prefix| name.starts_with(prefix.as_str())) {
             continue;
         }
         let file_name = match Path::new(&name).file_name() {
@@ -543,11 +562,40 @@ fn copy_if_absent(src: &Path, dest: &Path) -> Result<(), LaunchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("waybound-test-{}-{label}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn extract_native_honors_exclude_prefixes() {
+        let dir = temp_dir("native-exclude");
+        let jar_path = dir.join("natives.jar");
+        {
+            let file = std::fs::File::create(&jar_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for (name, contents) in [
+                ("lib/native.dll", &b"dll"[..]),
+                ("META-INF/MANIFEST.MF", &b"manifest"[..]),
+                ("excluded/skipme.dll", &b"skip"[..]),
+            ] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(contents).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        extract_native(&jar_path, &out, &["excluded/".to_string()]).unwrap();
+        assert!(out.join("native.dll").is_file());
+        assert!(!out.join("MANIFEST.MF").exists());
+        assert!(!out.join("skipme.dll").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

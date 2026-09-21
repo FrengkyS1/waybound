@@ -12,6 +12,7 @@ let discover: () => Promise<unknown>;
 let library: () => Promise<unknown>;
 let HomePage: typeof HomePageComponent;
 
+let createdInputs: unknown[];
 beforeEach(() => {
   // HomePage reads the dismiss flag at mount; keep storage local to the test run.
   const storage: Record<string, string> = {};
@@ -22,8 +23,15 @@ beforeEach(() => {
     clear: () => { for (const key of Object.keys(storage)) delete storage[key]; },
   });
   library = () => Promise.resolve([saved]);
+  createdInputs = [];
   discover = () => Promise.reject(new Error("network unavailable"));
-  mockIPC((command) => {
+  mockIPC((command, args) => {
+    if (command === "create_instance") {
+      if (args && typeof args === "object" && "input" in args) {
+        createdInputs.push(args.input);
+      }
+      return { ...saved, id: "created-offline", name: "Offline Quilt" };
+    }
     if (command === "list_instances") return library();
     if (command === "list_minecraft_versions") return discover();
     if (command === "get_curseforge_status") return { configured: false };
@@ -64,5 +72,37 @@ describe("local library without version discovery", () => {
     library = () => Promise.reject(new Error("library database unreadable"));
     await showLibrary();
     await waitFor(() => expect(screen.getByText("library database unreadable")).toBeInTheDocument());
+  });
+
+  it("creates offline from a saved version without resolving a loader first", async () => {
+    await showLibrary();
+    await screen.findByText(saved.name);
+    fireEvent.click(screen.getByRole("button", { name: /Create$/ }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Offline Quilt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Quilt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create instance" }));
+    await waitFor(() => expect(createdInputs).toEqual([{ name: "Offline Quilt", minecraftVersion: "1.20.1", loader: "quilt" }]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("retries failed metadata in the open dialog while keeping available versions", async () => {
+    await showLibrary();
+    await screen.findByText(saved.name);
+    fireEvent.click(screen.getByRole("button", { name: /Create$/ }));
+    expect(screen.getByRole("button", { name: "1.20.1" })).toBeInTheDocument();
+    discover = () => Promise.resolve([{ version: "1.21.1" }]);
+    fireEvent.click(await screen.findByRole("button", { name: "Retry versions" }));
+    expect(await screen.findByRole("button", { name: "1.21.1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "1.20.1" })).toBeInTheDocument();
+  });
+
+  it("opens instance actions from Shift-F10", async () => {
+    await showLibrary();
+    const card = (await screen.findByText(saved.name)).closest('[role="button"]')!;
+    (card as HTMLElement).focus();
+    fireEvent.keyDown(card, { key: "F10", shiftKey: true });
+    expect(await screen.findByRole("menuitem", { name: "Open" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "End" });
+    expect(screen.getByRole("menuitem", { name: "Delete instance" })).toHaveFocus();
   });
 });

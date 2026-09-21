@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ModLoader } from "../instances/types";
 import { fileToIconDataUrl } from "./imageIcon";
 import { useEscapeKey } from "../../hooks/useEscapeKey";
+import { useModalFocus } from "../../hooks/useModalFocus";
 import styles from "./CreateInstanceDialog.module.css";
 
 const LOADERS: { value: ModLoader; label: string }[] = [
@@ -15,6 +16,8 @@ const LOADERS: { value: ModLoader; label: string }[] = [
 interface CreateInstanceDialogProps {
   versions: string[];
   versionsError: string | null;
+  onRetryVersions?: () => void;
+  error?: string | null;
   busy: boolean;
   onClose: () => void;
   onCreate: (input: {
@@ -28,6 +31,8 @@ interface CreateInstanceDialogProps {
 export function CreateInstanceDialog({
   versions,
   versionsError,
+  onRetryVersions,
+  error,
   busy,
   onClose,
   onCreate,
@@ -39,6 +44,7 @@ export function CreateInstanceDialog({
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEscapeKey(onClose, !busy);
+  const modalRef = useModalFocus();
 
   async function handlePickImage(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -67,6 +73,8 @@ export function CreateInstanceDialog({
     >
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="create-instance-title"
@@ -81,6 +89,7 @@ export function CreateInstanceDialog({
             Browse afterward.
           </p>
         </header>
+        {error && <p className={styles.hint} role="alert">{error}</p>}
 
         <form
           className={styles.form}
@@ -135,10 +144,15 @@ export function CreateInstanceDialog({
 
           <fieldset className={styles.fieldset}>
             <legend className={styles.label}>Minecraft version</legend>
+            {versionsError && (
+              <p className={styles.hint} role="alert">
+                {versionsError} {onRetryVersions && <button type="button" onClick={onRetryVersions}>Retry versions</button>}
+              </p>
+            )}
             <div className={styles.versionList}>
-              {versions.length === 0 && (
-                <p className={styles.hint} role={versionsError ? "alert" : "status"}>
-                  {versionsError ?? "Loading versions…"}
+              {versions.length === 0 && !versionsError && (
+                <p className={styles.hint} role="status">
+                  Loading versions…
                 </p>
               )}
               {versions.map((version) => (

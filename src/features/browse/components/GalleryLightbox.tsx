@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { GalleryItem } from "../detailTypes";
 import { useEscapeKey } from "../../../hooks/useEscapeKey";
+import { useModalFocus } from "../../../hooks/useModalFocus";
 import styles from "./GalleryLightbox.module.css";
 
 interface GalleryLightboxProps {
@@ -26,6 +27,7 @@ export function GalleryLightbox({ items, initialIndex, onClose }: GalleryLightbo
   const item = items[index];
 
   useEscapeKey(onClose);
+  const modalRef = useModalFocus();
 
   function step(direction: 1 | -1) {
     setIndex((i) => (i + direction + items.length) % items.length);
@@ -70,6 +72,8 @@ export function GalleryLightbox({ items, initialIndex, onClose }: GalleryLightbo
     <div className={styles.backdrop} role="presentation" onClick={onClose}>
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={item.title ?? "Screenshot"}

@@ -260,3 +260,18 @@ describe("pending missing-mod entries (describeMissingMods)", () => {
     expect(store.getState().installs).toEqual([]);
   });
 });
+
+describe("dockMinimized", () => {
+  it("starts expanded and toggles without touching the backend", async () => {
+    const { store, backendCalls } = await loadStore([]);
+    expect(store.getState().dockMinimized).toBe(false);
+
+    store.getState().setDockMinimized(true);
+    expect(store.getState().dockMinimized).toBe(true);
+
+    store.getState().setDockMinimized(false);
+    expect(store.getState().dockMinimized).toBe(false);
+
+    expect(backendCalls()).toEqual([]);
+  });
+});

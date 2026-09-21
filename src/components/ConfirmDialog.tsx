@@ -1,4 +1,5 @@
 import { useEscapeKey } from "../hooks/useEscapeKey";
+import { useModalFocus } from "../hooks/useModalFocus";
 import styles from "./ConfirmDialog.module.css";
 
 interface ConfirmDialogProps {
@@ -21,6 +22,7 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   useEscapeKey(onCancel);
+  const modalRef = useModalFocus();
 
   return (
     <div
@@ -30,6 +32,8 @@ export function ConfirmDialog({
     >
       <div
         className={styles.dialog}
+        ref={modalRef}
+        tabIndex={-1}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="confirm-title"

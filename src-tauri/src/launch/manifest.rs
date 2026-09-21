@@ -20,6 +20,11 @@ pub struct VersionManifest {
 pub struct ManifestVersion {
     pub id: String,
     pub url: String,
+    /// Mojang's release channel ("release", "snapshot", "old_beta"...).
+    /// Recorded for future version-list filtering; resolution is always by
+    /// exact id, so it gates nothing today.
+    #[serde(default, rename = "type")]
+    pub version_type: Option<String>,
 }
 
 impl VersionManifest {
@@ -103,6 +108,16 @@ pub struct Library {
     /// OS -> classifier key for legacy natives (<=1.18).
     #[serde(default)]
     pub natives: Option<std::collections::HashMap<String, String>>,
+    /// Extraction exclusions for native jars (path prefixes, e.g.
+    /// `["META-INF/"]`). Honored on top of the built-in META-INF skip.
+    #[serde(default)]
+    pub extract: Option<ExtractRules>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ExtractRules {
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

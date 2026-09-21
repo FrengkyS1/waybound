@@ -79,6 +79,29 @@ pub fn select_at_least(runtimes: &[JavaRuntime], required_major: u32) -> Option<
         .cloned()
 }
 
+/// The Java major a Minecraft version needs, independent of any version-JSON
+/// `javaVersion` block — same table every launcher (including Prism) applies:
+/// 1.17+ moved to 17, 1.20.5+ (and everything after, including the year-based
+/// scheme) to 21, everything earlier stays on 8. Used when the version JSON
+/// carries no `javaVersion` (older versions) instead of assuming 8, which
+/// silently launched 1.17–1.20.4 on a Java 8 and died with no useful error.
+pub fn required_java_major(mc_version: &str) -> u32 {
+    let mut nums = mc_version.split('.').filter_map(|p| p.parse::<u32>().ok());
+    let (major, minor, patch) =
+        (nums.next().unwrap_or(0), nums.next().unwrap_or(0), nums.next().unwrap_or(0));
+    if major > 1 || (major == 1 && (minor > 20 || (minor == 20 && patch >= 5))) {
+        21
+    } else if major == 1 && minor >= 17 {
+        17
+    } else if major == 1 {
+        8
+    } else {
+        // Unparseable version — newest requirement is the safe default (it
+        // triggers a download prompt rather than a doomed launch on Java 8).
+        21
+    }
+}
+
 /// Probe a single Java executable path for its major version.
 pub fn probe_major(path: &str) -> Option<u32> {
     probe_java(Path::new(path)).map(|r| r.major_version)
@@ -213,7 +236,7 @@ fn parse_major_version(banner: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_major_version;
+    use super::{parse_major_version, required_java_major};
 
     #[test]
     fn parses_legacy_and_modern() {
@@ -226,5 +249,17 @@ mod tests {
             Some(17)
         );
         assert_eq!(parse_major_version("openjdk version \"21\" 2023"), Some(21));
+    }
+
+    #[test]
+    fn java_requirements_follow_the_loader_table() {
+        assert_eq!(required_java_major("1.12.2"), 8);
+        assert_eq!(required_java_major("1.16.5"), 8);
+        assert_eq!(required_java_major("1.17"), 17);
+        assert_eq!(required_java_major("1.20.4"), 17);
+        assert_eq!(required_java_major("1.20.5"), 21);
+        assert_eq!(required_java_major("1.21.1"), 21);
+        assert_eq!(required_java_major("26.2"), 21);
+        assert_eq!(required_java_major("garbage"), 21);
     }
 }

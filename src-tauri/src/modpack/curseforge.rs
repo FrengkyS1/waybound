@@ -100,6 +100,13 @@ struct PackManifestEntry {
     filename: String,
     url: String,
     sha1: Option<String>,
+    /// From the manifest's `required` flag. Optional files install like
+    /// everything else (what the author shipped is what lands — Prism
+    /// parity), but the flag is recorded so later flows can tell "pack
+    /// core" from "pack extra". Old sidecars predate the field and read
+    /// back as required.
+    #[serde(default = "default_true")]
+    required: bool,
 }
 
 const PACK_MANIFEST_FILENAME: &str = ".curseforge-pack-manifest.json";
@@ -296,6 +303,28 @@ pub struct CurseForgeManifest {
     pub files: Vec<CurseForgeManifestFile>,
     #[serde(default)]
     overrides: String,
+    /// The pack's own `minecraft` section — the ONLY place a CurseForge pack
+    /// declares its loader (`modLoaders[].id`, e.g. `"neoforge-21.1.172"`).
+    /// The per-file `projectID`/`fileID` list below carries no loader signal
+    /// (pack zips are loader-agnostic archives), so without this the
+    /// installer has to guess the loader from Browse categories and gets
+    /// NeoForge packs wrong (see `declared_loader_from_bytes`).
+    #[serde(default)]
+    pub minecraft: Option<CfManifestMinecraft>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CfManifestMinecraft {
+    #[serde(default, rename = "modLoaders")]
+    pub mod_loaders: Vec<CfManifestModLoader>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CfManifestModLoader {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,6 +339,34 @@ pub struct CurseForgeManifestFile {
 
 fn default_true() -> bool {
     true
+}
+
+/// Writes a downloaded pack file atomically (temp + rename, so a crash or
+/// kill can never leave a half-written jar behind) after checking its sha1
+/// when the resolver reported one. A mismatch returns Err so the caller
+/// routes the file down the normal skip → Modrinth-substitution → manual
+/// path instead of installing corrupt bytes.
+fn place_verified_file(
+    dest: &std::path::Path,
+    filename: &str,
+    data: &[u8],
+    sha1: Option<&str>,
+) -> Result<(), ModpackError> {
+    if let Some(expected) = sha1.filter(|s| !s.is_empty()) {
+        use sha1::Digest;
+        let actual = hex::encode(sha1::Sha1::digest(data));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(crate::download::DownloadError::HashMismatch("sha1".to_string()).into());
+        }
+    }
+    crate::download::atomic_write(&safe_join(dest, filename)?, data)?;
+    Ok(())
+}
+
+/// Manifest file id -> required flag (absent ids read as required, matching
+/// the manifest struct's own default).
+fn manifest_required_map(files: &[CurseForgeManifestFile]) -> std::collections::HashMap<u32, bool> {
+    files.iter().map(|f| (f.file_id, f.required)).collect()
 }
 
 pub async fn import_curseforge_modpack_zip(
@@ -340,12 +397,17 @@ pub async fn import_curseforge_modpack_zip(
 
     // Same concurrency fix as the Modrinth importer: this used to resolve and
     // download each mod strictly one at a time (three sequential round trips
-    // per entry — download URL, download, then filename), which serializes
+    // per entry - download URL, download, then filename), which serializes
     // to minutes of pure network wait for a few-hundred-mod pack.
+    //
+    // Optional (`required: false`) files install like everything else — the
+    // manifest lists what the author shipped, and dropping optionals made
+    // installs incomplete versus Prism and the preview (which surfaces the
+    // flag). The flag travels into the sidecar instead of gating anything.
+    let required_by_file_id = manifest_required_map(&manifest.files);
     let jobs: Vec<(u32, u32)> = manifest
         .files
         .iter()
-        .filter(|f| f.required)
         .map(|f| (f.project_id, f.file_id))
         .collect();
 
@@ -497,8 +559,13 @@ pub async fn import_curseforge_modpack_zip(
         match download_bytes_with_retry(client, url, cancel).await {
             Ok(data) => {
                 let dest = dest_dir_for(filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
-                std::fs::write(safe_join(&dest, filename)?, data)?;
-                Ok((None, filename.clone()))
+                // A corrupt download (or a hash mismatch) joins the skip
+                // path below — substitution, then manual — like any other
+                // failed file, rather than failing the whole pack.
+                match place_verified_file(&dest, filename, &data, sha1.as_deref()) {
+                    Ok(()) => Ok((None, filename.clone())),
+                    Err(_) => Ok((Some((*project_id, file_id, sha1.clone())), filename.clone())),
+                }
             }
             Err(crate::download::DownloadError::Cancelled) => {
                 Err(ModpackError::from(crate::download::DownloadError::Cancelled))
@@ -571,8 +638,12 @@ pub async fn import_curseforge_modpack_zip(
         }
         match download_bytes_with_retry(client, &download.url, cancel).await {
             Ok(data) => {
+                if crate::download::verify_hashes(&data, &download.hashes).is_err() {
+                    still_skipped.push((*project_id, *file_id, filename.clone(), sha1.clone()));
+                    continue;
+                }
                 let dest = dest_dir_for(&download.filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
-                std::fs::write(safe_join(&dest, &download.filename)?, data)?;
+                crate::download::atomic_write(&safe_join(&dest, &download.filename)?, &data)?;
                 files_installed += 1;
                 substituted.push(name.clone());
             }
@@ -677,6 +748,7 @@ pub async fn import_curseforge_modpack_zip(
                 filename: filename.clone(),
                 url,
                 sha1: sha1.clone(),
+                required: required_by_file_id.get(file_id).copied().unwrap_or(true),
             }
         })
         // `still_skipped` and `missing_mods` were built by mapping over the
@@ -691,6 +763,7 @@ pub async fn import_curseforge_modpack_zip(
                 filename: filename.clone(),
                 url: mm.url.clone(),
                 sha1: sha1.clone(),
+                required: required_by_file_id.get(file_id).copied().unwrap_or(true),
             }
         }))
         .collect();
@@ -751,7 +824,7 @@ fn extract_overrides(
         }
         let mut buffer = Vec::new();
         entry.read_to_end(&mut buffer)?;
-        std::fs::write(&dest, buffer)?;
+        crate::download::atomic_write(&dest, &buffer)?;
         applied += 1;
     }
 
@@ -794,6 +867,7 @@ mod pack_reconciliation_tests {
             filename: filename.to_string(),
             url: format!("https://www.curseforge.com/minecraft/mc-mods/test/download/{file_id}"),
             sha1: None,
+            required: true,
         }
     }
 
@@ -806,6 +880,35 @@ mod pack_reconciliation_tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].file_id, 10);
         assert_eq!(loaded[1].filename, "b.jar");
+    }
+
+    #[test]
+    fn old_sidecar_without_required_reads_back_as_required() {
+        // Sidecars written before the `required` field existed must still
+        // parse (as required), or an update would lose all reconciliation
+        // history the moment it loads them.
+        let dir = temp_instance_dir("legacy-sidecar");
+        let legacy = r#"[{"project_id":1,"file_id":10,"name":"a","filename":"a.jar","url":"https://example.com","sha1":null}]"#;
+        std::fs::write(dir.join(".curseforge-pack-manifest.json"), legacy).unwrap();
+        let loaded = load_pack_manifest(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].required);
+    }
+
+    #[test]
+    fn required_map_honors_explicit_optional() {
+        use super::{manifest_required_map, CurseForgeManifestFile};
+        // Serde struct has no public constructor in tests; parse like the
+        // importer does.
+        let files: Vec<CurseForgeManifestFile> = serde_json::from_value(serde_json::json!([
+            {"projectID": 1, "fileID": 10},
+            {"projectID": 2, "fileID": 20, "required": false},
+        ]))
+        .unwrap();
+        let map = manifest_required_map(&files);
+        assert_eq!(map.get(&10), Some(&true));
+        assert_eq!(map.get(&20), Some(&false));
+        assert_eq!(map.get(&999), None);
     }
 
     #[test]

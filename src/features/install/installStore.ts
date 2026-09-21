@@ -3,6 +3,8 @@ import { create } from "zustand";
 
 import {
   cancelInstall,
+  pauseInstall,
+  resumeInstall,
   dismissMissingMod as dismissMissingModApi,
   fetchPendingMissingMods,
   installMod,
@@ -32,6 +34,11 @@ export interface InstallEntry {
   message?: string;
   error?: string;
   instanceId?: string;
+  paused?: boolean;
+  controlPending?: boolean;
+  controlError?: string;
+  progressSample?: { current: number; total: number; time: number };
+  etaSeconds?: number;
   /** File-count progress, when known (modpack installs report this). */
   current?: number;
   total?: number;
@@ -82,11 +89,15 @@ interface InstallStore {
   notifications: ModNotification[];
   /** Bumped when an install finishes, so the instance list can refresh. */
   refreshTick: number;
+  /** Collapses the bottom-right dock to a peek tab (session-only). */
+  dockMinimized: boolean;
+  setDockMinimized: (minimized: boolean) => void;
   dismissNotification: (id: string) => void;
   /** Start an install in the background — the UI is never blocked. */
   startInstall: (name: string, input: InstallModInput) => void;
   /** Signals the backend to stop at its next chunk/file boundary. */
   cancel: (id: string) => void;
+  setPaused: (id: string, paused: boolean) => void;
   dismiss: (id: string) => void;
   /** Opens the in-app browser at the first missing mod and starts watching
    * Downloads for all of them. */
@@ -105,6 +116,9 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
   installs: [],
   notifications: [],
   refreshTick: 0,
+  dockMinimized: false,
+
+  setDockMinimized: (minimized) => set({ dockMinimized: minimized }),
 
   dismissNotification: (id) =>
     set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
@@ -154,7 +168,24 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
     })();
   },
 
-  cancel: (id) => void cancelInstall(id).catch(() => {}),
+  cancel: (id) => {
+    void cancelInstall(id).catch((error) => set((s) => ({
+      installs: s.installs.map((e) => e.id === id ? { ...e, controlError: String(error) } : e),
+    })));
+  },
+
+  setPaused: (id, paused) => {
+    const entry = get().installs.find((e) => e.id === id);
+    if (!entry || entry.status !== "installing" || entry.controlPending) return;
+    set((s) => ({ installs: s.installs.map((e) => e.id === id ? { ...e, controlPending: true, controlError: undefined } : e) }));
+    void (paused ? pauseInstall(id) : resumeInstall(id)).then(() => {
+      set((s) => ({ installs: s.installs.map((e) => e.id === id && e.status === "installing"
+        ? { ...e, paused, controlPending: false, progressSample: undefined, etaSeconds: undefined } : e) }));
+    }).catch((error) => {
+      set((s) => ({ installs: s.installs.map((e) => e.id === id
+        ? { ...e, controlPending: false, controlError: String(error) } : e) }));
+    });
+  },
 
   // Closing an entry that's still nagging about missing mods must persist
   // that the same way "Not installing this" does — otherwise the card is
@@ -242,9 +273,18 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
 void listen<InstallProgressEvent>("install://progress", (event) => {
   const { installId, current, total, currentName } = event.payload;
   useInstallStore.setState((s) => ({
-    installs: s.installs.map((e) =>
-      e.id === installId ? { ...e, current, total, currentName } : e,
-    ),
+    installs: s.installs.map((e) => {
+      if (e.id !== installId || e.status !== "installing") return e;
+      const time = Date.now();
+      const previous = e.progressSample;
+      const sample = !previous || previous.total !== total || current < previous.current
+        ? { current, total, time } : previous;
+      const completed = current - sample.current;
+      const elapsed = (time - sample.time) / 1000;
+      const etaSeconds = !e.paused && completed > 0 && elapsed >= 1 && total > current
+        ? Math.ceil((total - current) * elapsed / completed) : undefined;
+      return { ...e, current, total, currentName, progressSample: e.paused ? undefined : sample, etaSeconds };
+    }),
     // HomePage's mod-count badge only watches this counter — without
     // bumping it here too, a modpack install (which can take minutes) left
     // the count frozen at its pre-install value until the whole thing

@@ -10,7 +10,7 @@ pub mod forge;
 pub mod java;
 pub mod java_runtime;
 pub mod manifest;
-
+pub mod offline;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -22,9 +22,7 @@ use crate::auth::Account;
 use crate::dto::ModLoader;
 
 use files::GamePaths;
-use manifest::{
-    rules_allow, ArgValue, Argument, VersionJson, VersionManifest, VERSION_MANIFEST_URL,
-};
+use manifest::{rules_allow, ArgValue, Argument, VersionJson};
 
 const LAUNCHER_NAME: &str = "Waybound";
 const LAUNCHER_VERSION: &str = "0.1.0";
@@ -45,6 +43,8 @@ pub enum LaunchError {
     Extract(String),
     #[error("Minecraft {version} needs Java {required}, but no matching Java runtime was found. Install a JDK (Adoptium Temurin {required}) or set a Java path in Settings.")]
     NoJava { version: String, required: u32 },
+    #[error("The Java at '{path}' is version {found}, but Minecraft {version} needs Java {required}. Pick a newer Java in Settings or clear the override.")]
+    JavaTooOld { path: String, version: String, found: u32, required: u32 },
     #[error("Minecraft version '{0}' was not found in the Mojang manifest")]
     VersionNotFound(String),
     #[error("launching {0} instances is not supported yet — use Vanilla or Fabric")]
@@ -99,30 +99,12 @@ pub async fn prepare_launch<F>(
 where
     F: Fn(ProgressUpdate),
 {
-    let paths = GamePaths::new(game_root);
+    let paths = GamePaths::new(game_root.clone());
     std::fs::create_dir_all(&instance_dir)?;
 
     report(ProgressUpdate::stage("Resolving version", 0, 1));
 
-    // Vanilla base version JSON.
-    let manifest: VersionManifest = client
-        .get(VERSION_MANIFEST_URL)
-        .send()
-        .await?
-        .json()
-        .await
-        .map_err(|e| LaunchError::Parse(format!("version manifest: {e}")))?;
-    let entry = manifest
-        .find(game_version)
-        .ok_or_else(|| LaunchError::VersionNotFound(game_version.to_string()))?;
-
-    let vanilla: VersionJson = client
-        .get(&entry.url)
-        .send()
-        .await?
-        .json()
-        .await
-        .map_err(|e| LaunchError::Parse(format!("version json: {e}")))?;
+    let vanilla = offline::vanilla_version(client, &game_root, game_version).await?;
 
     // Resolve Java up front: loaders inherit vanilla's Java requirement, and
     // Forge/NeoForge processors need a JVM to run during install.
@@ -130,7 +112,7 @@ where
         .java_version
         .as_ref()
         .and_then(|j| j.major_version)
-        .unwrap_or(8);
+        .unwrap_or_else(|| java::required_java_major(game_version));
     let component = vanilla
         .java_version
         .as_ref()
@@ -149,29 +131,22 @@ where
     // Layer the loader on top when requested.
     let version = match loader {
         ModLoader::Vanilla => vanilla,
-        ModLoader::Fabric => {
-            report(ProgressUpdate::stage("Resolving Fabric", 0, 1));
-            let lv = match loader_version {
-                Some(v) if !v.trim().is_empty() => v,
-                _ => fabric::latest_loader_version(client, game_version).await?,
-            };
-            let profile = fabric::fetch_profile(client, game_version, &lv).await?;
+        ModLoader::Fabric | ModLoader::Quilt => {
+            report(ProgressUpdate::stage("Resolving loader", 0, 1));
+            let profile = fabric::cached_profile(client, &game_root, game_version, loader_version, loader == ModLoader::Quilt).await?;
             let mut merged = fabric::merge_onto_parent(profile, vanilla);
             // Keep vanilla's id so client jar / natives / assets paths line up.
             merged.id = game_version.to_string();
             merged
         }
         ModLoader::Forge | ModLoader::NeoForge => {
-            let lv = forge::resolve_version(client, loader, game_version, loader_version).await?;
+            let lv = forge::resolve_cached_version(client, &paths, loader, game_version, loader_version).await?;
             let mut merged = forge::prepare(
                 client, &paths, loader, game_version, &lv, &vanilla, &java_path, report,
             )
             .await?;
             merged.id = game_version.to_string();
             merged
-        }
-        ModLoader::Quilt => {
-            return Err(LaunchError::UnsupportedLoader("Quilt".to_string()));
         }
     };
 
@@ -325,9 +300,25 @@ where
         let major = tokio::task::spawn_blocking(move || java::probe_major(&probe_path))
             .await
             .ok()
-            .flatten()
-            .unwrap_or(required_major);
-        return Ok((explicit, major));
+            .flatten();
+        match major {
+            // An explicit override that probes older than required used to
+            // be trusted blindly and die in the game with no useful error —
+            // fail here instead, naming the fix.
+            Some(found) if found < required_major => {
+                return Err(LaunchError::JavaTooOld {
+                    path: explicit,
+                    version: game_version.to_string(),
+                    found,
+                    required: required_major,
+                })
+            }
+            Some(found) => return Ok((explicit, found)),
+            // Unprobable override (deleted JDK, typo): fall back to the
+            // requirement so auto-resolution still finds something, rather
+            // than launching a broken path.
+            None => return Ok((explicit, required_major)),
+        }
     }
 
     let runtimes = tokio::task::spawn_blocking(java::detect_java_runtimes)
@@ -459,6 +450,7 @@ fn substitute(input: &str, vars: &HashMap<&str, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifest::{VersionManifest, VERSION_MANIFEST_URL};
 
     #[test]
     fn substitutes_known_tokens() {
@@ -469,6 +461,47 @@ mod tests {
             "--username Steve"
         );
         assert_eq!(substitute("${unknown}", &vars), "${unknown}");
+    }
+
+    #[tokio::test]
+    async fn prepares_cached_instance_with_network_unavailable() {
+        use sha1::{Digest, Sha1};
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("game");
+        let instance = scratch.path().join("instance");
+        let client_bytes = b"client fixture, not executable";
+        let asset_bytes = b"asset fixture";
+        let asset_hash = hex::encode(Sha1::digest(asset_bytes));
+        let index = serde_json::to_vec(&serde_json::json!({
+            "objects": {"example.txt": {"hash": asset_hash}}, "map_to_resources": true
+        })).unwrap();
+        let metadata = serde_json::json!({
+            "id": "cached", "mainClass": "net.minecraft.client.main.Main",
+            "downloads": {"client": {"url": "https://example.invalid/client", "sha1": hex::encode(Sha1::digest(client_bytes))}},
+            "assetIndex": {"id": "cached", "url": "https://example.invalid/index", "sha1": hex::encode(Sha1::digest(&index))},
+            "libraries": [],
+            "minecraftArguments": "--gameDir ${game_directory} --username ${auth_player_name}"
+        });
+        offline::put_bytes(&root, "versions/cached.json", &serde_json::to_vec(&metadata).unwrap()).unwrap();
+        for (path, bytes) in [
+            (root.join("versions/cached/cached.jar"), client_bytes.as_slice()),
+            (root.join("assets/indexes/cached.json"), index.as_slice()),
+            (root.join("assets/objects").join(&asset_hash[..2]).join(&asset_hash), asset_bytes.as_slice()),
+        ] {
+            offline::write_atomic(&path, bytes).unwrap();
+        }
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .timeout(std::time::Duration::from_secs(1)).build().unwrap();
+        let account = Account { uuid: "00000000000000000000000000000000".into(), username: "Fixture".into(),
+            minecraft_token: "synthetic".into(), msa_refresh_token: String::new(), expires_at: 0 };
+        let prepared = prepare_launch(&client, root, instance.clone(), "cached", ModLoader::Vanilla,
+            None, &account, Some("java".into()), 1024, vec![], &|_| {}).await.unwrap();
+        assert_eq!(prepared.working_dir, instance);
+        assert!(prepared.args.iter().any(|arg| arg == "net.minecraft.client.main.Main"));
+        assert!(prepared.args.windows(2).any(|args| args == ["--username", "Fixture"]));
+        assert_eq!(std::fs::read(instance.join("resources/example.txt")).unwrap(), asset_bytes);
+        // Preparation only: fixture client bytes are intentionally not runnable.
     }
 
     /// Network test: parse real Mojang JSON for a modern (structured arguments)
@@ -516,6 +549,11 @@ mod tests {
     #[ignore]
     async fn merges_real_fabric_profile() {
         let client = crate::download::http_client().unwrap();
+        let game_root = std::env::temp_dir().join(format!(
+            "waybound-launch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&game_root);
         let manifest: VersionManifest = client
             .get(VERSION_MANIFEST_URL)
             .send()
@@ -529,7 +567,14 @@ mod tests {
             client.get(&entry.url).send().await.unwrap().json().await.unwrap();
 
         let lv = fabric::latest_loader_version(&client, "1.20.1").await.unwrap();
-        let profile = fabric::fetch_profile(&client, "1.20.1", &lv).await.unwrap();
+        let profile: VersionJson = offline::fetch_json_cached(
+            &client,
+            &game_root,
+            &format!("fabric/1.20.1/{lv}.json"),
+            &fabric::profile_url("1.20.1", &lv),
+        )
+        .await
+        .unwrap();
         let merged = fabric::merge_onto_parent(profile, vanilla);
 
         // Fabric supplies its own launch entrypoint and keeps vanilla's assets.

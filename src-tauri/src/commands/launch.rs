@@ -33,7 +33,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// to launchable on the next start and lets a second copy be launched
 /// concurrently onto the same world files. This file plus [`is_pid_alive`] is
 /// what `get_running_instances` checks on startup to rebuild that state.
-const PID_FILE_NAME: &str = ".waybound-pid";
+pub(crate) const PID_FILE_NAME: &str = ".waybound-pid";
 
 /// Where a run's captured stdout/stderr is persisted, relative to the
 /// instance directory. Deliberately NOT `logs/latest.log`: the game's own
@@ -296,8 +296,8 @@ pub fn add_play_time(
         .map_err(|e| e.to_string())
 }
 
-/// Ensure the stored account has a usable Minecraft token, silently refreshing
-/// via the Microsoft refresh token when it has expired.
+/// Refresh only persisted authenticated identities. Outages preserve the saved
+/// account; invalid credentials and ownership denials still require sign-in.
 async fn ensure_account(
     state: &AppState,
     client: &reqwest::Client,
@@ -306,24 +306,84 @@ async fn ensure_account(
         .config
         .account()
         .ok_or_else(|| "Sign in with your Microsoft account before playing.".to_string())?;
+    if !saved_identity_is_valid(&account) {
+        return Err("Sign in with an owned Minecraft: Java Edition account before playing.".into());
+    }
 
     if !account.is_token_expired() {
         return Ok(account);
     }
 
-    let (access, refresh, _exp) = refresh_msa_token(client, &account.msa_refresh_token)
-        .await
-        .map_err(|_| "Your session expired. Please sign in again.".to_string())?;
-
-    let fresh = complete_minecraft_login(client, &access, refresh)
-        .await
-        .map_err(|e| e.to_string())?;
+    let refresh = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let (access, refresh, _) = refresh_msa_token(client, &account.msa_refresh_token).await?;
+        complete_minecraft_login(client, &access, refresh).await
+    }).await;
+    let fresh = match refresh {
+        Ok(Ok(fresh)) => fresh,
+        Ok(Err(error)) if error.is_transient() => return Ok(account),
+        Err(_) => return Ok(account),
+        Ok(Err(error)) => return Err(format!("Sign in again before playing: {error}")),
+    };
 
     state
         .config
         .set_account(Some(fresh.clone()))
         .map_err(|e| e.to_string())?;
     Ok(fresh)
+}
+
+fn saved_identity_is_valid(account: &Account) -> bool {
+    account.uuid.len() == 32 && account.uuid.bytes().all(|b| b.is_ascii_hexdigit())
+        && !account.username.is_empty() && !account.minecraft_token.is_empty()
+        && !account.msa_refresh_token.is_empty() && account.expires_at > 0
+}
+
+/// Check the real profile immediately before spawning. A 401/403/404 is never
+/// treated as offline; only transport interruption, 429 and 5xx permit fallback.
+async fn revalidate_account(client: &reqwest::Client, account: &Account) -> Result<(), String> {
+    let response = client.get("https://api.minecraftservices.com/minecraft/profile")
+        .timeout(std::time::Duration::from_secs(8))
+        .bearer_auth(&account.minecraft_token).send().await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            if crate::auth::microsoft::AuthError::Network(error).is_transient() {
+                return Ok(());
+            }
+            return Err("Could not validate your account. Please retry sign-in.".into());
+        }
+    };
+    let status = response.status();
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err("Your Minecraft session is no longer valid. Sign in again before playing.".into());
+    }
+    #[derive(serde::Deserialize)]
+    struct Profile { id: String }
+    let profile: Profile = response.json().await
+        .map_err(|_| "Could not verify the Minecraft profile. Retry when the account service is available.".to_string())?;
+    if profile.id != account.uuid {
+        return Err("Minecraft account changed. Sign in again before playing.".into());
+    }
+    Ok(())
+}
+
+/// Whether a persisted PID marker describes a genuinely running game child.
+/// An unreadable or malformed marker fails closed: the caller must not allow
+/// a second Minecraft process onto the same world files based on nothing.
+pub(crate) fn instance_process_running(instance_root: &std::path::Path) -> Result<bool, String> {
+    let path = instance_root.join(PID_FILE_NAME);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let pid: u32 = raw.trim().parse().map_err(|_| {
+        format!("Corrupted launch marker in {}: delete the file before launching.", path.display())
+    })?;
+    Ok(is_pid_alive(pid))
 }
 
 /// Prepare all files for an instance and launch Minecraft. Emits
@@ -342,8 +402,9 @@ pub async fn launch_instance(
     instance_id: String,
 ) -> Result<(), String> {
     let task_app = app.clone();
+    let operation = crate::instances::operations::acquire(&instance_id)?;
     let task_instance_id = instance_id.clone();
-    let handle = tokio::spawn(async move { run_launch(task_app, task_instance_id).await });
+    let handle = tokio::spawn(async move { run_launch(task_app, task_instance_id, operation).await });
     let abort_handle = handle.abort_handle();
 
     state
@@ -384,7 +445,11 @@ pub fn cancel_launch(state: State<'_, AppState>, instance_id: String) -> Result<
     Ok(())
 }
 
-async fn run_launch(app: AppHandle, instance_id: String) -> Result<(), String> {
+async fn run_launch(
+    app: AppHandle,
+    instance_id: String,
+    operation: crate::instances::operations::OperationGuard,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let instance = state
         .db
@@ -450,6 +515,7 @@ async fn run_launch(app: AppHandle, instance_id: String) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
 
+    revalidate_account(&client, &account).await?;
     crate::activity::append_log(
         &format!(
             "Launching {} (Minecraft {}, Java {})",
@@ -508,6 +574,7 @@ async fn run_launch(app: AppHandle, instance_id: String) -> Result<(), String> {
     let exit_id = instance_id.clone();
     let exit_name = instance.name.clone();
     std::thread::spawn(move || {
+        let _operation = operation;
         let code = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.code(),

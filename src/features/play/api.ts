@@ -109,6 +109,32 @@ export async function readLaunchLog(instanceId: string): Promise<string[]> {
   return invoke<string[]>("read_launch_log", { instanceId });
 }
 
+export interface WrongLoaderFile {
+  fileName: string;
+  modName?: string;
+  detectedLoader: string;
+}
+
+export interface MissingDep {
+  fileName: string;
+  modName?: string;
+  depModId: string;
+  versionRange?: string;
+}
+
+export interface LaunchReadiness {
+  checkedFiles: number;
+  wrongLoader: WrongLoaderFile[];
+  missingDeps: MissingDep[];
+}
+
+/** Reads every enabled jar's own metadata and reports loader mismatches
+ * plus unsatisfied required deps. Advisory — empty lists don't guarantee
+ * the game starts, and a failed check never blocks launching. */
+export async function checkLaunchReadiness(instanceId: string): Promise<LaunchReadiness> {
+  return invoke<LaunchReadiness>("check_launch_readiness", { instanceId });
+}
+
 // ---- Event payloads ------------------------------------------------------
 
 export interface LaunchProgressEvent {

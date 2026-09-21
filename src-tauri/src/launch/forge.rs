@@ -89,6 +89,32 @@ pub async fn resolve_version(
     }
 }
 
+/// Unpinned instances reuse a prepared matching loader before consulting remote
+/// promotions. The inherited game version is checked exactly, not by prefix.
+pub async fn resolve_cached_version(
+    client: &Client, paths: &GamePaths, loader: ModLoader,
+    game_version: &str, requested: Option<String>,
+) -> Result<String, LaunchError> {
+    if let Some(version) = requested.filter(|v| !v.trim().is_empty()) { return Ok(version); }
+    let prefix = if loader == ModLoader::NeoForge { "neoforge-".to_string() } else { format!("forge-{game_version}-") };
+    let mut installed = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(paths.versions()) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let Some(version) = id.strip_prefix(&prefix) else { continue };
+            if !entry.path().join(".installed").is_file() { continue; }
+            let Ok(raw) = std::fs::read(entry.path().join(format!("{id}.json"))) else { continue };
+            let Ok(profile) = serde_json::from_slice::<VersionJson>(&raw) else { continue };
+            if profile.inherits_from.as_deref() == Some(game_version) {
+                installed.push(version.to_owned());
+            }
+        }
+    }
+    if let Some(version) = installed.into_iter().max_by_key(|v| version_key(v)) { return Ok(version); }
+    tokio::time::timeout(std::time::Duration::from_secs(8), resolve_version(client, loader, game_version, None))
+        .await.map_err(|_| LaunchError::Parse(format!("No installed loader metadata for Minecraft {game_version}. Connect to the internet to prepare it once.")))?
+}
+
 async fn fetch_forge_promotions(client: &Client) -> Result<Promotions, LaunchError> {
     client
         .get(FORGE_PROMOTIONS)
@@ -244,6 +270,9 @@ fn newer(a: &str, b: &str) -> bool {
 
 fn installer_url(loader: ModLoader, game_version: &str, loader_version: &str) -> String {
     match loader {
+        ModLoader::NeoForge if game_version == "1.20.1" => format!(
+            "{NEOFORGE_MAVEN}/net/neoforged/forge/{loader_version}/forge-{loader_version}-installer.jar"
+        ),
         ModLoader::NeoForge => format!(
             "{NEOFORGE_MAVEN}/net/neoforged/neoforge/{loader_version}/neoforge-{loader_version}-installer.jar"
         ),
@@ -286,24 +315,21 @@ where
         let raw = std::fs::read(&version_json_path)?;
         let profile: VersionJson = serde_json::from_slice(&raw)
             .map_err(|e| LaunchError::Parse(format!("cached loader version: {e}")))?;
+        if profile.inherits_from.as_deref() != Some(game_version) {
+            return Err(LaunchError::Parse(format!("Installed loader does not match Minecraft {game_version}")));
+        }
         return Ok(super::fabric::merge_onto_parent(profile, vanilla.clone()));
     }
 
     report(ProgressUpdate::stage("Downloading loader installer", 0, 1));
     std::fs::create_dir_all(&install_dir)?;
 
-    // Download the installer jar into memory.
+    // download_verified re-downloads only when the jar is absent or unreadable,
+    // recovering interrupted preparations without touching the live install.
     let url = installer_url(loader, game_version, loader_version);
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        return Err(LaunchError::Download {
-            url,
-            status: resp.status().as_u16(),
-        });
-    }
-    let installer_bytes = resp.bytes().await?.to_vec();
     let installer_path = install_dir.join("installer.jar");
-    std::fs::write(&installer_path, &installer_bytes)?;
+    download_verified(client, &url, &installer_path, None, false).await?;
+    let installer_bytes = std::fs::read(&installer_path)?;
 
     // Extract the two JSON descriptors.
     let install_profile: InstallProfile =
@@ -368,13 +394,9 @@ where
         .await
         .map_err(|e| LaunchError::Spawn(format!("processor task panicked: {e}")))??;
     }
-
-    // Persist the version profile and a completion marker.
-    std::fs::write(
-        &version_json_path,
-        serde_json::to_vec_pretty(&raw_version_json(&installer_bytes)?)
-            .map_err(|e| LaunchError::Parse(e.to_string()))?,
-    )?;
+    let raw = raw_version_json(&installer_bytes)?;
+    std::fs::write(&version_json_path, serde_json::to_vec_pretty(&raw)
+        .map_err(|e| LaunchError::Parse(e.to_string()))?)?;
     std::fs::write(&marker, b"ok")?;
 
     Ok(super::fabric::merge_onto_parent(version_profile, vanilla.clone()))

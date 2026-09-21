@@ -90,7 +90,7 @@ export function GlobalGameSettingsSection() {
             <button
               type="button"
               className={styles.saveBtn}
-              disabled={!options.customize || saving}
+              disabled={saving}
               onClick={() => void handleSave()}
             >
               {saving ? "Saving…" : "Save"}

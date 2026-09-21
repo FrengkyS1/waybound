@@ -4,21 +4,29 @@ mod config;
 mod db;
 mod download;
 mod dto;
+mod fingerprint;
+mod identify;
 mod identity;
+mod loader_meta;
 mod instances;
 mod launch;
 mod modpack;
 mod settings;
 mod sources;
 mod activity;
+mod transfer;
 
 use commands::{
-    apply_global_mc_options_to_all_instances, cancel_install, cancel_launch, clear_curseforge_api_key, create_instance,
+    detect_importable_launchers,
+    apply_global_mc_options_to_all_instances, cancel_install, cancel_launch, check_launch_readiness,
+    clear_curseforge_api_key, create_instance,
     add_play_time, delete_instance, dismiss_missing_mod, duplicate_instance, get_account, get_activity_logs, get_curseforge_status,
-    get_content_meta, get_latest_loader_version, get_mod_summary_for_content, list_instance_content, list_mod_configs,
+    get_content_meta, get_latest_loader_version, get_loader_version_info, get_mod_summary_for_content,
+    identify_mod_file, list_instance_content, list_mod_configs,
     read_config_file, remove_content_file, set_content_enabled, write_config_file,
     get_global_mc_options, get_instance_launch_config, get_instance_options, get_launch_settings,
-    get_mod_details, get_modpack_content, get_running_instances, get_version_changelog,
+    get_mod_details, get_modpack_content, get_modpack_detail_for_instance, get_running_instances,
+    get_version_changelog,
     import_curseforge_api_key_from_env_file, install_mod_to_instance, launch_instance,
     list_instance_mods, list_instances, list_java_runtimes, list_minecraft_versions,
     list_pending_missing_mods, logout, read_launch_log,
@@ -26,6 +34,7 @@ use commands::{
     save_instance_options, search_mods, set_curseforge_api_key, set_instance_icon,
     set_instance_launch_config, set_instance_loader_version, set_launch_settings, test_curseforge_api_key,
     test_curseforge_docker_env_key, update_mod_in_instance, watch_for_missing_mods, AppState,
+    import_instance, export_instance, pause_install, resume_install,
 };
 use config::ConfigStore;
 use db::Database;
@@ -147,6 +156,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             search_mods,
+            detect_importable_launchers,
             get_curseforge_status,
             set_curseforge_api_key,
             clear_curseforge_api_key,
@@ -160,6 +170,7 @@ pub fn run() {
             rename_instance,
             set_instance_icon,
             get_latest_loader_version,
+            get_loader_version_info,
             set_instance_loader_version,
             list_instance_content,
             get_content_meta,
@@ -173,11 +184,17 @@ pub fn run() {
             duplicate_instance,
             list_instance_mods,
             install_mod_to_instance,
+            import_instance,
+            export_instance,
+            pause_install,
+            resume_install,
             cancel_install,
             remove_mod_from_instance,
             list_minecraft_versions,
             get_mod_details,
             get_modpack_content,
+            get_modpack_detail_for_instance,
+            identify_mod_file,
             get_version_changelog,
             get_activity_logs,
             get_instance_options,
@@ -196,6 +213,7 @@ pub fn run() {
             add_play_time,
             launch_instance,
             cancel_launch,
+            check_launch_readiness,
             get_running_instances,
             read_launch_log,
             open_missing_mods_browser,

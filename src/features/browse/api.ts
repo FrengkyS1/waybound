@@ -23,6 +23,13 @@ export async function fetchModpackContent(
   });
 }
 
+/** The installed modpack's project detail (with its version list) for an
+ * instance, resolved from the pack uid recorded at import time. Rejects
+ * for instances with no recorded pack. */
+export async function fetchModpackDetailForInstance(instanceId: string): Promise<ModDetail> {
+  return invoke<ModDetail>("get_modpack_detail_for_instance", { instanceId });
+}
+
 export async function fetchVersionChangelog(
   summary: ModSummary,
   versionId: string,
@@ -48,6 +55,14 @@ export async function installMod(
 
 export async function cancelInstall(installId: string): Promise<void> {
   return invoke<void>("cancel_install", { installId });
+}
+
+export async function pauseInstall(installId: string): Promise<void> {
+  return invoke<void>("pause_install", { installId });
+}
+
+export async function resumeInstall(installId: string): Promise<void> {
+  return invoke<void>("resume_install", { installId });
 }
 
 export async function openMissingModsBrowser(url: string): Promise<void> {
