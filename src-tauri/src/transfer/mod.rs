@@ -68,7 +68,7 @@ pub(crate) async fn import_instance(
             if key.is_empty() && manifest.get("files").and_then(serde_json::Value::as_array).is_some_and(|f| !f.is_empty()) {
                 return Err("Configure a CurseForge API key in Settings before importing this ZIP, or import its already-installed CurseForge App folder offline.".into());
             }
-            let result = crate::modpack::import_curseforge_modpack_zip(&bytes, &game, &key, &state.modrinth, &metadata.minecraft, metadata.loader, cancel, report).await.map_err(|e| e.to_string())?;
+            let result = crate::modpack::import_curseforge_modpack_zip(&bytes, &game, &key, cancel, report).await.map_err(|e| e.to_string())?;
             if result.has_skipped { return Err(format!("Import was not published because some files need manual download. Import the completed CurseForge App instance folder instead. {}", result.message)); }
             version_label = result.version_label;
         } else {

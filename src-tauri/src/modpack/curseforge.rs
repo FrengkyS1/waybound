@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{ModpackError, ModpackImportResult};
 use crate::commands::content::DISABLED_SUFFIX;
 use crate::download::{download_bytes_with_retry, http_client, safe_join, CancelToken, DOWNLOAD_CONCURRENCY};
-use crate::dto::{ContentType, ModLoader, ModSearchQuery, SortIndex};
 use crate::sources::curseforge::CurseForgeClient;
-use crate::sources::modrinth::ModrinthClient;
 
 // CurseForge's CDN (the actual file bytes) isn't rate-limited the way
 // api.curseforge.com is, so downloads stay at the normal concurrency. Only
@@ -195,107 +193,6 @@ pub fn pending_missing_mods(instance_root: &Path) -> Vec<crate::dto::instance::M
         .collect()
 }
 
-/// Loose enough to match "Entity Culling Fabric/Forge" (CurseForge's title)
-/// against "EntityCulling" (Modrinth's), strict enough that two unrelated
-/// mods essentially never collide — punctuation/case/whitespace stripped,
-/// then one name must fully contain the other.
-fn normalize_mod_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn names_plausibly_match(a: &str, b: &str) -> bool {
-    let na = normalize_mod_name(a);
-    let nb = normalize_mod_name(b);
-    !na.is_empty() && !nb.is_empty() && (na.contains(&nb) || nb.contains(&na))
-}
-
-/// CurseForge titles routinely carry loader/platform decoration the base
-/// mod's Modrinth listing never has — "Entity Culling Fabric/Forge",
-/// "(ARCHIVE) Faster Random", "Better World Loading ([Neo]Forge)". Verified
-/// against Modrinth's search directly: sent as-is, every one of those
-/// returns zero hits; stripped down to "Entity Culling" / "Faster Random" /
-/// "Better World Loading", each finds the real project as the top result.
-/// Modrinth's search apparently doesn't do partial/fuzzy matching well
-/// against a query cluttered with extra tokens, so this strips parenthesized
-/// segments and any word that's purely loader names (plain or slash-joined).
-fn search_query_from_cf_name(name: &str) -> String {
-    let mut without_brackets = String::new();
-    let mut depth = 0i32;
-    for c in name.chars() {
-        match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = (depth - 1).max(0),
-            _ if depth == 0 => without_brackets.push(c),
-            _ => {}
-        }
-    }
-
-    const LOADER_WORDS: [&str; 4] = ["fabric", "forge", "neoforge", "quilt"];
-    let cleaned = without_brackets
-        .split_whitespace()
-        .filter(|word| {
-            let normalized = word.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_ascii_lowercase();
-            !normalized.split('/').all(|part| LOADER_WORDS.contains(&part))
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if cleaned.trim().is_empty() {
-        name.to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Looks for the same mod on Modrinth as a legitimate alternate source when
-/// CurseForge won't hand out a download for it — Modrinth is a fully
-/// separate, openly-licensed platform with no equivalent "third-party
-/// download disabled" flag, so this isn't a workaround for CurseForge's
-/// restriction, it's checking whether the author also publishes there.
-///
-/// Deliberately strict: the name has to plausibly match, and the returned
-/// file must be for the *exact* Minecraft version and loader this instance
-/// is running — no falling back to "closest available," since a
-/// wrong-version substitute silently dropped into a modpack is worse than
-/// just telling the user to grab it manually.
-async fn find_modrinth_replacement(
-    modrinth: &ModrinthClient,
-    mc_version: &str,
-    loader: ModLoader,
-    mod_name: &str,
-) -> Option<crate::instances::ResolvedDownload> {
-    let query = ModSearchQuery {
-        query: search_query_from_cf_name(mod_name),
-        content_type: Some(ContentType::Mod),
-        loader: None,
-        sort: SortIndex::Relevance,
-        offset: 0,
-        limit: 5,
-    };
-    let results = modrinth.search(&query).await.ok()?;
-    for hit in results.hits.iter().filter(|h| names_plausibly_match(&h.name, mod_name)) {
-        let Some(project_id) = hit.modrinth_id.as_deref() else { continue };
-        if let Ok(download) = modrinth
-            .query_versions(project_id, Some(mc_version), Some(loader.as_modrinth()))
-            .await
-        {
-            crate::activity::append_log(
-                &format!(
-                    "CF modpack import: found \"{mod_name}\" on Modrinth as \"{}\" (project {project_id}), using it instead of CurseForge — resolved file: {}",
-                    hit.name, download.filename
-                ),
-                "debug",
-                None,
-            );
-            return Some(download);
-        }
-    }
-    None
-}
-
 #[derive(Debug, Deserialize)]
 pub struct CurseForgeManifest {
     #[serde(default)]
@@ -344,8 +241,8 @@ fn default_true() -> bool {
 /// Writes a downloaded pack file atomically (temp + rename, so a crash or
 /// kill can never leave a half-written jar behind) after checking its sha1
 /// when the resolver reported one. A mismatch returns Err so the caller
-/// routes the file down the normal skip → Modrinth-substitution → manual
-/// path instead of installing corrupt bytes.
+/// routes the file to the manual-download list instead of installing
+/// corrupt bytes.
 fn place_verified_file(
     dest: &std::path::Path,
     filename: &str,
@@ -373,9 +270,6 @@ pub async fn import_curseforge_modpack_zip(
     bytes: &[u8],
     instance_root: &Path,
     api_key: &str,
-    modrinth: &ModrinthClient,
-    mc_version: &str,
-    loader: ModLoader,
     cancel: &CancelToken,
     report: &impl Fn(u32, u32, &str),
 ) -> Result<ModpackImportResult, ModpackError> {
@@ -559,9 +453,9 @@ pub async fn import_curseforge_modpack_zip(
         match download_bytes_with_retry(client, url, cancel).await {
             Ok(data) => {
                 let dest = dest_dir_for(filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
-                // A corrupt download (or a hash mismatch) joins the skip
-                // path below — substitution, then manual — like any other
-                // failed file, rather than failing the whole pack.
+                // A corrupt download (or a hash mismatch) joins the manual
+                // list below like any other failed file, rather than
+                // failing the whole pack.
                 match place_verified_file(&dest, filename, &data, sha1.as_deref()) {
                     Ok(()) => Ok((None, filename.clone())),
                     Err(_) => Ok((Some((*project_id, file_id, sha1.clone())), filename.clone())),
@@ -616,40 +510,16 @@ pub async fn import_curseforge_modpack_zip(
     skipped_files.sort_unstable_by_key(|(id, _, _, _)| *id);
     skipped_files.dedup_by_key(|(id, _, _, _)| *id);
 
-    // CurseForge won't hand these out at all — before giving up, check
-    // whether the same mod is also published on Modrinth (a separate,
-    // openly-licensed platform with no equivalent restriction) for this
-    // exact Minecraft version and loader. Only an exact-version match
-    // counts; anything looser risks silently swapping in an incompatible
-    // file, so a miss here still falls through to the manual-download list.
-    let mut still_skipped: Vec<(u32, u32, String, Option<String>)> = Vec::new();
-    let mut substituted: Vec<String> = Vec::new();
-    for (project_id, file_id, filename, sha1) in &skipped_files {
-        let Some((name, _slug, _icon, _website_url)) = mod_meta.get(project_id) else {
-            still_skipped.push((*project_id, *file_id, filename.clone(), sha1.clone()));
-            continue;
-        };
-        let Some(download) = find_modrinth_replacement(modrinth, mc_version, loader, name).await else {
-            still_skipped.push((*project_id, *file_id, filename.clone(), sha1.clone()));
-            continue;
-        };
-        if cancel.is_cancelled() {
-            return Err(ModpackError::from(crate::download::DownloadError::Cancelled));
-        }
-        match download_bytes_with_retry(client, &download.url, cancel).await {
-            Ok(data) => {
-                if crate::download::verify_hashes(&data, &download.hashes).is_err() {
-                    still_skipped.push((*project_id, *file_id, filename.clone(), sha1.clone()));
-                    continue;
-                }
-                let dest = dest_dir_for(&download.filename, &data, mods_dir, resourcepacks_dir, shaderpacks_dir);
-                crate::download::atomic_write(&safe_join(&dest, &download.filename)?, &data)?;
-                files_installed += 1;
-                substituted.push(name.clone());
-            }
-            Err(_) => still_skipped.push((*project_id, *file_id, filename.clone(), sha1.clone())),
-        }
-    }
+    // CurseForge won't hand these out at all (their author disabled
+    // third-party downloads), and there is deliberately no automatic
+    // cross-source substitution: a silently-swapped Modrinth file proved
+    // worse than a missing one — Modrinth variants for a different
+    // loader/MC slip through name matching and then crash the game with
+    // no clear cause (the Structory case), which is exactly why Prism
+    // stops automating here too. Every skipped file goes straight to the
+    // manual-download list below with its exact file page, and the
+    // Downloads watcher places whatever the user grabs.
+    let still_skipped: Vec<(u32, u32, String, Option<String>)> = skipped_files;
 
     // CurseForge's exact file-download page (or, lacking a slug, a search
     // link) for each file the user still has to grab themselves. Pointing at
@@ -681,20 +551,10 @@ pub async fn import_curseforge_modpack_zip(
         .collect();
 
     let mut skipped_note = String::new();
-    if !substituted.is_empty() {
-        skipped_note.push_str(&format!(
-            "\n\n{} mod(s) weren't available from CurseForge (author disabled third-party \
-             downloads) but were found on Modrinth for this exact Minecraft version and loader, \
-             and installed from there instead: {}",
-            substituted.len(),
-            substituted.join(", ")
-        ));
-    }
     let has_skipped = !missing_mods.is_empty();
     if has_skipped {
         skipped_note.push_str(&format!(
-            "\n\n{} mod(s) have third-party downloads disabled by their author on CurseForge \
-             and aren't published on Modrinth either — click \"Download missing mods\" to grab \
+            "\n\n{} mod(s) have third-party downloads disabled by their author on CurseForge — click \"Download missing mods\" to grab \
              them yourself and Waybound will place them automatically:",
             missing_mods.len()
         ));
@@ -1036,45 +896,5 @@ mod pack_reconciliation_tests {
             super::dest_dir_for("Pack.zip", &resourcepack_zip, &mods_dir, &rp_dir, &sp_dir),
             rp_dir
         );
-    }
-}
-
-#[cfg(test)]
-mod modrinth_fallback_tests {
-    use super::{names_plausibly_match, search_query_from_cf_name};
-
-    // Each of these CurseForge titles verified against Modrinth's real
-    // search API directly: sent as-is they return zero hits; cleaned like
-    // this they return the real project as the top result.
-    #[test]
-    fn strips_loader_decoration_that_breaks_modrinth_search() {
-        assert_eq!(search_query_from_cf_name("Entity Culling Fabric/Forge"), "Entity Culling");
-        assert_eq!(search_query_from_cf_name("(ARCHIVE) Faster Random"), "Faster Random");
-        assert_eq!(
-            search_query_from_cf_name("Better World Loading ([Neo]Forge)"),
-            "Better World Loading"
-        );
-        assert_eq!(
-            search_query_from_cf_name("Wabi-Sabi Structures (Forge)"),
-            "Wabi-Sabi Structures"
-        );
-    }
-
-    #[test]
-    fn leaves_plain_names_untouched() {
-        assert_eq!(search_query_from_cf_name("Structory"), "Structory");
-        assert_eq!(search_query_from_cf_name("ServerCore"), "ServerCore");
-    }
-
-    #[test]
-    fn falls_back_to_original_if_cleaning_empties_it() {
-        assert_eq!(search_query_from_cf_name("Forge"), "Forge");
-    }
-
-    #[test]
-    fn name_matching_is_order_independent_and_case_insensitive() {
-        assert!(names_plausibly_match("Entity Culling Fabric/Forge", "EntityCulling"));
-        assert!(names_plausibly_match("ServerCore", "servercore"));
-        assert!(!names_plausibly_match("Better HP", "Iron's Spells 'n Spellbooks"));
     }
 }

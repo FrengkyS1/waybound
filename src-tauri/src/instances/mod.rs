@@ -1075,16 +1075,13 @@ async fn install_modpack(
     // which is how a NeoForge pack ends up on a Forge instance: every
     // NeoForge jar then fails to register and the game dies on "missing"
     // mandatory dependencies that are all sitting in `mods/`. Correct the
-    // instance BEFORE importing so per-file resolution and the launch both
-    // use the pack's real loader.
-    let mut effective_loader = instance.loader;
+    // instance BEFORE importing so the launch uses the pack's real loader.
     let mut loader_note: Option<String> = None;
     if let Some(declared) = crate::modpack::declared_loader_from_bytes(&bytes) {
-        if declared.loader != effective_loader {
+        if declared.loader != instance.loader {
             db.set_instance_loader(&instance.id, declared.loader)?;
             // A pin for the old loader is meaningless under the new one.
             db.set_instance_loader_version(&instance.id, None)?;
-            effective_loader = declared.loader;
         }
         // Pin the pack's exact build when it declares one and the instance
         // has no explicit pin — the pack was built and tested against
@@ -1136,9 +1133,6 @@ async fn install_modpack(
             &bytes,
             &instance_root,
             &api_key,
-            modrinth,
-            &instance.minecraft_version,
-            effective_loader,
             cancel,
             report,
         )
