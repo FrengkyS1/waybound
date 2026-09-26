@@ -112,3 +112,37 @@
 .row:hover .chevron {
   color: var(--color-text-secondary);
 }
+
+/* Row-level shortcut into InstallTargetDialog — same accent treatment as
+ * the detail page's install button, compacted for the row. Always rendered
+ * (not hover-only) so touch and keyboard users get it too. */
+.installBtn {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: var(--glow-accent);
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.installBtn:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+  box-shadow: var(--glow-accent-strong);
+}
+
+.installBtn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.installBtn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

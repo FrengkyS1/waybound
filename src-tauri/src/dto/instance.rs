@@ -160,6 +160,20 @@ pub struct MissingDep {
     pub version_range: Option<String>,
 }
 
+/// A jar built for a different game version than the instance runs — e.g.
+/// a 1.20.1 Forge jar on a 1.21.1 NeoForge instance, which the game refuses
+/// to load with its own error screen only after a full launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrongGameVersionFile {
+    pub file_name: String,
+    pub mod_name: Option<String>,
+    /// Game version(s) the jar declares (metadata ranges and/or filename).
+    pub declared: String,
+    /// The instance's game version it was judged against.
+    pub expected: String,
+}
+
 /// Pre-launch readiness: blockers found by reading every enabled jar's own
 /// metadata. Empty lists mean "nothing obviously wrong" — never a guarantee
 /// the game will start.
@@ -169,6 +183,7 @@ pub struct LaunchReadiness {
     pub checked_files: u32,
     pub wrong_loader: Vec<WrongLoaderFile>,
     pub missing_deps: Vec<MissingDep>,
+    pub wrong_game_version: Vec<WrongGameVersionFile>,
 }
 
 /// Per-instance launch overrides. Empty/None fields fall back to global config.
@@ -217,6 +232,12 @@ pub struct InstallModInput {
     pub instance_id: Option<String>,
     pub create_instance: Option<CreateInstanceInput>,
     pub version_id: Option<String>,
+    /// Explicit origin override. When absent, the backend derives it:
+    /// sidecar-claimed filename → pack, otherwise user. Browse passes
+    /// `User` explicitly (a deliberate add is always yours, even when it
+    /// overlaps a pack file); flows without that context omit it.
+    #[serde(default)]
+    pub origin: Option<ModOrigin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

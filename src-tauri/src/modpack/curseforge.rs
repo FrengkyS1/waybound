@@ -494,11 +494,13 @@ pub async fn import_curseforge_modpack_zip(
         let owned_root = instance_root.to_path_buf();
         let owned_prefix = manifest.overrides.clone();
         let owned_cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
+        let (applied, paths) = tokio::task::spawn_blocking(move || {
             extract_overrides(&owned_bytes, &owned_root, &owned_prefix, &owned_cancel)
         })
         .await
-        .map_err(|e| ModpackError::Other(format!("override extraction task panicked: {e}")))??
+        .map_err(|e| ModpackError::Other(format!("override extraction task panicked: {e}")))??;
+        let _ = write_overrides_manifest(instance_root, &paths);
+        applied
     };
 
     let label = if manifest.name.is_empty() {
@@ -660,11 +662,12 @@ fn extract_overrides(
     instance_root: &Path,
     prefix: &str,
     cancel: &CancelToken,
-) -> Result<u32, ModpackError> {
+) -> Result<(u32, Vec<String>), ModpackError> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
     let normalized = prefix.trim_end_matches('/');
     let mut applied = 0u32;
+    let mut paths = Vec::new();
 
     for i in 0..archive.len() {
         if i % 20 == 0 && cancel.is_cancelled() {
@@ -686,9 +689,23 @@ fn extract_overrides(
         entry.read_to_end(&mut buffer)?;
         crate::download::atomic_write(&dest, &buffer)?;
         applied += 1;
+        paths.push(relative.replace('\\', "/"));
     }
 
-    Ok(applied)
+    Ok((applied, paths))
+}
+
+/// Records which override files an import applied, so later flows (origin
+/// marking, and eventually reconciliation) can tell pack-shipped files
+/// from user files. Overwritten per import — it describes the latest one.
+pub(crate) fn write_overrides_manifest(
+    instance_root: &Path,
+    paths: &[String],
+) -> Result<(), ModpackError> {
+    let manifest_path = instance_root.join(".pack-overrides-manifest.json");
+    let data = serde_json::to_vec_pretty(paths)?;
+    crate::download::atomic_write(&manifest_path, &data)?;
+    Ok(())
 }
 
 pub fn is_curseforge_modpack_zip(bytes: &[u8]) -> bool {

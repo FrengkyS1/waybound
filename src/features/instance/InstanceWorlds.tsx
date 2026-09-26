@@ -5,15 +5,19 @@ import {
   type ServerEntry,
   type WorldEntry,
 } from "../instances/api";
+import { ConfigEditorModal } from "./ConfigEditorModal";
 import styles from "./InstancePage.module.css";
 
 /**
- * Read-only Worlds tab: singleplayer saves with name, last played, mode
- * and version. No launching into them, no editing — a list.
+ * Worlds tab: singleplayer saves with name, last played, mode and
+ * version. Each world has a Files button opening its text files
+ * (stats, advancements, …) in the shared config editor — level.dat and
+ * friends are binary and never listed.
  */
 export function WorldsTab({ instanceId }: { instanceId: string }) {
   const [worlds, setWorlds] = useState<WorldEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editorFor, setEditorFor] = useState<WorldEntry | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -45,6 +49,7 @@ export function WorldsTab({ instanceId }: { instanceId: string }) {
   }
 
   return (
+    <>
     <ul className={styles.modList} aria-label="Singleplayer worlds">
       {worlds.map((w) => (
         <li key={w.folderName} className={styles.modRow}>
@@ -65,9 +70,28 @@ export function WorldsTab({ instanceId }: { instanceId: string }) {
                 .join(" · ") || w.folderName}
             </span>
           </div>
+          <button
+            type="button"
+            className={styles.configBtn}
+            onClick={() => setEditorFor(w)}
+            title="Browse and edit this world's text files"
+          >
+            Files
+          </button>
         </li>
       ))}
     </ul>
+    {editorFor && (
+      <ConfigEditorModal
+        instanceId={instanceId}
+        scope="world"
+        worldFolder={editorFor.folderName}
+        title={editorFor.name ?? editorFor.folderName}
+        emptyHint="No text files in this world to edit in-app."
+        onClose={() => setEditorFor(null)}
+      />
+    )}
+    </>
   );
 }
 

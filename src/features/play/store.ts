@@ -10,6 +10,7 @@ import {
   logout,
   microsoftLogin,
   readLaunchLog,
+  stopGame,
   type AccountPublic,
   type DeviceCodePrompt,
   type LaunchExitedEvent,
@@ -65,6 +66,12 @@ interface PlayStore {
   play: (instanceId: string, instanceName: string) => Promise<void>;
   /** Signals the backend to stop an in-flight prepare/download at its next await point. */
   cancelLaunch: (instanceId: string) => void;
+  /** Force-kills a running game. The backend reports the exit as
+   * user-stopped rather than crashed. No-op when nothing is running. */
+  stopGame: (instanceId: string) => void;
+  /** Collapses the bottom-right launch dock to a peek tab (session-only). */
+  launchDockMinimized: boolean;
+  setLaunchDockMinimized: (minimized: boolean) => void;
   dismissLaunch: (instanceId: string) => void;
   clearDevicePrompt: () => void;
   clearLogs: (instanceId: string) => void;
@@ -95,6 +102,9 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
   launches: {},
   logsByInstance: {},
   refreshTick: 0,
+  launchDockMinimized: false,
+
+  setLaunchDockMinimized: (minimized) => set({ launchDockMinimized: minimized }),
 
   init: async () => {
     if (!listenersReady) {
@@ -207,6 +217,8 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
   },
 
   cancelLaunch: (instanceId) => void cancelLaunch(instanceId).catch(() => {}),
+
+  stopGame: (instanceId) => void stopGame(instanceId).catch(() => {}),
 
   dismissLaunch: (instanceId) =>
     set((state) => {
@@ -328,16 +340,19 @@ async function registerListeners(
         const seconds = Math.round((Date.now() - launch.startedAtMs) / 1000);
         if (seconds > 0) void addPlayTime(launch.instanceId, seconds);
       }
+      // A deliberate stop lands on the existing cancelled phase (same as
+      // cancelling a prepare) rather than inventing a new one.
+      const stopped = event.payload.stoppedByUser === true;
       set({
         launches: {
           ...launches,
           [event.payload.instanceId]: {
             ...launch,
-            phase: "exited",
-            stage: event.payload.crashed ? "Crashed" : "Closed",
+            phase: stopped ? "cancelled" : "exited",
+            stage: stopped ? "Stopped" : event.payload.crashed ? "Crashed" : "Closed",
             exitCode: event.payload.code,
-            crashed: event.payload.crashed,
-            crashReason: event.payload.crashReason,
+            crashed: stopped ? false : event.payload.crashed,
+            crashReason: stopped ? null : event.payload.crashReason,
           },
         },
         refreshTick: refreshTick + 1,

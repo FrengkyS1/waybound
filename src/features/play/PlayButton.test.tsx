@@ -98,4 +98,65 @@ describe("PlayButton readiness gate", () => {
     );
     expect(screen.queryByText("Possible mod problems")).not.toBeInTheDocument();
   });
+
+  it("offers Cancel while preparing, wired to cancel_launch", async () => {
+    usePlayStore.setState({
+      account: { uuid: "u", username: "Player" },
+      launches: {
+        "inst-1": {
+          instanceId: "inst-1",
+          instanceName: "Test Instance",
+          phase: "preparing",
+          stage: "Downloading",
+          current: 1,
+          total: 4,
+          logs: [],
+          exitCode: null,
+          error: null,
+          startedAtMs: Date.now(),
+          crashed: false,
+          crashReason: null,
+        },
+      },
+    });
+    renderButton();
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    await waitFor(() =>
+      expect(
+        calls.filter((c) => c.cmd === "cancel_launch"),
+      ).toHaveLength(1),
+    );
+    expect(calls.filter((c) => c.cmd === "launch_instance")).toHaveLength(0);
+  });
+
+  it("morphs to Stop while running, wired to stop_game", async () => {
+    usePlayStore.setState({
+      account: { uuid: "u", username: "Player" },
+      launches: {
+        "inst-1": {
+          instanceId: "inst-1",
+          instanceName: "Test Instance",
+          phase: "running",
+          stage: "Minecraft is running",
+          current: 0,
+          total: 0,
+          logs: [],
+          exitCode: null,
+          error: null,
+          startedAtMs: Date.now(),
+          crashed: false,
+          crashReason: null,
+        },
+      },
+    });
+    renderButton();
+
+    fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
+
+    await waitFor(() =>
+      expect(calls.filter((c) => c.cmd === "stop_game")).toHaveLength(1),
+    );
+  });
 });

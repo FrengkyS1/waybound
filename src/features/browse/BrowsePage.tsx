@@ -2,9 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { FilterBar } from "./components/FilterBar";
 import { ModRow } from "./components/ModRow";
 import { ProjectDetailPage } from "./components/ProjectDetailPage";
+import { InstallTargetDialog } from "./components/InstallTargetDialog";
 import { SearchBar } from "./components/SearchBar";
+import { fetchModDetails } from "./api";
+import type { ModDetail } from "./detailTypes";
+import { installVerb } from "./detailTypes";
 import type { InstanceInstallTarget } from "../navigation/types";
 import type { ModSummary } from "./types";
+import { useTimedMessage } from "../../hooks/useTimedMessage";
+import { useInstallStore } from "../install/installStore";
 import { useBrowseStore } from "./store/browseStore";
 import styles from "./BrowsePage.module.css";
 
@@ -45,6 +51,37 @@ export function BrowsePage({
   const prevPage = useBrowseStore((s) => s.prevPage);
   const [selected, setSelected] = useState<ModSummary | null>(initialMod);
   const listRef = useRef<HTMLDivElement>(null);
+  // Row-level Install shortcut: fetches the row's detail on demand and
+  // opens the same InstallTargetDialog the detail page uses, so no page
+  // open is needed. Non-modpack rows with an install target skip the
+  // dialog and install straight into that instance (same as the page).
+  const [quickDetail, setQuickDetail] = useState<ModDetail | null>(null);
+  const [quickPendingUid, setQuickPendingUid] = useState<string | null>(null);
+  const [quickError, setQuickError] = useState<string | null>(null);
+  const startInstall = useInstallStore((s) => s.startInstall);
+  const { message: toast, showMessage: showToast } = useTimedMessage();
+
+  function handleQuickInstall(mod: ModSummary) {
+    if (quickPendingUid) return;
+    setQuickError(null);
+    if (installTarget && mod.projectType !== "modpack") {
+      startInstall(mod.name, {
+        modSummary: mod,
+        source: null,
+        instanceId: installTarget.instanceId,
+        origin: "user",
+      });
+      showToast(`Installing ${mod.name}.`);
+      return;
+    }
+    setQuickPendingUid(mod.uid);
+    void fetchModDetails(mod)
+      .then((detail) => setQuickDetail(detail))
+      .catch((err) =>
+        setQuickError(err instanceof Error ? err.message : String(err)),
+      )
+      .finally(() => setQuickPendingUid(null));
+  }
 
   // Without this, Next/Prev swapped in a new page while the list stayed
   // scrolled wherever it was — landing the user mid-list on the new page
@@ -156,6 +193,9 @@ export function BrowsePage({
         </div>
       )}
 
+      {quickError && <p className={styles.error} role="alert">{quickError}</p>}
+      {toast && <p className={styles.status} role="status">{toast}</p>}
+
       <div className={styles.list} role="list" ref={listRef}>
         {!loading && results.length === 0 && !error && (
           <div className={styles.empty}>
@@ -167,7 +207,18 @@ export function BrowsePage({
           </div>
         )}
         {results.map((mod) => (
-          <ModRow key={mod.uid} mod={mod} onOpen={setSelected} />
+          <ModRow
+            key={mod.uid}
+            mod={mod}
+            onOpen={setSelected}
+            onInstall={handleQuickInstall}
+            installLabel={
+              installTarget && mod.projectType !== "modpack"
+                ? `Add to ${installTarget.instanceName}`
+                : installVerb(mod.projectType)
+            }
+            installPending={quickPendingUid === mod.uid}
+          />
         ))}
       </div>
 
@@ -194,6 +245,21 @@ export function BrowsePage({
             Next →
           </button>
         </nav>
+      )}
+
+      {quickDetail && (
+        <InstallTargetDialog
+          detail={quickDetail}
+          fixedInstanceId={installTarget?.instanceId}
+          onClose={() => setQuickDetail(null)}
+          onSuccess={(message) => {
+            showToast(message);
+            setQuickDetail(null);
+            if (installTarget && onReturnToInstance) {
+              onReturnToInstance();
+            }
+          }}
+        />
       )}
     </div>
   );

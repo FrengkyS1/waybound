@@ -344,8 +344,8 @@ export function HomePage({
           >
             <span aria-hidden>+</span> Create
           </button>
+          <button type="button" className={styles.createBtn} onClick={() => setTransfer("import")}>Import</button>
         </div>
-        <button type="button" className={styles.createBtn} onClick={() => setTransfer("import")}>Import</button>
         <div className={styles.toolbarRight}>
           <input
             type="search"

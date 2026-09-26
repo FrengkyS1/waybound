@@ -28,6 +28,16 @@ pub enum CurseForgeError {
     NotConfigured,
     #[error("no compatible CurseForge file found")]
     NotFound,
+    /// The newest available file targets a different game version than the
+    /// instance (e.g. a 1.20.1-only project installed into a 1.21.1
+    /// instance). Distinct from NotFound so callers can name the mismatch
+    /// instead of a bare "no compatible file".
+    #[error("no file for Minecraft {expected}")]
+    WrongGameVersion {
+        filename: String,
+        file_versions: Vec<String>,
+        expected: String,
+    },
     #[error("{message}")]
     Rejected { status: u16, message: String },
     /// The file's author disabled third-party/API distribution — CurseForge
@@ -170,14 +180,19 @@ impl CurseForgeClient {
 
         if loader != ModLoader::Vanilla {
             if let Ok(download) = self
-                .fetch_file_any_loader(mod_id, mc_version, loader, api_key)
+                .fetch_file_any_loader(mod_id, mc_version, loader, mc_version, api_key)
                 .await
             {
                 return Ok(download);
             }
         }
 
-        self.fetch_file_any_loader(mod_id, "", loader, api_key)
+        // Last resort: widen the API query past this game version (catches
+        // files whose CurseForge metadata is mistagged), but the picked file
+        // is still validated against the instance's REAL version below — a
+        // wrong-version jar is never silently installed, it comes back as
+        // WrongGameVersion naming the mismatch.
+        self.fetch_file_any_loader(mod_id, "", loader, mc_version, api_key)
             .await
     }
 
@@ -192,25 +207,34 @@ impl CurseForgeClient {
         loader: ModLoader,
         api_key: &str,
     ) -> Result<ResolvedDownload, CurseForgeError> {
-        self.fetch_file_inner(mod_id, mc_version, Some(loader), loader, api_key)
+        self.fetch_file_inner(mod_id, mc_version, Some(loader), loader, Some(mc_version), api_key)
             .await
             .map(|(download, _)| download)
     }
 
     /// Fallback attempt: widen the query (any loader / any game version) but
     /// still validate whatever comes back against the instance's real loader
-    /// — an untagged file is accepted, a file tagged for another loader is
-    /// refused, so the fallback can only ever return something usable.
+    /// AND game version — an untagged file is accepted, a file tagged for
+    /// another loader or game version is refused, so the fallback can only
+    /// ever return something usable.
     async fn fetch_file_any_loader(
         &self,
         mod_id: u32,
-        mc_version: &str,
+        query_mc_version: &str,
         validate_loader: ModLoader,
+        validate_mc_version: &str,
         api_key: &str,
     ) -> Result<ResolvedDownload, CurseForgeError> {
-        self.fetch_file_inner(mod_id, mc_version, None, validate_loader, api_key)
-            .await
-            .map(|(download, _)| download)
+        self.fetch_file_inner(
+            mod_id,
+            query_mc_version,
+            None,
+            validate_loader,
+            Some(validate_mc_version),
+            api_key,
+        )
+        .await
+        .map(|(download, _)| download)
     }
 
     /// `query_loader = None` skips the modLoaderType filter entirely; files
@@ -221,6 +245,7 @@ impl CurseForgeClient {
         mc_version: &str,
         query_loader: Option<ModLoader>,
         validate_loader: ModLoader,
+        validate_mc_version: Option<&str>,
         api_key: &str,
     ) -> Result<(ResolvedDownload, Vec<u32>), CurseForgeError> {
         let mut request = self
@@ -264,6 +289,23 @@ impl CurseForgeClient {
             .ok_or(CurseForgeError::NotFound)?;
 
         ensure_file_loader_matches(&file.loaders, validate_loader)?;
+        // The query above may have been deliberately widened past the game
+        // version (any-version fallback), so the picked file's own tags get
+        // checked against the instance's real version here. Files with no
+        // version tags pass (metadata is occasionally incomplete); a file
+        // tagged for another version is refused with the mismatch named.
+        if let Some(expected) = validate_mc_version {
+            if !expected.is_empty()
+                && !file.game_versions.is_empty()
+                && !file.game_versions.iter().any(|v| v == expected)
+            {
+                return Err(CurseForgeError::WrongGameVersion {
+                    filename: file.file_name.clone(),
+                    file_versions: file.game_versions.clone(),
+                    expected: expected.to_string(),
+                });
+            }
+        }
         let required_dependencies = required_dependency_mod_ids_of_file(&file);
 
         let download_url = match file.download_url.filter(|u| !u.is_empty()) {
@@ -688,7 +730,11 @@ impl CurseForgeClient {
             && !file.game_versions.is_empty()
             && !file.game_versions.iter().any(|v| v == mc_version)
         {
-            return Err(CurseForgeError::NotFound);
+            return Err(CurseForgeError::WrongGameVersion {
+                filename: file.file_name.clone(),
+                file_versions: file.game_versions.clone(),
+                expected: mc_version.to_string(),
+            });
         }
         let required_dependencies = required_dependency_mod_ids_of_file(&file);
 

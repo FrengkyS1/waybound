@@ -12,7 +12,7 @@ use base64::Engine;
 use crate::download::safe_join;
 use crate::dto::instance::{
     ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent, LaunchReadiness, MissingDep,
-    ServerEntry, WorldEntry, WrongLoaderFile,
+    ServerEntry, WorldEntry, WrongGameVersionFile, WrongLoaderFile,
 };
 use crate::dto::ModLoader;
 use crate::instances::paths::instance_root;
@@ -872,15 +872,21 @@ pub(crate) struct FileLaunchMeta {
     pub launch: ModLaunchMeta,
 }
 
-/// Judges parsed jar metadata against the instance's loader: loader-family
-/// mismatches plus required dependency ids no installed jar provides.
+/// Judges parsed jar metadata against the instance's loader and game
+/// version: loader-family mismatches, game-version ranges the instance
+/// falls outside of, plus required dependency ids no installed jar
+/// provides.
 /// Only the metadata entry matching the instance's loader counts — a
 /// multiloader jar's Fabric deps are meaningless on a NeoForge instance
 /// (and vice versa). A jar with no matching entry is flagged wrong-loader
 /// and its deps are skipped to avoid piling noise on the real problem.
+/// File names are never consulted for versions (mod versions share the MC
+/// namespace). A jar whose entry carries no usable MC range stays silent
+/// on game version.
 /// Pure (no I/O) so the rules are unit-testable without instance fixtures.
 pub(crate) fn assess_readiness(
     instance_loader: ModLoader,
+    instance_mc_version: &str,
     files: &[FileLaunchMeta],
     embedded_ids: &[String],
 ) -> LaunchReadiness {
@@ -903,6 +909,7 @@ pub(crate) fn assess_readiness(
     installed_ids.extend(embedded_ids.iter().map(|id| id.to_ascii_lowercase()));
     let mut wrong_loader = Vec::new();
     let mut missing_deps = Vec::new();
+    let mut wrong_game_version = Vec::new();
     for file in files {
         let matching = file
             .launch
@@ -936,12 +943,211 @@ pub(crate) fn assess_readiness(
                 });
             }
         }
+        // Game version: the matching loader entry's metadata ranges are
+        // the only signal. File names are deliberately NOT consulted —
+        // mod versions share the MC namespace (`alexsmobs-1.22.9.jar` is
+        // Alex's Mobs' own 1.22.9 built for MC 1.20.1), so name-based
+        // flagging cried wolf on working packs. A jar with no usable range
+        // stays silent; the install-time validation guards that class.
+        let shaped: Vec<&String> = entry
+            .mc_versions
+            .iter()
+            .filter(|r| range_mentions_mc_version(r))
+            .collect();
+        let declared = if shaped.is_empty()
+            || shaped
+                .iter()
+                .any(|r| mc_range_matches(r, instance_mc_version))
+        {
+            None
+        } else {
+            Some(entry.mc_versions.join(", "))
+        };
+        if let Some(declared) = declared {
+            wrong_game_version.push(WrongGameVersionFile {
+                file_name: file.file_name.clone(),
+                mod_name: file.mod_name.clone(),
+                declared,
+                expected: instance_mc_version.to_string(),
+            });
+        }
     }
     LaunchReadiness {
         checked_files: files.len() as u32,
         wrong_loader,
         missing_deps,
+        wrong_game_version,
     }
+}
+
+/// Numeric triple for game-version ordering across both Mojang schemes:
+/// legacy `1.x.y` and year-based `26.x`. Non-numeric tails (snapshots like
+/// `26.3-snapshot-5`) parse by leading digits; missing parts are zero.
+fn mc_triplet(version: &str) -> (u32, u32, u32) {
+    let mut parts = version.split('.');
+    let num = |p: Option<&str>| {
+        p.unwrap_or("")
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    };
+    (num(parts.next()), num(parts.next()), num(parts.next()))
+}
+
+/// Exact-or-line equality: only the major.minor line must match — Mojang
+/// keeps patches wire-compatible, so a jar declaring 1.20 (or 1.20.0)
+/// runs on 1.20.1, while 1.20.x on 1.21.y genuinely breaks.
+fn mc_exact_matches(declared: &str, mc: (u32, u32, u32)) -> bool {
+    let base = declared.trim().trim_end_matches(".x").trim_end_matches('.');
+    // No digits at all ("*"-adjacent garbage): unparseable, passes.
+    if !base.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let t = mc_triplet(base);
+    t.0 == mc.0 && t.1 == mc.1
+}
+
+/// Whether an instance game version is accepted by one minecraft dependency
+/// range from jar metadata. Covers the shapes mods actually ship: "*"
+/// (anything), exact versions ("1.20.1"), maven intervals ("[1.20,1.21)"),
+/// Fabric/npm comparators (">=1.20", ">1.20 <1.21", "1.20.x") and "||"
+/// unions. Anything unparseable matches — readiness is advisory and must
+/// not cry wolf on exotic ranges.
+///
+/// Comparison is at major.minor LINE granularity with inclusive bounds:
+/// patches stay wire-compatible, and — decisively — the game loader itself
+/// accepts the MDK-boilerplate `[1.21,1.21.1)` on 1.21.1 (NeoForge's own
+/// loading screen named only the truly wrong file when a 1.20.1 jar sat
+/// next to forty such mods). A checker stricter than the loader is just
+/// another wolf cry.
+fn mc_range_matches(range: &str, mc_version: &str) -> bool {
+    let mc = mc_triplet(mc_version);
+    let mc_line = (mc.0, mc.1);
+    // Maven multi-ranges (`[1.21],[1.21.1]` — an exact-pin union) split on
+    // commas that are NOT inside brackets; interval commas are handled
+    // by the branch logic below. An empty range matches (no constraint).
+    let parts = split_top_level(range);
+    if parts.is_empty() {
+        return true;
+    }
+    parts.into_iter().any(|part| {
+        part.split("||").any(|branch| {
+            let branch = branch.trim();
+        if branch.is_empty() || branch == "*" {
+            return true;
+        }
+        // Maven interval: bounds name LINES, and both ends count as
+        // inclusive no matter the bracket flavor — see the doc comment.
+        if (branch.starts_with('[') || branch.starts_with('('))
+            && (branch.ends_with(']') || branch.ends_with(')'))
+        {
+            let inner = &branch[1..branch.len() - 1];
+            // No comma: an exact pin (`[1.20]`), matched by line.
+            if !inner.contains(',') {
+                return mc_exact_matches(inner, mc);
+            }
+            let mut bounds = inner.splitn(2, ',');
+            let lo = bounds.next().unwrap_or("").trim();
+            let hi = bounds.next().unwrap_or("").trim();
+            // Digitless bounds ("(,)") are open-ended, like empty ones.
+            if !lo.is_empty() && lo.chars().any(|c| c.is_ascii_digit()) {
+                let t = mc_triplet(lo);
+                if mc_line < (t.0, t.1) {
+                    return false;
+                }
+            }
+            if !hi.is_empty() && hi.chars().any(|c| c.is_ascii_digit()) {
+                let t = mc_triplet(hi);
+                if mc_line > (t.0, t.1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Space/comma-separated AND of comparator atoms. Comparators keep
+        // full-triplet strictness (`<1.21.2` on 1.21.1 passes, on 1.21.2
+        // fails) — only intervals and bare versions compare by line, since
+        // only those are written line-wise by authors and tooling.
+        branch
+            .split(|c| c == ' ' || c == ',')
+            .filter(|p| !p.is_empty())
+            .all(|atom| {
+                let (op, ver) = if let Some(v) = atom.strip_prefix(">=") {
+                    (">=", v)
+                } else if let Some(v) = atom.strip_prefix("<=") {
+                    ("<=", v)
+                } else if let Some(v) = atom.strip_prefix('>') {
+                    (">", v)
+                } else if let Some(v) = atom.strip_prefix('<') {
+                    ("<", v)
+                } else if let Some(v) = atom.strip_prefix('=') {
+                    ("=", v)
+                } else if let Some(v) = atom.strip_prefix('~') {
+                    // npm `~1.20` (patch-level): >=1.20.0.
+                    (">=", v)
+                } else if let Some(v) = atom.strip_prefix('^') {
+                    // npm `^1.20` (compatible-within-line): >=1.20.0.
+                    (">=", v)
+                } else {
+                    ("=", atom)
+                };
+                let ver = ver.trim();
+                if ver.is_empty() || ver == "*" {
+                    return true;
+                }
+                // Digitless comparator bounds are unparseable: pass.
+                if !ver.chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+                let t = mc_triplet(ver.trim_end_matches(".x").trim_end_matches('.'));
+                match op {
+                    ">=" => mc >= t,
+                    "<=" => mc <= t,
+                    ">" => mc > t,
+                    "<" => mc < t,
+                    _ => mc_exact_matches(ver, mc),
+                }
+            })
+        })
+    })
+}
+
+/// Splits a range on commas outside any brackets: maven multi-ranges like
+/// `[1.21],[1.21.1]` are unions, while the comma inside `[1.20,1.21)` is
+/// the interval separator the branch logic consumes.
+fn split_top_level(range: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in range.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(range[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(range[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// Whether a range string mentions any Minecraft-shaped version (a version
+/// part starting with 1 or 26). Jar metadata occasionally carries non-MC
+/// junk in version fields; without this, such junk would evaluate against
+/// the instance version and cry wolf.
+fn range_mentions_mc_version(range: &str) -> bool {
+    range
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|p| !p.is_empty())
+        .any(|p| {
+            let mut nums = p.split('.');
+            matches!(nums.next(), Some("1") | Some("26"))
+        })
 }
 
 /// Pre-launch readiness check: reads every ENABLED jar's own metadata and
@@ -993,7 +1199,7 @@ pub async fn check_launch_readiness(
     })
     .await
     .map_err(|e| e.to_string())?;
-    Ok(assess_readiness(instance.loader, &files.0, &files.1))
+    Ok(assess_readiness(instance.loader, &instance.minecraft_version, &files.0, &files.1))
 }
 
 /// Lists singleplayer worlds (`saves/*/level.dat`) oldest detail omitted:
@@ -1375,6 +1581,99 @@ pub fn write_config_file(
     fs::write(&path, contents).map_err(|e| e.to_string())
 }
 
+/// Recursively collects every text-editable file under one world folder,
+/// paths relative to the world folder itself — what the frontend passes
+/// back to `read_world_file`/`write_world_file`. `level.dat`/`session.lock`
+/// and friends are binary and never match the text-extension filter, so no
+/// special-casing is needed beyond the shared dotfile skip.
+fn collect_world_text_files(dir: &Path, relative_prefix: &str, out: &mut Vec<ConfigFileEntry>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let relative = if relative_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative_prefix}/{name}")
+        };
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_world_text_files(&entry.path(), &relative, out);
+        } else if is_text_config_file(&name) {
+            out.push(ConfigFileEntry { relative_path: relative.clone(), display_name: relative });
+        }
+    }
+}
+
+/// Resolve `saves/<world_folder>` for frontend-supplied folder names:
+/// safe_join containment plus an is_dir check, so a stale or hostile name
+/// is an error rather than an empty list or an escape.
+fn resolve_world_dir(root: &Path, world_folder: &str) -> Result<PathBuf, String> {
+    let dir = safe_join(&root.join("saves"), world_folder).map_err(|e| e.to_string())?;
+    if dir.is_dir() {
+        Ok(dir)
+    } else {
+        Err("World not found.".to_string())
+    }
+}
+
+/// Every text-editable file inside one world folder. Empty (not an error)
+/// when the world has none editable in-app — the frontend then offers no
+/// file browser for that world.
+#[tauri::command]
+pub fn list_world_files(
+    state: State<'_, AppState>,
+    instance_id: String,
+    world_folder: String,
+) -> Result<Vec<ConfigFileEntry>, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let _ = state.db.get_instance(&instance_id).map_err(|e| e.to_string())?;
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    let mut out = Vec::new();
+    collect_world_text_files(&world_dir, "", &mut out);
+    out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn read_world_file(
+    instance_id: String,
+    world_folder: String,
+    relative_path: String,
+) -> Result<String, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    let path = safe_join(&world_dir, &relative_path).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_EDITABLE_CONFIG_BYTES {
+        return Err(format!(
+            "This file is {:.1} MB — too large to edit in-app. Use \"Open folder\" and a text editor instead.",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    fs::read_to_string(&path)
+        .map_err(|_| "Couldn't read this file as text — it may not be a plain-text file.".to_string())
+}
+
+#[tauri::command]
+pub fn write_world_file(
+    instance_id: String,
+    world_folder: String,
+    relative_path: String,
+    contents: String,
+) -> Result<(), String> {
+    // Same operation lock as config writes: rejects while the game runs so
+    // Minecraft can't overwrite the edit (or vice versa) mid-session.
+    let _operation = acquire(&instance_id)?;
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    let path = safe_join(&world_dir, &relative_path).map_err(|e| e.to_string())?;
+    fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod content_meta_cache_tests {
     use super::{apply_cache, normalize_for_match, ConfigTopEntry, ScannedFile};
@@ -1633,7 +1932,7 @@ mod config_matching_tests {
 
 #[cfg(test)]
 mod launch_meta_tests {
-    use super::{assess_readiness, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
+    use super::{assess_readiness, mc_range_matches, range_mentions_mc_version, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
     use crate::dto::ModLoader;
     use std::io::Write;
 
@@ -1763,14 +2062,14 @@ mod launch_meta_tests {
             merged.clone(),
             file("somelib.jar", Some("somelib"), launch_meta_single("neoforge", &[])),
         ];
-        let neo_report = assess_readiness(ModLoader::NeoForge, &neo_files, &[]);
+        let neo_report = assess_readiness(ModLoader::NeoForge, "1.21.1", &neo_files, &[]);
         assert!(neo_report.wrong_loader.is_empty(), "{:?}", neo_report.wrong_loader);
         assert!(neo_report.missing_deps.is_empty(), "{:?}", neo_report.missing_deps);
         let fabric_files = vec![
             merged,
             file("fabric-api.jar", Some("fabric-api"), launch_meta_single("fabric", &[])),
         ];
-        let fabric_report = assess_readiness(ModLoader::Fabric, &fabric_files, &[]);
+        let fabric_report = assess_readiness(ModLoader::Fabric, "1.21.1", &fabric_files, &[]);
         assert!(fabric_report.wrong_loader.is_empty(), "{:?}", fabric_report.wrong_loader);
         assert!(fabric_report.missing_deps.is_empty(), "{:?}", fabric_report.missing_deps);
     }
@@ -1805,7 +2104,7 @@ mod launch_meta_tests {
     #[test]
     fn neoforge_jar_on_forge_instance_is_flagged() {
         let files = vec![file("formations.jar", Some("formations"), launch_with("neoforge", &[]))];
-        let report = assess_readiness(ModLoader::Forge, &files, &[]);
+        let report = assess_readiness(ModLoader::Forge, "1.21.1", &files, &[]);
         assert_eq!(report.checked_files, 1);
         assert_eq!(report.wrong_loader.len(), 1);
         assert_eq!(report.wrong_loader[0].detected_loader, "neoforge");
@@ -1818,7 +2117,7 @@ mod launch_meta_tests {
             file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"])),
             file("b.jar", Some("somelib"), launch_with("neoforge", &[])),
         ];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
         assert!(report.wrong_loader.is_empty());
         assert!(report.missing_deps.is_empty());
     }
@@ -1826,10 +2125,128 @@ mod launch_meta_tests {
     #[test]
     fn missing_dep_names_the_requiring_file() {
         let files = vec![file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"]))];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
         assert_eq!(report.missing_deps.len(), 1);
         assert_eq!(report.missing_deps[0].dep_mod_id, "somelib");
         assert_eq!(report.missing_deps[0].file_name, "a.jar");
+    }
+
+    fn launch_meta_mc(loader: &str, mc: &[&str]) -> ModLaunchMeta {
+        ModLaunchMeta {
+            loaders: vec![super::LoaderMetaEntry {
+                loader: loader.to_string(),
+                mc_versions: mc.iter().map(|s| s.to_string()).collect(),
+                dependencies: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn mc_range_matching_covers_shipped_shapes() {
+        // Exact versions match by major.minor line — patches stay
+        // wire-compatible, so 1.20.0 runs on 1.20.1.
+        assert!(mc_range_matches("1.21.1", "1.21.1"));
+        assert!(mc_range_matches("1.21", "1.21.1"));
+        assert!(mc_range_matches("1.20.0", "1.20.1"));
+        assert!(!mc_range_matches("1.20.1", "1.21.1"));
+        assert!(!mc_range_matches("1.20", "1.21.1"));
+        // Maven intervals are line-inclusive: the MDK-boilerplate
+        // `[1.21,1.21.1)` loads on 1.21.1 (the loader itself accepts it),
+        // while a range outside the instance's line still flags.
+        assert!(mc_range_matches("[1.20,1.21)", "1.20.4"));
+        assert!(mc_range_matches("[1.20,1.21)", "1.21.1"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.22"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.19.4"));
+        assert!(mc_range_matches("[1.21,1.21.1)", "1.21.1"));
+        assert!(mc_range_matches("[1.21,1.22)", "1.21.1"));
+        assert!(mc_range_matches("(,1.21]", "1.21"));
+        assert!(mc_range_matches("(,1.21]", "1.21.1"));
+        assert!(mc_range_matches("[1.21,)", "1.21.1"));
+        // Fabric comparators + unions + wildcards. Comparators keep
+        // full-triplet strictness: `<1.21.2` still accepts 1.21.1.
+        assert!(mc_range_matches(">=1.20", "1.21.1"));
+        assert!(!mc_range_matches(">=1.22", "1.21.1"));
+        assert!(mc_range_matches(">=1.20 <1.21", "1.20.4"));
+        assert!(!mc_range_matches(">=1.20 <1.21", "1.21.1"));
+        assert!(mc_range_matches(">=1.21.1 <1.21.2", "1.21.1"));
+        assert!(!mc_range_matches(">=1.21.1 <1.21.2", "1.21.2"));
+        assert!(mc_range_matches("~1.20", "1.20.1"));
+        assert!(mc_range_matches("^1.20", "1.21.1"));
+        assert!(mc_range_matches("1.20.x", "1.20.4"));
+        assert!(mc_range_matches(">=1.20 || >=1.21.1", "1.21.1"));
+        assert!(mc_range_matches("26.2", "26.2"));
+        // Maven multi-range unions (exact-pin lists).
+        assert!(mc_range_matches("[1.21],[1.21.1]", "1.21.1"));
+        assert!(!mc_range_matches("[1.20],[1.20.4]", "1.21.1"));
+        // Anything + garbage passes: advisory must not cry wolf.
+        assert!(mc_range_matches("*", "1.21.1"));
+        assert!(mc_range_matches("", "1.21.1"));
+        assert!(mc_range_matches("garbage", "1.21.1"));
+    }
+
+    #[test]
+    fn range_shape_guard_ignores_non_mc_junk() {
+        assert!(range_mentions_mc_version(">=1.20"));
+        assert!(range_mentions_mc_version("[1.20,1.21)"));
+        assert!(range_mentions_mc_version("1.21.1"));
+        assert!(!range_mentions_mc_version("2.64"));
+        assert!(!range_mentions_mc_version("garbage"));
+        assert!(!range_mentions_mc_version(""));
+    }
+
+    #[test]
+    fn outdated_jar_is_flagged_by_metadata_range() {
+        let files = vec![FileLaunchMeta {
+            file_name: "somemod-3.0.jar".to_string(),
+            mod_name: Some("SomeMod".to_string()),
+            mod_id: Some("somemod".to_string()),
+            all_mod_ids: vec!["somemod".to_string()],
+            launch: launch_meta_mc("neoforge", &["[1.19,1.20]"]),
+        }];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
+        assert!(report.wrong_loader.is_empty());
+        assert_eq!(report.wrong_game_version.len(), 1);
+        assert_eq!(report.wrong_game_version[0].expected, "1.21.1");
+        assert_eq!(report.wrong_game_version[0].declared, "[1.19,1.20]");
+    }
+
+    #[test]
+    fn versioned_file_name_without_metadata_stays_silent() {
+        // Incident regression test: `alexsmobs-1.22.9.jar` is Alex's Mobs'
+        // own 1.22.9 built for MC 1.20.1 — a file-name-only signal flagged
+        // it (plus ATi Structures, BetterThanMending) on a 1.20.1 instance.
+        // Names are never consulted now, so all such jars stay silent.
+        for name in [
+            "alexsmobs-1.22.9.jar",
+            "ATi Structures V1.4.6.jar",
+            "BetterThanMending-1.7.2.jar",
+            "biggerstacks-1.20.1-2026.06.17-all.jar",
+        ] {
+            let files = vec![file(name, Some("somemod"), launch_with("forge", &[]))];
+            let report = assess_readiness(ModLoader::Forge, "1.20.1", &files, &[]);
+            assert!(report.wrong_loader.is_empty(), "{name}");
+            assert!(report.wrong_game_version.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn matching_game_version_stays_silent() {
+        let ranged = vec![FileLaunchMeta {
+            file_name: "somemod-3.0.jar".to_string(),
+            mod_name: Some("SomeMod".to_string()),
+            mod_id: Some("somemod".to_string()),
+            all_mod_ids: vec!["somemod".to_string()],
+            launch: launch_meta_mc("neoforge", &["[1.21,1.22)"]),
+        }];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &ranged, &[]);
+        assert!(report.wrong_game_version.is_empty());
+        let named = vec![file(
+            "somemod-1.21.jar",
+            Some("somemod"),
+            launch_with("neoforge", &[]),
+        )];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &named, &[]);
+        assert!(report.wrong_game_version.is_empty());
     }
 
     #[test]
@@ -1867,7 +2284,7 @@ mod launch_meta_tests {
         let meta = read_mod_metadata(&path);
         assert!(meta.embedded_ids.iter().any(|id| id == "flywheel"), "{:?}", meta.embedded_ids);
         let files = vec![file("host.jar", Some("create"), meta.launch.clone())];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &meta.embedded_ids);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &meta.embedded_ids);
         assert!(report.missing_deps.is_empty(), "{:?}", report.missing_deps);
         let _ = std::fs::remove_file(&path);
     }
@@ -1875,7 +2292,7 @@ mod launch_meta_tests {
 
 #[cfg(test)]
 mod worlds_servers_tests {
-    use super::{read_servers_file, read_world_entry};
+    use super::{collect_world_text_files, read_servers_file, read_world_entry};
     use std::io::Write;
     use valence_nbt::compound;
 
@@ -1977,6 +2394,30 @@ mod worlds_servers_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(read_servers_file(&dir.join("servers.dat")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn world_text_files_list_json_and_skip_binaries() {
+        let dir = std::env::temp_dir().join("waybound-world-files-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let world = dir.join("My World");
+        std::fs::create_dir_all(world.join("stats")).unwrap();
+        std::fs::create_dir_all(world.join("advancements")).unwrap();
+        std::fs::write(world.join("level.dat"), b"\x1fbeing-binary").unwrap();
+        std::fs::write(world.join("session.lock"), b"1234").unwrap();
+        std::fs::write(world.join(".hidden.json"), b"{}").unwrap();
+        std::fs::write(world.join("stats").join("uuid.json"), b"{}").unwrap();
+        std::fs::write(
+            world.join("advancements").join("done.json"),
+            b"{\"x\":1}",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        collect_world_text_files(&world, "", &mut out);
+        let mut paths: Vec<_> = out.iter().map(|e| e.relative_path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["advancements/done.json", "stats/uuid.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

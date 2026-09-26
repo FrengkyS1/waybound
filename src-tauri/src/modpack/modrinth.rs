@@ -111,7 +111,7 @@ pub async fn import_modrinth_mrpack_bytes(
         project_uids.insert(filename.to_string(), format!("modrinth:{}", meta.project_id));
         if let Some(icon) = &meta.icon { icons.insert(filename.to_string(), icon.clone()); }
     }
-    let overrides_applied = transaction.overrides(bytes, &["overrides", "client-overrides"], cancel).await?;
+    let (overrides_applied, override_paths) = transaction.overrides(bytes, &["overrides", "client-overrides"], cancel).await?;
     let manifest_path = instance_root.join(".modrinth-pack-manifest.json");
     let old_paths: Vec<String> = match std::fs::read(&manifest_path) {
         Ok(data) => serde_json::from_slice(&data)?,
@@ -132,6 +132,10 @@ pub async fn import_modrinth_mrpack_bytes(
         }
     }
     transaction.stage(".modrinth-pack-manifest.json", &serde_json::to_vec_pretty(&paths)?)?;
+    transaction.stage(
+        ".pack-overrides-manifest.json",
+        &serde_json::to_vec_pretty(&override_paths)?,
+    )?;
     transaction.commit(cancel).await?;
     let label = if index.name.is_empty() { "Modrinth modpack".to_string() } else { format!("{} {}", index.name, index.version_id) };
     Ok(ModpackImportResult {

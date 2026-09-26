@@ -12,7 +12,7 @@ use crate::sources::curseforge::{CurseForgeClient, CurseForgeError};
 
 use crate::sources::modrinth::{ModrinthClient, ModrinthError};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::Mutex;
 
@@ -38,6 +38,14 @@ pub struct AppState {
     /// Abort handles for in-flight launches (preparing/downloading phase),
     /// keyed by instance id, so `cancel_launch` can stop one.
     pub launches: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+
+    /// Live game PIDs by instance id, so `stop_game` can kill a running
+    /// game. Written on spawn, removed by the reaper thread on exit.
+    pub game_pids: Mutex<HashMap<String, u32>>,
+
+    /// Instances the user asked to stop: consulted (and cleared) by the
+    /// reaper so a deliberate stop reports as stopped rather than crashed.
+    pub stop_requests: Mutex<HashSet<String>>,
 
 }
 
@@ -297,6 +305,10 @@ fn map_curseforge_search_warning(error: CurseForgeError) -> String {
 
         CurseForgeError::NotFound => "CurseForge: no compatible file.".to_string(),
 
+        CurseForgeError::WrongGameVersion { filename, expected, .. } => {
+            format!("CurseForge: {filename} is not built for Minecraft {expected}.")
+        }
+
         CurseForgeError::DistributionRestricted { filename, .. } => {
 
             format!("CurseForge: {filename} requires a manual download.")
@@ -308,8 +320,9 @@ fn map_curseforge_search_warning(error: CurseForgeError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_by_loader;
+    use super::{filter_by_loader, map_curseforge_search_warning};
     use crate::dto::{ContentType, ModLoader, ModSource, ModSummary};
+    use crate::sources::curseforge::CurseForgeError;
 
     fn mod_with_loaders(loaders: Vec<ModLoader>) -> ModSummary {
         ModSummary {
@@ -347,8 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_hits_with_no_recognized_loaders_unfiltered() {
-        // Empty `loaders` means the source's categories didn't map to a
+    fn keeps_hits_with_no_recognized_loaders_unfiltered() {        // Empty `loaders` means the source's categories didn't map to a
         // known loader (a metadata gap), not proof the mod lacks the
         // requested one — must not be dropped.
         let hits = vec![
@@ -358,6 +370,17 @@ mod tests {
         let filtered = filter_by_loader(hits, Some(ModLoader::Quilt));
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].loaders.is_empty());
+    }
+
+    #[test]
+    fn wrong_game_version_warning_names_file_and_version() {
+        let msg = map_curseforge_search_warning(CurseForgeError::WrongGameVersion {
+            filename: "biggerstacks-1.20.1-2026.06.17-all.jar".to_string(),
+            file_versions: vec!["1.20.1".to_string()],
+            expected: "1.21.1".to_string(),
+        });
+        assert!(msg.contains("biggerstacks-1.20.1-2026.06.17-all.jar"), "got: {msg}");
+        assert!(msg.contains("1.21.1"), "got: {msg}");
     }
 }
 

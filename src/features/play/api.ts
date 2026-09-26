@@ -91,6 +91,12 @@ export async function cancelLaunch(instanceId: string): Promise<void> {
   await invoke("cancel_launch", { instanceId });
 }
 
+/** Force-kills a running game. No-op when nothing is running. The backend
+ * reports the exit as user-stopped rather than crashed. */
+export async function stopGame(instanceId: string): Promise<void> {
+  await invoke("stop_game", { instanceId });
+}
+
 export interface RunningInstance {
   instanceId: string;
   instanceName: string;
@@ -122,10 +128,20 @@ export interface MissingDep {
   versionRange?: string;
 }
 
+export interface WrongGameVersionFile {
+  fileName: string;
+  modName?: string;
+  /** Game version(s) the jar declares (metadata ranges and/or filename). */
+  declared: string;
+  /** The instance's game version it was judged against. */
+  expected: string;
+}
+
 export interface LaunchReadiness {
   checkedFiles: number;
   wrongLoader: WrongLoaderFile[];
   missingDeps: MissingDep[];
+  wrongGameVersion: WrongGameVersionFile[];
 }
 
 /** Reads every enabled jar's own metadata and reports loader mismatches
@@ -159,4 +175,6 @@ export interface LaunchExitedEvent {
    * work it out from the crash report or the mod-loader's error block, the
    * actual cause. Null unless `crashed`. */
   crashReason: string | null;
+  /** The player pressed Stop (as opposed to the game exiting on its own). */
+  stoppedByUser: boolean;
 }

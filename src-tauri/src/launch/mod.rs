@@ -301,24 +301,7 @@ where
             .await
             .ok()
             .flatten();
-        match major {
-            // An explicit override that probes older than required used to
-            // be trusted blindly and die in the game with no useful error —
-            // fail here instead, naming the fix.
-            Some(found) if found < required_major => {
-                return Err(LaunchError::JavaTooOld {
-                    path: explicit,
-                    version: game_version.to_string(),
-                    found,
-                    required: required_major,
-                })
-            }
-            Some(found) => return Ok((explicit, found)),
-            // Unprobable override (deleted JDK, typo): fall back to the
-            // requirement so auto-resolution still finds something, rather
-            // than launching a broken path.
-            None => return Ok((explicit, required_major)),
-        }
+        return check_override_major(&explicit, game_version, major, required_major);
     }
 
     let runtimes = tokio::task::spawn_blocking(java::detect_java_runtimes)
@@ -344,6 +327,29 @@ where
         version: game_version.to_string(),
         required: required_major,
     })
+}
+
+/// Decides what an explicit Java override resolves to, factored out of
+/// `resolve_java` so the rules are unit-testable without spawning
+/// processes: too-old-but-probed fails fast naming the fix; matching
+/// passes through; unprobable (deleted JDK, typo) falls back to the
+/// requirement so auto-resolution still finds something.
+fn check_override_major(
+    explicit: &str,
+    game_version: &str,
+    probed: Option<u32>,
+    required_major: u32,
+) -> Result<(String, u32), LaunchError> {
+    match probed {
+        Some(found) if found < required_major => Err(LaunchError::JavaTooOld {
+            path: explicit.to_string(),
+            version: game_version.to_string(),
+            found,
+            required: required_major,
+        }),
+        Some(found) => Ok((explicit.to_string(), found)),
+        None => Ok((explicit.to_string(), required_major)),
+    }
 }
 
 /// Map a required Java major to the Mojang runtime component that provides it,
@@ -477,6 +483,7 @@ mod tests {
         })).unwrap();
         let metadata = serde_json::json!({
             "id": "cached", "mainClass": "net.minecraft.client.main.Main",
+            "javaVersion": {"majorVersion": 17},
             "downloads": {"client": {"url": "https://example.invalid/client", "sha1": hex::encode(Sha1::digest(client_bytes))}},
             "assetIndex": {"id": "cached", "url": "https://example.invalid/index", "sha1": hex::encode(Sha1::digest(&index))},
             "libraries": [],
@@ -502,6 +509,19 @@ mod tests {
         assert!(prepared.args.windows(2).any(|args| args == ["--username", "Fixture"]));
         assert_eq!(std::fs::read(instance.join("resources/example.txt")).unwrap(), asset_bytes);
         // Preparation only: fixture client bytes are intentionally not runnable.
+    }
+
+    #[test]
+    fn explicit_java_override_older_than_required_fails_fast() {
+        let err = super::check_override_major("C:/jdk17", "1.21.1", Some(17), 21).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs Java 21"),
+            "override rejection must name the requirement, got: {msg}"
+        );
+        // Matching and unprobable (deleted JDK, typo) overrides pass through.
+        assert!(super::check_override_major("C:/jdk21", "1.21.1", Some(21), 21).is_ok());
+        assert!(super::check_override_major("C:/gone", "1.21.1", None, 21).is_ok());
     }
 
     /// Network test: parse real Mojang JSON for a modern (structured arguments)

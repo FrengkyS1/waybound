@@ -252,8 +252,7 @@ describe("Content tab file rows", () => {
     expect(sizeOf("big.jar")).toBe("2.4 MB");
   });
 
-  it("badges user-added mods and filters by origin", async () => {
-    await renderContent({
+  it("badges user-added mods and filters by origin", async () => {    await renderContent({
       mods: [
         entry({ fileName: "mine.jar", name: "Mine", addedByYou: true }),
         entry({ fileName: "pack.jar", name: "Pack", addedByYou: false }),
@@ -272,5 +271,21 @@ describe("Content tab file rows", () => {
     // And back to everything.
     fireEvent.click(within(addedGroup).getByRole("button", { name: /^all/i }));
     expect(screen.getByText("pack.jar")).toBeInTheDocument();
+  });
+
+  it("searches resolved display names, not just filenames", async () => {
+    await renderContent({
+      mods: [
+        entry({ fileName: "ftb-ranks-neoforge-2101.1.3.jar", name: "FTB Ranks" }),
+        entry({ fileName: "unrelated-1.0.0.jar", name: "Unrelated" }),
+      ],
+    });
+
+    await screen.findByText("FTB Ranks");
+    // "ftb r" has a space the filename never contains — only the
+    // display-name match finds it.
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "ftb r" } });
+    expect(screen.getByText("FTB Ranks")).toBeInTheDocument();
+    expect(screen.queryByText("Unrelated")).not.toBeInTheDocument();
   });
 });

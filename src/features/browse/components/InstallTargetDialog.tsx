@@ -111,6 +111,9 @@ export function InstallTargetDialog({
               loader: isModpack ? suggestedLoader : loader,
             }
           : undefined,
+      // A Browse mod install is a deliberate add — always yours. (Packs
+      // ignore this; their rows are pack by construction.)
+      origin: isModpack ? undefined : "user",
     });
     onSuccess(`Installing ${detail.summary.name}…`);
     onClose();

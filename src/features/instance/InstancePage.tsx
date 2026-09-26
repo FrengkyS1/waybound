@@ -413,7 +413,7 @@ function OverviewTab({
                 {instance.modpackProjectUid && (
                   <button
                     type="button"
-                    className={styles.packVersionsLink}
+                    className={styles.packVersionsBtn}
                     onClick={() => setPackVersionsOpen(true)}
                     title="Switch this instance to a different version of the modpack"
                   >
@@ -755,6 +755,15 @@ function ContentTab({
   }
 
   const term = search.trim().toLowerCase();
+  const matchesTerm = (e: ContentEntry) => {
+    if (!term) return true;
+    // Match the resolved display name too ("FTB Ranks"), not just the
+    // filename ("ftb-ranks-...jar") which never contains spaces.
+    return (
+      e.fileName.toLowerCase().includes(term) ||
+      (e.name ?? "").toLowerCase().includes(term)
+    );
+  };
   const visible = groups
     .filter((g) => filter === "all" || g.category === filter)
     .map((g) => ({
@@ -766,7 +775,7 @@ function ContentTab({
         .filter((e) =>
           addedFilter === "all" ? true : addedFilter === "mine" ? e.addedByYou : !e.addedByYou,
         )
-        .filter((e) => (term ? e.fileName.toLowerCase().includes(term) : true)),
+        .filter(matchesTerm),
     }));
 
   if (content && total === 0) {
@@ -1019,8 +1028,10 @@ function ContentTab({
       {configTarget && (
         <ConfigEditorModal
           instanceId={instance.id}
+          scope="mod"
           fileName={configTarget.fileName}
-          modLabel={configTarget.label}
+          title={configTarget.label}
+          emptyHint="No config files found for this mod."
           onClose={() => setConfigTarget(null)}
         />
       )}

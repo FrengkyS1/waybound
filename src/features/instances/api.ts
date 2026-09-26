@@ -246,6 +246,33 @@ export async function fetchInstanceWorlds(instanceId: string): Promise<WorldEntr
   return invoke<WorldEntry[]>("list_instance_worlds", { instanceId });
 }
 
+/** Text-editable files inside one world folder, paths relative to the
+ * world folder — pass straight back to readWorldFile/writeWorldFile.
+ * Empty (not an error) when the world has none editable in-app. */
+export async function listWorldFiles(
+  instanceId: string,
+  worldFolder: string,
+): Promise<ConfigFileEntry[]> {
+  return invoke("list_world_files", { instanceId, worldFolder });
+}
+
+export async function readWorldFile(
+  instanceId: string,
+  worldFolder: string,
+  relativePath: string,
+): Promise<string> {
+  return invoke("read_world_file", { instanceId, worldFolder, relativePath });
+}
+
+export async function writeWorldFile(
+  instanceId: string,
+  worldFolder: string,
+  relativePath: string,
+  contents: string,
+): Promise<void> {
+  await invoke("write_world_file", { instanceId, worldFolder, relativePath, contents });
+}
+
 /** Saved multiplayer servers from `servers.dat` — read-only list. */
 export async function fetchInstanceServers(instanceId: string): Promise<ServerEntry[]> {
   return invoke<ServerEntry[]>("list_instance_servers", { instanceId });
