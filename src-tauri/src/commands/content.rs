@@ -872,16 +872,17 @@ pub(crate) struct FileLaunchMeta {
     pub launch: ModLaunchMeta,
 }
 
-/// Judges parsed jar metadata against the instance's loader: loader-family
-/// mismatches plus required dependency ids no installed jar provides.
+/// Judges parsed jar metadata against the instance's loader and game
+/// version: loader-family mismatches, game-version ranges the instance
+/// falls outside of, plus required dependency ids no installed jar
+/// provides.
 /// Only the metadata entry matching the instance's loader counts — a
 /// multiloader jar's Fabric deps are meaningless on a NeoForge instance
 /// (and vice versa). A jar with no matching entry is flagged wrong-loader
 /// and its deps are skipped to avoid piling noise on the real problem.
-/// Game version is judged the same per-entry way: the matching entry's
-/// `mc_versions` ranges first, else MC-looking tokens in the file name
-/// (Forge jars often declare no minecraft range at all). Either signal
-/// firing lands the jar in `wrong_game_version`.
+/// File names are never consulted for versions (mod versions share the MC
+/// namespace). A jar whose entry carries no usable MC range stays silent
+/// on game version.
 /// Pure (no I/O) so the rules are unit-testable without instance fixtures.
 pub(crate) fn assess_readiness(
     instance_loader: ModLoader,
@@ -942,26 +943,25 @@ pub(crate) fn assess_readiness(
                 });
             }
         }
-        // Game version: metadata ranges win when present (authoritative);
-        // otherwise the file name is the only signal Forge-era jars give.
-        let declared = if !entry.mc_versions.is_empty() {
-            if entry
-                .mc_versions
+        // Game version: the matching loader entry's metadata ranges are
+        // the only signal. File names are deliberately NOT consulted —
+        // mod versions share the MC namespace (`alexsmobs-1.22.9.jar` is
+        // Alex's Mobs' own 1.22.9 built for MC 1.20.1), so name-based
+        // flagging cried wolf on working packs. A jar with no usable range
+        // stays silent; the install-time validation guards that class.
+        let shaped: Vec<&String> = entry
+            .mc_versions
+            .iter()
+            .filter(|r| range_mentions_mc_version(r))
+            .collect();
+        let declared = if shaped.is_empty()
+            || shaped
                 .iter()
                 .any(|r| mc_range_matches(r, instance_mc_version))
-            {
-                None
-            } else {
-                Some(entry.mc_versions.join(", "))
-            }
+        {
+            None
         } else {
-            let tokens = mc_versions_in_file_name(&file.file_name);
-            let mc = mc_triplet(instance_mc_version);
-            if tokens.is_empty() || tokens.iter().any(|t| mc_exact_matches(t, mc)) {
-                None
-            } else {
-                Some(tokens.join(", "))
-            }
+            Some(entry.mc_versions.join(", "))
         };
         if let Some(declared) = declared {
             wrong_game_version.push(WrongGameVersionFile {
@@ -996,10 +996,9 @@ fn mc_triplet(version: &str) -> (u32, u32, u32) {
     (num(parts.next()), num(parts.next()), num(parts.next()))
 }
 
-/// Exact-or-prefix equality: a 2-part declaration ("1.21", "26.2") covers
-/// its whole patch line, so it matches any instance under it; 3-part
-/// declarations must match fully. Used for exact atoms and file-name
-/// tokens alike.
+/// Exact-or-line equality: only the major.minor line must match — Mojang
+/// keeps patches wire-compatible, so a jar declaring 1.20 (or 1.20.0)
+/// runs on 1.20.1, while 1.20.x on 1.21.y genuinely breaks.
 fn mc_exact_matches(declared: &str, mc: (u32, u32, u32)) -> bool {
     let base = declared.trim().trim_end_matches(".x").trim_end_matches('.');
     // No digits at all ("*"-adjacent garbage): unparseable, passes.
@@ -1007,11 +1006,7 @@ fn mc_exact_matches(declared: &str, mc: (u32, u32, u32)) -> bool {
         return true;
     }
     let t = mc_triplet(base);
-    match base.split('.').filter(|p| !p.is_empty()).count() {
-        2 => t.0 == mc.0 && t.1 == mc.1,
-        3 => t == mc,
-        _ => t.0 == mc.0,
-    }
+    t.0 == mc.0 && t.1 == mc.1
 }
 
 /// Whether an instance game version is accepted by one minecraft dependency
@@ -1091,30 +1086,18 @@ fn mc_range_matches(range: &str, mc_version: &str) -> bool {
     })
 }
 
-/// MC-looking version tokens in a file name: maximal digit-dot runs whose
-/// first component is 1 (legacy `1.x.y`) or 26 (year-based). Loader builds
-/// ("47.1.11", "21.1.25") and bare counts never qualify.
-fn mc_versions_in_file_name(file_name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for run in file_name.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        let run = run.trim_matches('.');
-        let mut parts = run.split('.');
-        match parts.next() {
-            Some("1") | Some("26") => {}
-            _ => continue,
-        }
-        let count = run.split('.').count();
-        if (count == 2 || count == 3)
-            && run
-                .split('.')
-                .skip(1)
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-            && !out.iter().any(|v| v == run)
-        {
-            out.push(run.to_string());
-        }
-    }
-    out
+/// Whether a range string mentions any Minecraft-shaped version (a version
+/// part starting with 1 or 26). Jar metadata occasionally carries non-MC
+/// junk in version fields; without this, such junk would evaluate against
+/// the instance version and cry wolf.
+fn range_mentions_mc_version(range: &str) -> bool {
+    range
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|p| !p.is_empty())
+        .any(|p| {
+            let mut nums = p.split('.');
+            matches!(nums.next(), Some("1") | Some("26"))
+        })
 }
 
 /// Pre-launch readiness check: reads every ENABLED jar's own metadata and
@@ -1899,7 +1882,7 @@ mod config_matching_tests {
 
 #[cfg(test)]
 mod launch_meta_tests {
-    use super::{assess_readiness, mc_range_matches, mc_versions_in_file_name, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
+    use super::{assess_readiness, mc_range_matches, range_mentions_mc_version, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
     use crate::dto::ModLoader;
     use std::io::Write;
 
@@ -2110,10 +2093,12 @@ mod launch_meta_tests {
 
     #[test]
     fn mc_range_matching_covers_shipped_shapes() {
-        // Exact + prefix line.
+        // Exact versions match by major.minor line — patches stay
+        // wire-compatible, so 1.20.0 runs on 1.20.1.
         assert!(mc_range_matches("1.21.1", "1.21.1"));
-        assert!(!mc_range_matches("1.20.1", "1.21.1"));
         assert!(mc_range_matches("1.21", "1.21.1"));
+        assert!(mc_range_matches("1.20.0", "1.20.1"));
+        assert!(!mc_range_matches("1.20.1", "1.21.1"));
         assert!(!mc_range_matches("1.20", "1.21.1"));
         // Maven intervals.
         assert!(mc_range_matches("[1.20,1.21)", "1.20.4"));
@@ -2137,21 +2122,13 @@ mod launch_meta_tests {
     }
 
     #[test]
-    fn file_name_tokens_skip_loader_builds() {
-        assert_eq!(
-            mc_versions_in_file_name("biggerstacks-1.20.1-2026.06.17-all.jar"),
-            vec!["1.20.1".to_string()]
-        );
-        assert!(mc_versions_in_file_name("forge-47.1.11-client.jar").is_empty());
-        assert!(mc_versions_in_file_name("neoforge-21.1.25-installer.jar").is_empty());
-        assert_eq!(
-            mc_versions_in_file_name("sodium-neoforge-0.8.13-beta.2+mc1.21.1.jar"),
-            vec!["1.21.1".to_string()]
-        );
-        assert_eq!(
-            mc_versions_in_file_name("somemod-1.21.jar"),
-            vec!["1.21".to_string()]
-        );
+    fn range_shape_guard_ignores_non_mc_junk() {
+        assert!(range_mentions_mc_version(">=1.20"));
+        assert!(range_mentions_mc_version("[1.20,1.21)"));
+        assert!(range_mentions_mc_version("1.21.1"));
+        assert!(!range_mentions_mc_version("2.64"));
+        assert!(!range_mentions_mc_version("garbage"));
+        assert!(!range_mentions_mc_version(""));
     }
 
     #[test]
@@ -2171,19 +2148,22 @@ mod launch_meta_tests {
     }
 
     #[test]
-    fn outdated_jar_is_flagged_by_file_name() {
-        // Forge-era jars often declare no minecraft range at all — the
-        // Bigger Stacks case: file name is the only signal.
-        let files = vec![file(
+    fn versioned_file_name_without_metadata_stays_silent() {
+        // Incident regression test: `alexsmobs-1.22.9.jar` is Alex's Mobs'
+        // own 1.22.9 built for MC 1.20.1 — a file-name-only signal flagged
+        // it (plus ATi Structures, BetterThanMending) on a 1.20.1 instance.
+        // Names are never consulted now, so all such jars stay silent.
+        for name in [
+            "alexsmobs-1.22.9.jar",
+            "ATi Structures V1.4.6.jar",
+            "BetterThanMending-1.7.2.jar",
             "biggerstacks-1.20.1-2026.06.17-all.jar",
-            Some("biggerstacks"),
-            launch_with("neoforge", &[]),
-        )];
-        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
-        assert!(report.wrong_loader.is_empty());
-        assert_eq!(report.wrong_game_version.len(), 1);
-        assert_eq!(report.wrong_game_version[0].declared, "1.20.1");
-        assert_eq!(report.wrong_game_version[0].expected, "1.21.1");
+        ] {
+            let files = vec![file(name, Some("somemod"), launch_with("forge", &[]))];
+            let report = assess_readiness(ModLoader::Forge, "1.20.1", &files, &[]);
+            assert!(report.wrong_loader.is_empty(), "{name}");
+            assert!(report.wrong_game_version.is_empty(), "{name}");
+        }
     }
 
     #[test]
