@@ -12,8 +12,9 @@ pub mod transfer;
 pub use auth::{get_account, logout, microsoft_login};
 pub use content::{
     check_launch_readiness, get_content_meta, list_instance_content, list_instance_servers,
-    list_instance_worlds, list_mod_configs, read_config_file, remove_content_file,
-    set_content_enabled, write_config_file,
+    list_instance_worlds, list_mod_configs, list_world_files, read_config_file,
+    read_world_file, remove_content_file, set_content_enabled, write_config_file,
+    write_world_file,
 };
 pub use config::{
     clear_curseforge_api_key, get_curseforge_status, import_curseforge_api_key_from_env_file,
@@ -22,7 +23,7 @@ pub use config::{
 pub use launch::{
     add_play_time, cancel_launch, get_instance_launch_config, get_launch_settings,
     get_running_instances, launch_instance, list_java_runtimes, read_launch_log,
-    set_instance_launch_config, set_launch_settings,
+    set_instance_launch_config, set_launch_settings, stop_game,
 };
 pub use instances::{
     cancel_install, create_instance, delete_instance, dismiss_missing_mod, duplicate_instance,

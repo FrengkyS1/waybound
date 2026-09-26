@@ -92,6 +92,10 @@ export interface InstallModInput {
     minecraftVersion: string;
     loader: ModLoader;
   };
+  /** Explicit origin. Browse passes "user" (a deliberate add is always
+   * yours); flows without that context omit it and let the backend derive
+   * pack-vs-user from the pack sidecars. */
+  origin?: "user" | "pack";
 }
 
 export interface InstallModResult {

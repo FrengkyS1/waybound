@@ -182,13 +182,15 @@ export function ProjectDetailPage({
   function handleDirectInstall(version?: VersionPrefill) {
     if (!installTarget) return;
     const name = detail?.summary?.name ?? summary.name;
+    const installing = detail?.summary ?? summary;
     startInstall(name, {
-      modSummary: detail?.summary ?? summary,
+      modSummary: installing,
       source: null,
       instanceId: installTarget.instanceId,
       versionId: version?.versionId,
+      origin: installing.projectType === "modpack" ? undefined : "user",
     });
-    showToast(`Installing ${name}…`);
+    showToast(`Installing ${name}.`);
   }
 
   return (

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { usePlayStore } from "./store";
 import { checkLaunchReadiness, type LaunchReadiness } from "./api";
@@ -22,11 +22,20 @@ export function PlayButton({
 }: PlayButtonProps) {
   const account = usePlayStore((s) => s.account);
   const play = usePlayStore((s) => s.play);
+  const cancelLaunch = usePlayStore((s) => s.cancelLaunch);
+  const stopGame = usePlayStore((s) => s.stopGame);
   const launch = usePlayStore((s) => s.launches[instanceId]);
   const [signInOpen, setSignInOpen] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
-  const isBusyHere =
-    !!launch && (launch.phase === "preparing" || launch.phase === "running");
+  const isPreparing = launch?.phase === "preparing";
+  const isRunning = launch?.phase === "running";
+  const isBusyHere = isPreparing || isRunning;
+
+  // The exit event clears the launch entry, which re-arms the button.
+  useEffect(() => {
+    if (!isRunning) setStopping(false);
+  }, [isRunning]);
 
   const [checking, setChecking] = useState(false);
   const [readiness, setReadiness] = useState<LaunchReadiness | null>(null);
@@ -40,7 +49,11 @@ export function PlayButton({
     setChecking(true);
     try {
       const report = await checkLaunchReadiness(instanceId);
-      if (report.wrongLoader.length === 0 && report.missingDeps.length === 0) {
+      if (
+        report.wrongLoader.length === 0 &&
+        report.missingDeps.length === 0 &&
+        (report.wrongGameVersion ?? []).length === 0
+      ) {
         void play(instanceId, instanceName);
       } else {
         setReadiness(report);
@@ -53,6 +66,18 @@ export function PlayButton({
   }
 
   function handleClick() {
+    // The dock has the same actions, but the hero button is where the
+    // player is looking — surface Cancel/Stop here too.
+    if (isPreparing) {
+      cancelLaunch(instanceId);
+      return;
+    }
+    if (isRunning) {
+      if (stopping) return;
+      setStopping(true);
+      stopGame(instanceId);
+      return;
+    }
     if (!account) {
       setSignInOpen(true);
       return;
@@ -60,26 +85,36 @@ export function PlayButton({
     void startPlay();
   }
 
-  const label = isBusyHere
-    ? launch?.phase === "running"
-      ? "Running"
-      : "Launching."
-    : checking
-      ? "Checking…"
-      : account
-        ? "Play"
-        : "Sign in to play";
+  const label = isPreparing
+    ? "Cancel"
+    : isRunning
+      ? stopping
+        ? "Stopping…"
+        : "Stop"
+      : checking
+        ? "Checking…"
+        : account
+          ? "Play"
+          : "Sign in to play";
+
+  const actionClass =
+    variant === "primary" ? styles.primary : styles.compact;
 
   return (
     <>
       <button
         type="button"
-        className={variant === "primary" ? styles.primary : styles.compact}
+        className={`${actionClass} ${isRunning ? styles.stop : ""}`}
         onClick={handleClick}
-        disabled={disabled || isBusyHere || checking}
+        disabled={disabled || checking || stopping}
+        title={
+          isRunning
+            ? "Force-stop the game (unsaved progress may be lost)"
+            : undefined
+        }
       >
       <span className={styles.icon} aria-hidden>
-        ▶
+        {isRunning ? "■" : "▶"}
       </span>
         {label}
       </button>
@@ -123,9 +158,15 @@ function readinessMessage(r: LaunchReadiness): string {
       `"${m.modName ?? m.fileName}" needs "${m.depModId}"${m.versionRange ? ` (${m.versionRange})` : ""}, which isn't installed.`,
     );
   }
+  for (const g of (r.wrongGameVersion ?? []).slice(0, MAX_LISTED)) {
+    lines.push(
+      `"${g.modName ?? g.fileName}" targets Minecraft ${g.declared} but this instance runs ${g.expected} — the game will refuse to load it.`,
+    );
+  }
   const hidden =
     Math.max(0, r.wrongLoader.length - MAX_LISTED) +
-    Math.max(0, r.missingDeps.length - MAX_LISTED);
+    Math.max(0, r.missingDeps.length - MAX_LISTED) +
+    Math.max(0, (r.wrongGameVersion ?? []).length - MAX_LISTED);
   if (hidden > 0) lines.push(`…and ${hidden} more.`);
   return lines.join("\n");
 }

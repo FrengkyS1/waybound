@@ -188,14 +188,21 @@ impl Database {
             if pack_files.is_empty() {
                 continue;
             }
-            let placeholders = pack_files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            // Match both spellings: rows may store the `.disabled`-suffixed
+            // name while sidecars record the base filename.
+            let mut names: Vec<String> = pack_files.iter().cloned().collect();
+            names.extend(
+                pack_files
+                    .iter()
+                    .map(|n| format!("{n}.disabled")),
+            );
+            let placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE instance_mods SET origin = 'pack' WHERE instance_id = ?1 AND origin = 'user' AND file_name IN ({placeholders})"
             );
             if let Ok(conn) = self.conn() {
                 let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
-                let owned: Vec<String> = pack_files.into_iter().collect();
-                params.extend(owned.iter().map(|s| s as &dyn rusqlite::ToSql));
+                params.extend(names.iter().map(|s| s as &dyn rusqlite::ToSql));
                 let _ = conn.execute(&sql, params.as_slice());
             }
         }
@@ -623,34 +630,43 @@ pub struct LoaderMetaRow {
     pub fetched_at: u64,
 }
 
-/// Filenames the instance's pack sidecars claim (CF manifest entries'
-/// `filename`, mrpack `mods/` paths reduced to file names). Shared by
-/// the origin backfill and the Content tab's untracked-file marking.
-/// Best-effort: unreadable sidecars contribute nothing.
-pub(crate) fn pack_filenames(root: &std::path::Path) -> std::collections::HashSet<String> {
-    let mut pack_files = std::collections::HashSet::new();
-    if let Ok(text) = std::fs::read_to_string(root.join(".curseforge-pack-manifest.json")) {
-        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
-            for entry in &entries {
-                if let Some(name) = entry.get("filename").and_then(|v| v.as_str()) {
-                    pack_files.insert(name.to_string());
+    /// Filenames the instance's pack sidecars claim: CF manifest entries'
+    /// `filename`, mrpack `mods/` paths reduced to file names, plus
+    /// override files recorded at import time (resource packs, configs,
+    /// extra jars — none of which the manifests list). Shared by the
+    /// origin backfill and the Content tab's untracked-file marking.
+    /// Best-effort: unreadable sidecars contribute nothing.
+    pub(crate) fn pack_filenames(root: &std::path::Path) -> std::collections::HashSet<String> {
+        fn insert_basename(set: &mut std::collections::HashSet<String>, path: &str) {
+            if let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() {
+                    set.insert(name.to_string());
                 }
             }
         }
-    }
-    if let Ok(text) = std::fs::read_to_string(root.join(".modrinth-pack-manifest.json")) {
-        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
-            for entry in &entries {
-                if let Some(path) = entry.as_str() {
-                    if let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) {
+        let mut pack_files = std::collections::HashSet::new();
+        if let Ok(text) = std::fs::read_to_string(root.join(".curseforge-pack-manifest.json")) {
+            if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+                for entry in &entries {
+                    if let Some(name) = entry.get("filename").and_then(|v| v.as_str()) {
                         pack_files.insert(name.to_string());
                     }
                 }
             }
         }
+        for manifest in [".modrinth-pack-manifest.json", ".pack-overrides-manifest.json"] {
+            if let Ok(text) = std::fs::read_to_string(root.join(manifest)) {
+                if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for entry in &entries {
+                        if let Some(path) = entry.as_str() {
+                            insert_basename(&mut pack_files, path);
+                        }
+                    }
+                }
+            }
+        }
+        pack_files
     }
-    pack_files
-}
 
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
     let loader_raw: String = row.get(3)?;

@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   listModConfigs,
+  listWorldFiles,
   readConfigFile,
+  readWorldFile,
   writeConfigFile,
+  writeWorldFile,
   type ConfigFileEntry,
 } from "../instances/api";
 import { useEscapeKey } from "../../hooks/useEscapeKey";
@@ -10,15 +13,19 @@ import { useModalFocus } from "../../hooks/useModalFocus";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import styles from "./ConfigEditorModal.module.css";
 
-interface ConfigEditorModalProps {
+type ConfigEditorModalProps = {
   instanceId: string;
-  /** The mod's jar filename — what `list_mod_configs` matches against. */
-  fileName: string;
-  /** Display name for the modal title (the mod's resolved name, falling
-   * back to a humanized filename upstream). */
-  modLabel: string;
+  /** Dialog title (mod display name or world name). */
+  title: string;
+  /** Shown when the scope lists zero files. */
+  emptyHint: string;
   onClose: () => void;
-}
+} & (
+  /** Per-mod config/ files matched by jar filename. */
+  | { scope: "mod"; fileName: string; worldFolder?: never }
+  /** Text files inside one world folder. */
+  | { scope: "world"; worldFolder: string; fileName?: never }
+);
 
 type LoadState =
   | { stage: "loading-list" }
@@ -28,9 +35,10 @@ type LoadState =
 
 export function ConfigEditorModal({
   instanceId,
-  fileName,
-  modLabel,
+  title,
+  emptyHint,
   onClose,
+  ...scope
 }: ConfigEditorModalProps) {
   const [state, setState] = useState<LoadState>({ stage: "loading-list" });
   const [selected, setSelected] = useState<ConfigFileEntry | null>(null);
@@ -47,6 +55,10 @@ export function ConfigEditorModal({
   const saveInFlight = useRef(false);
   const modalRef = useModalFocus();
 
+  // Stable primitive key for the effect below — the scope object itself
+  // would be a fresh identity every render.
+  const scopeKey =
+    scope.scope === "mod" ? `mod:${scope.fileName}` : `world:${scope.worldFolder}`;
   useEffect(() => {
     let cancelled = false;
     setState({ stage: "loading-list" });
@@ -55,7 +67,10 @@ export function ConfigEditorModal({
     setSavedContent("");
     setFileError(null);
     request.current += 1;
-    void listModConfigs(instanceId, fileName)
+    void (scope.scope === "mod"
+      ? listModConfigs(instanceId, scope.fileName)
+      : listWorldFiles(instanceId, scope.worldFolder)
+    )
       .then((configs) => {
         if (cancelled) return;
         if (configs.length === 0) {
@@ -77,7 +92,7 @@ export function ConfigEditorModal({
       request.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instanceId, fileName]);
+  }, [instanceId, scopeKey]);
 
   async function openFile(entry: ConfigFileEntry) {
     if (saveInFlight.current) return;
@@ -88,7 +103,10 @@ export function ConfigEditorModal({
     setLoadingFile(true);
     setSelected(entry);
     try {
-      const text = await readConfigFile(instanceId, entry.relativePath);
+      const text =
+        scope.scope === "mod"
+          ? await readConfigFile(instanceId, entry.relativePath)
+          : await readWorldFile(instanceId, scope.worldFolder, entry.relativePath);
       if (generation !== request.current) return;
       setContent(text);
       setSavedContent(text);
@@ -119,7 +137,11 @@ export function ConfigEditorModal({
     setSaving(true);
     setFileError(null);
     try {
-      await writeConfigFile(instanceId, selected.relativePath, saved);
+      if (scope.scope === "mod") {
+        await writeConfigFile(instanceId, selected.relativePath, saved);
+      } else {
+        await writeWorldFile(instanceId, scope.worldFolder, selected.relativePath, saved);
+      }
       if (generation === request.current) setSavedContent(saved);
     } catch (err) {
       if (generation === request.current) setFileError(err instanceof Error ? err.message : String(err));
@@ -141,12 +163,12 @@ export function ConfigEditorModal({
         tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-label={`Edit config for ${modLabel}`}
+        aria-label={`Edit files for ${title}`}
         onClick={(e) => e.stopPropagation()}
       >
         <header className={styles.header}>
           <div>
-            <h2 className={styles.title}>{modLabel}</h2>
+            <h2 className={styles.title}>{title}</h2>
             {selected && <p className={styles.subtitle}>{selected.displayName}</p>}
           </div>
           <button
@@ -183,7 +205,7 @@ export function ConfigEditorModal({
           <div className={styles.editorPane}>
             {state.stage === "loading-list" && <p className={styles.hint}>Loading…</p>}
             {state.stage === "no-configs" && (
-              <p className={styles.hint}>No config files found for this mod.</p>
+              <p className={styles.hint}>{emptyHint}</p>
             )}
             {state.stage === "list-error" && <p className={styles.error}>{state.message}</p>}
             {state.stage === "ready" && !selected && !loadingFile && (

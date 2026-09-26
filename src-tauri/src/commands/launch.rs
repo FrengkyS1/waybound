@@ -125,8 +125,7 @@ pub fn read_launch_log(instance_id: String) -> Result<Vec<String>, String> {
 /// a Windows-only helper process as an acceptable answer elsewhere (e.g. Java
 /// version probing), and this is a startup-only, once-per-instance check.
 #[cfg(windows)]
-fn is_pid_alive(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
+fn is_pid_alive(pid: u32) -> bool {    let output = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -145,6 +144,32 @@ fn is_pid_alive(pid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Force-kills a game process for `stop_game`. Same no-new-crate policy as
+/// `is_pid_alive` above; hard kill, like Prism — there is no graceful
+/// "please save and quit" channel to a running game.
+#[cfg(windows)]
+fn kill_pid(pid: u32) -> std::io::Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| std::io::Error::other(format!("taskkill exited {status}")))
+}
+
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) -> std::io::Result<()> {
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| std::io::Error::other(format!("kill exited {status}")))
 }
 
 /// A Minecraft process detected as still running from a previous Waybound
@@ -209,6 +234,12 @@ fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
         let _ = std::fs::remove_file(&pid_file);
+        let user_stopped = app
+            .state::<AppState>()
+            .stop_requests
+            .lock()
+            .map(|mut set| set.remove(&instance_id))
+            .unwrap_or(false);
         let _ = app.emit(
             "launch://exited",
             LaunchExitedEvent {
@@ -218,9 +249,51 @@ fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path
                 // read output from, so there's nothing to diagnose.
                 crashed: false,
                 crash_reason: None,
+                stopped_by_user: user_stopped,
             },
         );
     });
+}
+
+/// Kills a running game: the live PID from this session when present, else
+/// the PID file (covers games adopted from a previous session). Records a
+/// stop request first so whichever reaper notices reports "stopped" rather
+/// than "crashed". No-op when nothing is running — the desired state
+/// already holds, so there is nothing to report as an error.
+#[tauri::command]
+pub fn stop_game(state: State<'_, AppState>, instance_id: String) -> Result<(), String> {
+    let pid = state
+        .game_pids
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&instance_id)
+        .copied()
+        .or_else(|| {
+            let root = crate::instances::paths::instance_root(&instance_id).ok()?;
+            std::fs::read_to_string(root.join(PID_FILE_NAME))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        });
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    if let Ok(mut stops) = state.stop_requests.lock() {
+        stops.insert(instance_id.clone());
+    }
+    if let Err(err) = kill_pid(pid) {
+        // Lost the race with a natural exit: the reaper reports it normally,
+        // so withdraw the stop request rather than mislabel a future run.
+        if is_pid_alive(pid) {
+            if let Ok(mut stops) = state.stop_requests.lock() {
+                stops.remove(&instance_id);
+            }
+            return Err(format!("Couldn't stop the game: {err}"));
+        }
+        if let Ok(mut stops) = state.stop_requests.lock() {
+            stops.remove(&instance_id);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -545,6 +618,12 @@ async fn run_launch(
     // if this write fails, launching still proceeds exactly as before.
     let pid_file = prepared.working_dir.join(PID_FILE_NAME);
     let _ = std::fs::write(&pid_file, child.id().to_string());
+    // Remember the live PID so `stop_game` can kill a running game (the
+    // reaper thread below takes ownership of the Child itself, so without
+    // this there would be no handle left to stop it with).
+    if let Ok(mut pids) = state.game_pids.lock() {
+        pids.insert(instance_id.clone(), child.id());
+    }
 
     let _ = app.emit(
         "launch://started",
@@ -583,10 +662,22 @@ async fn run_launch(
             }
         };
         let _ = std::fs::remove_file(&pid_file);
+        let exit_state = exit_app.state::<AppState>();
+        if let Ok(mut pids) = exit_state.game_pids.lock() {
+            pids.remove(&exit_id);
+        }
+        // A deliberate stop reports as stopped, not crashed: the non-zero
+        // exit code a kill produces would otherwise mislabel it.
+        let user_stopped = exit_state
+            .stop_requests
+            .lock()
+            .map(|mut set| set.remove(&exit_id))
+            .unwrap_or(false);
 
-        // Any non-zero code is a crash: a normal quit from the game's own menu
-        // exits 0, and the player closing the window does too.
-        let crashed = code.is_some_and(|code| code != 0);
+        // Any non-zero code is a crash, unless the user stopped it
+        // deliberately: a normal quit from the game's own menu exits 0,
+        // and the player closing the window does too.
+        let crashed = !user_stopped && code.is_some_and(|code| code != 0);
         let crash_reason = crashed.then(|| {
             // The reader threads are still draining the pipe at the moment
             // try_wait returns, and the mod-loader error that explains the
@@ -602,6 +693,11 @@ async fn run_launch(
 
         match &crash_reason {
             Some(reason) => crate::activity::append_log(reason, "error", None),
+            None if user_stopped => crate::activity::append_log(
+                &format!("{exit_name} stopped by the player"),
+                "info",
+                None,
+            ),
             None => crate::activity::append_log(
                 &format!("{exit_name} closed (exit {code:?})"),
                 "info",
@@ -615,6 +711,7 @@ async fn run_launch(
                 code,
                 crashed,
                 crash_reason,
+                stopped_by_user: user_stopped,
             },
         );
     });
@@ -893,6 +990,9 @@ struct LaunchExitedEvent {
     /// A complete, human-readable sentence naming the instance and, where it
     /// could be worked out, the actual cause. `None` unless `crashed`.
     crash_reason: Option<String>,
+    /// The player pressed Stop (as opposed to the game exiting on its own).
+    /// Lets the frontend report "Stopped" instead of "Crashed".
+    stopped_by_user: bool,
 }
 
 #[cfg(test)]

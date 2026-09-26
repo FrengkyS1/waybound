@@ -80,9 +80,10 @@ impl PackTransaction {
         Ok(())
     }
 
-    pub async fn overrides(&mut self, bytes: &[u8], prefixes: &[&str], cancel: &CancelToken) -> Result<u32, ModpackError> {
+    pub async fn overrides(&mut self, bytes: &[u8], prefixes: &[&str], cancel: &CancelToken) -> Result<(u32, Vec<String>), ModpackError> {
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
         let mut applied = 0;
+        let mut paths = Vec::new();
         // Prefix order is deliberate: client overrides win over common files.
         for prefix in prefixes {
             let prefix = format!("{}/", prefix.trim_end_matches('/'));
@@ -107,9 +108,10 @@ impl PackTransaction {
                 entry.read_to_end(&mut data)?;
                 self.stage(&relative, &data)?;
                 applied += 1;
+                paths.push(normalized);
             }
         }
-        Ok(applied)
+        Ok((applied, paths))
     }
 
     pub async fn commit(mut self, cancel: &CancelToken) -> Result<(), ModpackError> {

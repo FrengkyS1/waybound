@@ -326,9 +326,14 @@ impl InstanceService {
         summary: &ModSummary,
 
         preferred_source: Option<ModSource>,
-
         version_id: Option<&str>,
+
         update_existing: bool,
+
+        // Explicit origin override. When absent, a sidecar-claimed
+        // filename means pack (reinstalling or version-switching pack
+        // content); anything else is a genuine add.
+        origin: Option<crate::dto::ModOrigin>,
 
         cancel: &crate::download::CancelToken,
 
@@ -509,6 +514,12 @@ impl InstanceService {
             None => None,
         };
 
+        // Origin for the new row: explicit caller override wins, else a
+        // sidecar-claimed filename means reinstalling pack content.
+        let sidecar_claimed = instance_root(instance_id)
+            .ok()
+            .map(|root| crate::db::pack_filenames(&root).contains(&download.filename))
+            .unwrap_or(false);
         let installed = db.insert_instance_mod(
 
             instance_id,
@@ -525,8 +536,7 @@ impl InstanceService {
 
             icon.as_deref(),
 
-            // Direct user install (Browse button / update flow) — never pack.
-            crate::dto::ModOrigin::User,
+            resolve_install_origin(origin, sidecar_claimed),
 
         )?;
 
@@ -1325,6 +1335,22 @@ fn strip_pack_extension(filename: &str) -> String {
         .to_string()
 }
 
+/// Decides the recorded origin for a fresh install row: an explicit
+/// caller override wins (Browse passes User; update passes the row's),
+/// otherwise a sidecar-claimed filename means pack content being
+/// reinstalled or version-switched, and anything else is a genuine add.
+/// Pure so the precedence is unit-testable without a database.
+fn resolve_install_origin(
+    explicit: Option<crate::dto::ModOrigin>,
+    sidecar_claimed: bool,
+) -> crate::dto::ModOrigin {
+    explicit.unwrap_or(if sidecar_claimed {
+        crate::dto::ModOrigin::Pack
+    } else {
+        crate::dto::ModOrigin::User
+    })
+}
+
 fn sync_mods_folder(
 
     db: &Database,
@@ -1767,6 +1793,12 @@ fn map_curseforge_install_error(err: crate::sources::curseforge::CurseForgeError
 
         )),
 
+        crate::sources::curseforge::CurseForgeError::WrongGameVersion { filename, file_versions, expected } => InstanceError::Other(format!(
+
+            "{filename} is not built for Minecraft {expected} (it targets {}). This project has no {expected} release — pick a different version or mod.", file_versions.join(", ")
+
+        )),
+
         crate::sources::curseforge::CurseForgeError::Rejected { message, .. } => {
 
             InstanceError::Other(message)
@@ -1927,9 +1959,9 @@ pub struct ResolvedDownload {
 
 mod tests {
 
-    use super::{is_installable, is_reserved_windows_name, slugify, strip_pack_extension};
+    use super::{is_installable, is_reserved_windows_name, map_curseforge_install_error, resolve_install_origin, slugify, strip_pack_extension};
 
-    use crate::dto::ContentType;
+    use crate::dto::{ContentType, ModOrigin};
 
 
 
@@ -1939,6 +1971,18 @@ mod tests {
 
         assert!(is_installable(ContentType::Modpack));
 
+    }
+
+    #[test]
+    fn install_origin_explicit_wins_then_sidecar_then_user() {
+        // Browse passes User explicitly: always yours, even overlapping a
+        // pack file. Updates pass the row's origin through the same slot.
+        assert_eq!(resolve_install_origin(Some(ModOrigin::User), true), ModOrigin::User);
+        assert_eq!(resolve_install_origin(Some(ModOrigin::Pack), false), ModOrigin::Pack);
+        // No context (version modal on an untracked file): the sidecar
+        // decides — reinstalling pack content stays pack.
+        assert_eq!(resolve_install_origin(None, true), ModOrigin::Pack);
+        assert_eq!(resolve_install_origin(None, false), ModOrigin::User);
     }
 
     #[test]
@@ -1967,6 +2011,23 @@ mod tests {
         // Unrecognized extension (or none) is left untouched rather than
         // guessed at.
         assert_eq!(strip_pack_extension("weird-pack.tar.gz"), "weird-pack.tar.gz");
+    }
+
+    #[test]
+    fn wrong_game_version_error_names_the_mismatch() {
+        // The Bigger Stacks case: 1.20.1-only file offered to a 1.21.1
+        // instance must name both sides, not a bare "no compatible file".
+        let err = map_curseforge_install_error(
+            crate::sources::curseforge::CurseForgeError::WrongGameVersion {
+                filename: "biggerstacks-1.20.1-2026.06.17-all.jar".to_string(),
+                file_versions: vec!["1.20.1".to_string()],
+                expected: "1.21.1".to_string(),
+            },
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("biggerstacks-1.20.1-2026.06.17-all.jar"), "got: {msg}");
+        assert!(msg.contains("1.21.1"), "got: {msg}");
+        assert!(msg.contains("1.20.1"), "got: {msg}");
     }
 
 }

@@ -330,6 +330,7 @@ pub async fn install_mod_to_instance(
         input.source,
         input.version_id.as_deref(),
         false,
+        input.origin,
         &cancel,
         &report,
     )
@@ -524,6 +525,9 @@ pub async fn update_mod_in_instance(
         Some(preferred_source),
         version_id.as_deref(),
         true,
+        // Updating (or version-switching) a mod is maintenance, not adding:
+        // the row's origin survives the delete-and-reinstall below.
+        Some(row.origin),
         &cancel,
         &report,
     )

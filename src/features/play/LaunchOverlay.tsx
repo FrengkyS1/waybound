@@ -5,11 +5,49 @@ import styles from "./LaunchOverlay.module.css";
 
 export function LaunchOverlay() {
   const launches = usePlayStore((s) => s.launches);
+  const minimized = usePlayStore((s) => s.launchDockMinimized);
+  const setMinimized = usePlayStore((s) => s.setLaunchDockMinimized);
   const entries = Object.values(launches);
   if (entries.length === 0) return null;
 
+  // Minimized: just a peek tab on the bottom-right edge — same pattern as
+  // the install dock. Clicking it brings the full dock back.
+  if (minimized) {
+    const anyRunning = entries.some((e) => e.phase === "running" || e.phase === "preparing");
+    return (
+      <button
+        type="button"
+        className={styles.peek}
+        onClick={() => setMinimized(false)}
+        aria-label={`Show ${entries.length} notification${entries.length === 1 ? "" : "s"}`}
+        title="Show notifications"
+      >
+        <span
+          className={`${styles.dot} ${anyRunning ? styles.dot_running : styles.dot_exited}`}
+          aria-hidden
+        />
+        <span aria-hidden>▴</span>
+        <span>{entries.length}</span>
+      </button>
+    );
+  }
+
   return (
     <div className={styles.dock} role="status" aria-live="polite">
+      <div className={styles.dockHeader}>
+        <span className={styles.dockTitle}>
+          {entries.length} background {entries.length === 1 ? "item" : "items"}
+        </span>
+        <button
+          type="button"
+          className={styles.minimize}
+          onClick={() => setMinimized(true)}
+          aria-label="Minimize notifications"
+          title="Minimize"
+        >
+          ▾
+        </button>
+      </div>
       {entries.map((launch) => (
         <LaunchCard key={launch.instanceId} launch={launch} />
       ))}
@@ -21,7 +59,9 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
   const dismiss = usePlayStore((s) => s.dismissLaunch);
   const play = usePlayStore((s) => s.play);
   const cancelLaunch = usePlayStore((s) => s.cancelLaunch);
+  const stopGame = usePlayStore((s) => s.stopGame);
   const [showLog, setShowLog] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
   // Auto-scroll the log to the newest line.
@@ -140,6 +180,21 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
               onClick={() => cancelLaunch(launch.instanceId)}
             >
               Cancel
+            </button>
+          )}
+          {phase === "running" && (
+            <button
+              type="button"
+              className={styles.stop}
+              disabled={stopping}
+              title="Force-stop the game (unsaved progress may be lost)"
+              onClick={() => {
+                if (stopping) return;
+                setStopping(true);
+                stopGame(launch.instanceId);
+              }}
+            >
+              {stopping ? "Stopping…" : "Stop"}
             </button>
           )}
           {dismissable && (
