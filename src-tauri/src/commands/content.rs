@@ -1015,40 +1015,61 @@ fn mc_exact_matches(declared: &str, mc: (u32, u32, u32)) -> bool {
 /// Fabric/npm comparators (">=1.20", ">1.20 <1.21", "1.20.x") and "||"
 /// unions. Anything unparseable matches — readiness is advisory and must
 /// not cry wolf on exotic ranges.
+///
+/// Comparison is at major.minor LINE granularity with inclusive bounds:
+/// patches stay wire-compatible, and — decisively — the game loader itself
+/// accepts the MDK-boilerplate `[1.21,1.21.1)` on 1.21.1 (NeoForge's own
+/// loading screen named only the truly wrong file when a 1.20.1 jar sat
+/// next to forty such mods). A checker stricter than the loader is just
+/// another wolf cry.
 fn mc_range_matches(range: &str, mc_version: &str) -> bool {
     let mc = mc_triplet(mc_version);
-    range.split("||").any(|branch| {
-        let branch = branch.trim();
+    let mc_line = (mc.0, mc.1);
+    // Maven multi-ranges (`[1.21],[1.21.1]` — an exact-pin union) split on
+    // commas that are NOT inside brackets; interval commas are handled
+    // by the branch logic below. An empty range matches (no constraint).
+    let parts = split_top_level(range);
+    if parts.is_empty() {
+        return true;
+    }
+    parts.into_iter().any(|part| {
+        part.split("||").any(|branch| {
+            let branch = branch.trim();
         if branch.is_empty() || branch == "*" {
             return true;
         }
-        // Maven interval: [lo,hi], (lo,hi), [lo,hi), (lo,hi]; an empty
-        // bound is open-ended.
+        // Maven interval: bounds name LINES, and both ends count as
+        // inclusive no matter the bracket flavor — see the doc comment.
         if (branch.starts_with('[') || branch.starts_with('('))
             && (branch.ends_with(']') || branch.ends_with(')'))
         {
-            let lo_inclusive = branch.starts_with('[');
-            let hi_inclusive = branch.ends_with(']');
             let inner = &branch[1..branch.len() - 1];
+            // No comma: an exact pin (`[1.20]`), matched by line.
+            if !inner.contains(',') {
+                return mc_exact_matches(inner, mc);
+            }
             let mut bounds = inner.splitn(2, ',');
             let lo = bounds.next().unwrap_or("").trim();
             let hi = bounds.next().unwrap_or("").trim();
             // Digitless bounds ("(,)") are open-ended, like empty ones.
             if !lo.is_empty() && lo.chars().any(|c| c.is_ascii_digit()) {
                 let t = mc_triplet(lo);
-                if mc < t || (mc == t && !lo_inclusive) {
+                if mc_line < (t.0, t.1) {
                     return false;
                 }
             }
             if !hi.is_empty() && hi.chars().any(|c| c.is_ascii_digit()) {
                 let t = mc_triplet(hi);
-                if mc > t || (mc == t && !hi_inclusive) {
+                if mc_line > (t.0, t.1) {
                     return false;
                 }
             }
             return true;
         }
-        // Space/comma-separated AND of comparator atoms.
+        // Space/comma-separated AND of comparator atoms. Comparators keep
+        // full-triplet strictness (`<1.21.2` on 1.21.1 passes, on 1.21.2
+        // fails) — only intervals and bare versions compare by line, since
+        // only those are written line-wise by authors and tooling.
         branch
             .split(|c| c == ' ' || c == ',')
             .filter(|p| !p.is_empty())
@@ -1063,6 +1084,12 @@ fn mc_range_matches(range: &str, mc_version: &str) -> bool {
                     ("<", v)
                 } else if let Some(v) = atom.strip_prefix('=') {
                     ("=", v)
+                } else if let Some(v) = atom.strip_prefix('~') {
+                    // npm `~1.20` (patch-level): >=1.20.0.
+                    (">=", v)
+                } else if let Some(v) = atom.strip_prefix('^') {
+                    // npm `^1.20` (compatible-within-line): >=1.20.0.
+                    (">=", v)
                 } else {
                     ("=", atom)
                 };
@@ -1083,7 +1110,30 @@ fn mc_range_matches(range: &str, mc_version: &str) -> bool {
                     _ => mc_exact_matches(ver, mc),
                 }
             })
+        })
     })
+}
+
+/// Splits a range on commas outside any brackets: maven multi-ranges like
+/// `[1.21],[1.21.1]` are unions, while the comma inside `[1.20,1.21)` is
+/// the interval separator the branch logic consumes.
+fn split_top_level(range: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in range.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(range[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(range[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
 }
 
 /// Whether a range string mentions any Minecraft-shaped version (a version
@@ -2100,21 +2150,34 @@ mod launch_meta_tests {
         assert!(mc_range_matches("1.20.0", "1.20.1"));
         assert!(!mc_range_matches("1.20.1", "1.21.1"));
         assert!(!mc_range_matches("1.20", "1.21.1"));
-        // Maven intervals.
+        // Maven intervals are line-inclusive: the MDK-boilerplate
+        // `[1.21,1.21.1)` loads on 1.21.1 (the loader itself accepts it),
+        // while a range outside the instance's line still flags.
         assert!(mc_range_matches("[1.20,1.21)", "1.20.4"));
-        assert!(!mc_range_matches("[1.20,1.21)", "1.21.1"));
+        assert!(mc_range_matches("[1.20,1.21)", "1.21.1"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.22"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.19.4"));
+        assert!(mc_range_matches("[1.21,1.21.1)", "1.21.1"));
         assert!(mc_range_matches("[1.21,1.22)", "1.21.1"));
         assert!(mc_range_matches("(,1.21]", "1.21"));
-        assert!(!mc_range_matches("(,1.21]", "1.21.1"));
+        assert!(mc_range_matches("(,1.21]", "1.21.1"));
         assert!(mc_range_matches("[1.21,)", "1.21.1"));
-        // Fabric comparators + unions + wildcards.
+        // Fabric comparators + unions + wildcards. Comparators keep
+        // full-triplet strictness: `<1.21.2` still accepts 1.21.1.
         assert!(mc_range_matches(">=1.20", "1.21.1"));
         assert!(!mc_range_matches(">=1.22", "1.21.1"));
         assert!(mc_range_matches(">=1.20 <1.21", "1.20.4"));
         assert!(!mc_range_matches(">=1.20 <1.21", "1.21.1"));
+        assert!(mc_range_matches(">=1.21.1 <1.21.2", "1.21.1"));
+        assert!(!mc_range_matches(">=1.21.1 <1.21.2", "1.21.2"));
+        assert!(mc_range_matches("~1.20", "1.20.1"));
+        assert!(mc_range_matches("^1.20", "1.21.1"));
         assert!(mc_range_matches("1.20.x", "1.20.4"));
         assert!(mc_range_matches(">=1.20 || >=1.21.1", "1.21.1"));
         assert!(mc_range_matches("26.2", "26.2"));
+        // Maven multi-range unions (exact-pin lists).
+        assert!(mc_range_matches("[1.21],[1.21.1]", "1.21.1"));
+        assert!(!mc_range_matches("[1.20],[1.20.4]", "1.21.1"));
         // Anything + garbage passes: advisory must not cry wolf.
         assert!(mc_range_matches("*", "1.21.1"));
         assert!(mc_range_matches("", "1.21.1"));
@@ -2138,13 +2201,13 @@ mod launch_meta_tests {
             mod_name: Some("SomeMod".to_string()),
             mod_id: Some("somemod".to_string()),
             all_mod_ids: vec!["somemod".to_string()],
-            launch: launch_meta_mc("neoforge", &["[1.20,1.21)"]),
+            launch: launch_meta_mc("neoforge", &["[1.19,1.20]"]),
         }];
         let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
         assert!(report.wrong_loader.is_empty());
         assert_eq!(report.wrong_game_version.len(), 1);
         assert_eq!(report.wrong_game_version[0].expected, "1.21.1");
-        assert_eq!(report.wrong_game_version[0].declared, "[1.20,1.21)");
+        assert_eq!(report.wrong_game_version[0].declared, "[1.19,1.20]");
     }
 
     #[test]
