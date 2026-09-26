@@ -11,8 +11,9 @@ pub mod transfer;
 
 pub use auth::{get_account, logout, microsoft_login};
 pub use content::{
-    check_launch_readiness, get_content_meta, list_instance_content, list_mod_configs,
-    read_config_file, remove_content_file, set_content_enabled, write_config_file,
+    check_launch_readiness, get_content_meta, list_instance_content, list_instance_servers,
+    list_instance_worlds, list_mod_configs, read_config_file, remove_content_file,
+    set_content_enabled, write_config_file,
 };
 pub use config::{
     clear_curseforge_api_key, get_curseforge_status, import_curseforge_api_key_from_env_file,

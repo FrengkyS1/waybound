@@ -1,5 +1,5 @@
 use crate::dto::instance::{InstalledMod, InstanceSummary};
-use crate::dto::{ModLoader, ModSource};
+use crate::dto::{ModLoader, ModOrigin, ModSource};
 use rusqlite::{params, OptionalExtension, Row};
 
 use super::{DbError, Database};
@@ -163,6 +163,44 @@ impl Database {
         Ok(())
     }
 
+    /// One-time-ish backfill for the `origin` column: rows whose file is
+    /// listed in the instance's pack sidecar (`.curseforge-pack-manifest.json`
+    /// filenames, or `.modrinth-pack-manifest.json` `mods/` paths) become
+    /// `pack`. Only touches rows still marked `user` (the migration
+    /// default), so re-running never clobbers an explicit value — after the
+    /// first pass the UPDATEs match nothing and cost a couple of indexed
+    /// reads. Best-effort throughout: an unreadable sidecar just skips that
+    /// instance, leaving its rows as `user` (the safe direction — a pack
+    /// file misread as user-added is cosmetic, the reverse would hide real
+    /// user mods).
+    pub fn backfill_mod_origins(&self) {
+        let pairs: Vec<(String, String)> = (|| {
+            let conn = self.conn().ok()?;
+            let mut stmt = conn.prepare("SELECT id, root_path FROM instances").ok()?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .ok()?;
+            rows.collect::<Result<Vec<_>, _>>().ok()
+        })()
+        .unwrap_or_default();
+        for (id, root) in pairs {
+            let pack_files = pack_filenames(std::path::Path::new(&root));
+            if pack_files.is_empty() {
+                continue;
+            }
+            let placeholders = pack_files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE instance_mods SET origin = 'pack' WHERE instance_id = ?1 AND origin = 'user' AND file_name IN ({placeholders})"
+            );
+            if let Ok(conn) = self.conn() {
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
+                let owned: Vec<String> = pack_files.into_iter().collect();
+                params.extend(owned.iter().map(|s| s as &dyn rusqlite::ToSql));
+                let _ = conn.execute(&sql, params.as_slice());
+            }
+        }
+    }
+
     pub fn set_instance_icon(&self, id: &str, icon: Option<&str>) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
@@ -247,8 +285,8 @@ impl Database {
             params![source.id, instance.id, instance.name, instance.root_path, instance.created_at as i64],
         )?;
         tx.execute(
-            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
-             SELECT ?2, mod_uid, mod_name, source, file_name, ?4 || substr(file_path, length(?3) + 1), installed_at, icon_url
+            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url, origin)
+             SELECT ?2, mod_uid, mod_name, source, file_name, ?4 || substr(file_path, length(?3) + 1), installed_at, icon_url, origin
              FROM instance_mods WHERE instance_id = ?1",
             params![source.id, instance.id, source.root_path, instance.root_path],
         )?;
@@ -265,7 +303,7 @@ impl Database {
     pub fn list_instance_mods(&self, instance_id: &str) -> Result<Vec<InstalledMod>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url
+            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url, origin
              FROM instance_mods
              WHERE instance_id = ?1
              ORDER BY mod_name ASC",
@@ -284,20 +322,22 @@ impl Database {
         file_name: &str,
         file_path: &str,
         icon_url: Option<&str>,
+        origin: ModOrigin,
     ) -> Result<InstalledMod, DbError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let installed_at = super::now_unix() as i64;
         tx.execute(
-            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(instance_id, mod_uid) DO UPDATE SET
                mod_name = excluded.mod_name,
                source = excluded.source,
                file_name = excluded.file_name,
                file_path = excluded.file_path,
                installed_at = excluded.installed_at,
-               icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url)",
+               icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url),
+               origin = excluded.origin",
             params![
                 instance_id,
                 mod_uid,
@@ -307,11 +347,12 @@ impl Database {
                 file_path,
                 installed_at,
                 icon_url,
+                origin_to_str(origin),
             ],
         )?;
 
         let installed = tx.query_row(
-            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url
+            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url, origin
              FROM instance_mods WHERE instance_id = ?1 AND mod_uid = ?2",
             params![instance_id, mod_uid],
             map_installed_mod_row,
@@ -325,25 +366,28 @@ impl Database {
     /// install (can be a few hundred jars). WAL mode already makes each
     /// individual commit cheap, but batching still avoids a few hundred
     /// separate implicit transactions for what's conceptually one operation.
+    /// Every row takes the same origin (pack sync is the only caller).
     pub fn insert_instance_mods_batch(
         &self,
         instance_id: &str,
         mods: &[(String, String, ModSource, String, String, Option<String>)],
+        origin: ModOrigin,
     ) -> Result<(), DbError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let installed_at = super::now_unix() as i64;
         for (mod_uid, mod_name, source, file_name, file_path, icon_url) in mods {
             tx.execute(
-                "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name, file_path, installed_at, icon_url, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(instance_id, mod_uid) DO UPDATE SET
                    mod_name = excluded.mod_name,
                    source = excluded.source,
                    file_name = excluded.file_name,
                    file_path = excluded.file_path,
                    installed_at = excluded.installed_at,
-                   icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url)",
+                   icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url),
+                   origin = excluded.origin",
                 params![
                     instance_id,
                     mod_uid,
@@ -353,6 +397,7 @@ impl Database {
                     file_path,
                     installed_at,
                     icon_url,
+                    origin_to_str(origin),
                 ],
             )?;
         }
@@ -578,6 +623,35 @@ pub struct LoaderMetaRow {
     pub fetched_at: u64,
 }
 
+/// Filenames the instance's pack sidecars claim (CF manifest entries'
+/// `filename`, mrpack `mods/` paths reduced to file names). Shared by
+/// the origin backfill and the Content tab's untracked-file marking.
+/// Best-effort: unreadable sidecars contribute nothing.
+pub(crate) fn pack_filenames(root: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut pack_files = std::collections::HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(root.join(".curseforge-pack-manifest.json")) {
+        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+            for entry in &entries {
+                if let Some(name) = entry.get("filename").and_then(|v| v.as_str()) {
+                    pack_files.insert(name.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join(".modrinth-pack-manifest.json")) {
+        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+            for entry in &entries {
+                if let Some(path) = entry.as_str() {
+                    if let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) {
+                        pack_files.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    pack_files
+}
+
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
     let loader_raw: String = row.get(3)?;
     let root_path: String = row.get(6)?;
@@ -620,6 +694,7 @@ fn map_installed_mod_row(row: &Row<'_>) -> Result<InstalledMod, rusqlite::Error>
 
 fn map_installed_mod_row_full(row: &Row<'_>) -> Result<InstalledMod, rusqlite::Error> {
     let source_raw: String = row.get(4)?;
+    let origin_raw: String = row.get(8)?;
     Ok(InstalledMod {
         id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -629,6 +704,7 @@ fn map_installed_mod_row_full(row: &Row<'_>) -> Result<InstalledMod, rusqlite::E
         file_name: row.get(5)?,
         installed_at: row.get::<_, i64>(6)? as u64,
         icon_url: row.get(7)?,
+        origin: parse_origin(&origin_raw),
     })
 }
 
@@ -663,6 +739,20 @@ fn parse_source(raw: &str) -> ModSource {
     match raw {
         "curseforge" => ModSource::Curseforge,
         _ => ModSource::Modrinth,
+    }
+}
+
+fn origin_to_str(origin: ModOrigin) -> &'static str {
+    match origin {
+        ModOrigin::User => "user",
+        ModOrigin::Pack => "pack",
+    }
+}
+
+fn parse_origin(raw: &str) -> ModOrigin {
+    match raw {
+        "pack" => ModOrigin::Pack,
+        _ => ModOrigin::User,
     }
 }
 
@@ -846,7 +936,7 @@ mod instance_db_tests {
         let temp = TempDb::new("cascade");
         let db = &temp.db;
         db.insert_instance(&sample_instance("a", "Alpha", 100)).unwrap();
-        db.insert_instance_mod("a", "modrinth:abc", "JEI", ModSource::Modrinth, "jei.jar", "C:/x/jei.jar", None)
+        db.insert_instance_mod("a", "modrinth:abc", "JEI", ModSource::Modrinth, "jei.jar", "C:/x/jei.jar", None, ModOrigin::User)
             .unwrap();
         assert_eq!(db.list_instance_mods("a").unwrap().len(), 1);
 
@@ -855,5 +945,58 @@ mod instance_db_tests {
             db.list_instance_mods("a").unwrap().is_empty(),
             "ON DELETE CASCADE requires PRAGMA foreign_keys to actually be on"
         );
+    }
+
+    #[test]
+    fn mod_origin_round_trips_and_upsert_overwrites() {
+        let temp = TempDb::new("origin");
+        let db = &temp.db;
+        db.insert_instance(&sample_instance("a", "Alpha", 100)).unwrap();
+        let row = db
+            .insert_instance_mod("a", "curseforge:1", "Pack Mod", ModSource::Curseforge, "pack.jar", "C:/x/pack.jar", None, ModOrigin::Pack)
+            .unwrap();
+        assert_eq!(row.origin, ModOrigin::Pack);
+        // Reinstalling the same project directly flips it to user.
+        let row = db
+            .insert_instance_mod("a", "curseforge:1", "Pack Mod", ModSource::Curseforge, "pack.jar", "C:/x/pack.jar", None, ModOrigin::User)
+            .unwrap();
+        assert_eq!(row.origin, ModOrigin::User);
+        assert_eq!(db.list_instance_mods("a").unwrap()[0].origin, ModOrigin::User);
+    }
+
+    #[test]
+    fn backfill_marks_sidecar_files_as_pack() {
+        use std::io::Write;
+        let temp = TempDb::new("backfill");
+        let db = &temp.db;
+        // Point the instance root at a temp dir holding a CF sidecar.
+        let dir = std::env::temp_dir().join("waybound-backfill-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sidecar = std::fs::File::create(dir.join(".curseforge-pack-manifest.json")).unwrap();
+        sidecar
+            .write_all(br#"[{"project_id":1,"file_id":10,"name":"Pack Mod","filename":"pack.jar","url":"https://example.com","sha1":null}]"#)
+            .unwrap();
+        let mut inst = sample_instance("a", "Alpha", 100);
+        inst.root_path = dir.to_string_lossy().to_string();
+        db.insert_instance(&inst).unwrap();
+        // Both rows start as user (the migration default).
+        db.insert_instance_mod("a", "curseforge:1", "Pack Mod", ModSource::Curseforge, "pack.jar", "C:/x/pack.jar", None, ModOrigin::User)
+            .unwrap();
+        db.insert_instance_mod("a", "modrinth:2", "My Mod", ModSource::Modrinth, "mine.jar", "C:/x/mine.jar", None, ModOrigin::User)
+            .unwrap();
+
+        db.backfill_mod_origins();
+
+        let rows = db.list_instance_mods("a").unwrap();
+        let pack = rows.iter().find(|r| r.file_name == "pack.jar").unwrap();
+        let mine = rows.iter().find(|r| r.file_name == "mine.jar").unwrap();
+        assert_eq!(pack.origin, ModOrigin::Pack);
+        assert_eq!(mine.origin, ModOrigin::User);
+        // Idempotent: a second run changes nothing.
+        db.backfill_mod_origins();
+        let rows = db.list_instance_mods("a").unwrap();
+        assert_eq!(rows.iter().find(|r| r.file_name == "pack.jar").unwrap().origin, ModOrigin::Pack);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

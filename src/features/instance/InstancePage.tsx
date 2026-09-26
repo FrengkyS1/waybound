@@ -25,12 +25,13 @@ import { SegmentGroup } from "../../components/SegmentGroup";
 import { ConfigEditorModal } from "./ConfigEditorModal";
 import { ModVersionModal } from "./ModVersionModal";
 import { ModpackVersionModal } from "./ModpackVersionModal";
+import { ServersTab, WorldsTab } from "./InstanceWorlds";
 import { LaunchOverrides } from "./LaunchOverrides";
 import { InstanceGameSettings } from "./InstanceGameSettings";
 import { ContextMenu } from "../../components/ContextMenu";
 import styles from "./InstancePage.module.css";
 
-export type Tab = "overview" | "content" | "logs" | "settings";
+export type Tab = "overview" | "content" | "worlds" | "servers" | "logs" | "settings";
 
 // Stable reference so the store selector doesn't return a new array each render
 // (which would loop useSyncExternalStore and blank the screen).
@@ -273,6 +274,12 @@ export function InstancePage({
         <TabButton id="content" active={tab} onClick={setTab}>
           Content
         </TabButton>
+        <TabButton id="worlds" active={tab} onClick={setTab}>
+          Worlds
+        </TabButton>
+        <TabButton id="servers" active={tab} onClick={setTab}>
+          Servers
+        </TabButton>
         <TabButton id="logs" active={tab} onClick={setTab}>
           Logs
         </TabButton>
@@ -300,6 +307,8 @@ export function InstancePage({
         {tab === "content" && (
           <ContentTab instance={instance} busy={busy} onAddMods={onAddMods} onOpenMod={onOpenMod} />
         )}
+        {tab === "worlds" && <WorldsTab instanceId={instance.id} />}
+        {tab === "servers" && <ServersTab instanceId={instance.id} />}
         {tab === "logs" && (
           <LogsTab
             instanceId={instance.id}
@@ -440,6 +449,7 @@ function OverviewTab({
 
 type ContentFilter = "all" | "mod" | "resourcepack" | "shaderpack";
 type EnabledFilter = "all" | "enabled" | "disabled";
+type AddedFilter = "all" | "mine" | "pack";
 
 const CATEGORY_LABEL: Record<ContentCategory, string> = {
   mod: "Mods",
@@ -461,6 +471,7 @@ function ContentTab({
   const [content, setContent] = useState<InstanceContent | null>(null);
   const [filter, setFilter] = useState<ContentFilter>("all");
   const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>("all");
+  const [addedFilter, setAddedFilter] = useState<AddedFilter>("all");
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -572,6 +583,11 @@ function ContentTab({
     all: typeScoped.length,
     enabled: typeScoped.filter((e) => e.enabled).length,
     disabled: typeScoped.filter((e) => !e.enabled).length,
+  };
+  const addedCounts = {
+    all: typeScoped.length,
+    mine: typeScoped.filter((e) => e.addedByYou).length,
+    pack: typeScoped.filter((e) => !e.addedByYou).length,
   };
 
   const categoryKey: Record<ContentCategory, "mods" | "resourcePacks" | "shaderPacks"> = {
@@ -747,6 +763,9 @@ function ContentTab({
         .filter((e) =>
           enabledFilter === "all" ? true : enabledFilter === "enabled" ? e.enabled : !e.enabled,
         )
+        .filter((e) =>
+          addedFilter === "all" ? true : addedFilter === "mine" ? e.addedByYou : !e.addedByYou,
+        )
         .filter((e) => (term ? e.fileName.toLowerCase().includes(term) : true)),
     }));
 
@@ -799,6 +818,21 @@ function ContentTab({
             onChange={setEnabledFilter}
             compact
           />
+          <SegmentGroup
+            label="Added"
+            value={addedFilter}
+            options={(["all", "mine", "pack"] as AddedFilter[]).map((f) => ({
+              value: f,
+              label:
+                f === "all"
+                  ? `All (${addedCounts.all})`
+                  : f === "mine"
+                    ? `By you (${addedCounts.mine})`
+                    : `From pack (${addedCounts.pack})`,
+            }))}
+            onChange={setAddedFilter}
+            compact
+          />
         </div>
         <input
           type="search"
@@ -845,6 +879,11 @@ function ContentTab({
                       <span className={styles.modNameLine}>
                         <span className={styles.modName}>{displayName}</span>
                         <CopyNameButton name={displayName} />
+                        {entry.addedByYou && (
+                          <span className={styles.addedTag} title="You added this — it didn't come with the modpack">
+                            Added by you
+                          </span>
+                        )}
                       </span>
                       <span
                         className={styles.modMeta}

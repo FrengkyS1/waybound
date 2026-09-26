@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ModLoader, ModSource, ModSummary};
+use super::{ModLoader, ModOrigin, ModSource, ModSummary};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,12 +62,18 @@ pub struct ContentEntry {
     #[serde(default)]
     pub meta_resolved: bool,
     /// True when at least one file/folder under `config/` looks like it
-    /// belongs to this mod — computed once per `list_instance_content` call
+    /// belongs to this mod - computed once per `list_instance_content` call
     /// (one scan of `config/`'s top level shared across every mod row)
     /// rather than per-row, so showing the "Config" button doesn't cost a
     /// separate lookup for each of a few hundred mods.
     #[serde(default)]
     pub has_config: bool,
+    /// True when the file was added by the user (Browse install, manual
+    /// drop) rather than placed by a modpack import. Resolved from the
+    /// tracked row's origin; untracked files read as user-added since no
+    /// pack claims them.
+    #[serde(default)]
+    pub added_by_you: bool,
 }
 
 /// All content in an instance, grouped by category.
@@ -77,6 +83,36 @@ pub struct InstanceContent {
     pub mods: Vec<ContentEntry>,
     pub resource_packs: Vec<ContentEntry>,
     pub shader_packs: Vec<ContentEntry>,
+}
+
+/// One singleplayer world (`saves/<folder>/level.dat`). Best-effort: a
+/// corrupt or unreadable level.dat degrades to the folder name with
+/// everything else absent, never an error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldEntry {
+    /// The folder name under `saves/` — the stable identifier.
+    pub folder_name: String,
+    pub name: Option<String>,
+    /// Unix millis of last play (`Data.LastPlayed`), when present.
+    pub last_played_ms: Option<i64>,
+    /// Human game mode ("Survival", "Creative", ...), when present.
+    pub game_mode: Option<String>,
+    /// Game version the world was last saved with, when present.
+    pub game_version: Option<String>,
+    /// The world's `icon.png` as a data URL, when present.
+    pub icon: Option<String>,
+}
+
+/// One saved multiplayer server (`servers.dat` entry). Read-only view —
+/// no pinging, no editing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerEntry {
+    pub name: String,
+    pub address: String,
+    /// The server's icon as a data URL, when the entry carries one.
+    pub icon: Option<String>,
 }
 
 /// One config file a mod's "Config" button can open — `relative_path` is
@@ -168,6 +204,9 @@ pub struct InstalledMod {
     /// since there's no project link to fetch one from.
     #[serde(default)]
     pub icon_url: Option<String>,
+    /// How the mod arrived: user-installed versus pack-placed. Always
+    /// written by the backend (migrated + backfilled for old rows).
+    pub origin: ModOrigin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

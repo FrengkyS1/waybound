@@ -52,6 +52,8 @@ export interface InstalledMod {
   source: "modrinth" | "curseforge";
   fileName: string;
   installedAt: number;
+  /** How the mod arrived: user-installed versus pack-placed. */
+  origin: "user" | "pack";
 }
 
 export interface GameVersionOption {

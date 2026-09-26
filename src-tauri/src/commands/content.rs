@@ -12,7 +12,7 @@ use base64::Engine;
 use crate::download::safe_join;
 use crate::dto::instance::{
     ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent, LaunchReadiness, MissingDep,
-    WrongLoaderFile,
+    ServerEntry, WorldEntry, WrongLoaderFile,
 };
 use crate::dto::ModLoader;
 use crate::instances::paths::instance_root;
@@ -548,6 +548,7 @@ fn apply_cache(
     cache: &std::collections::HashMap<(String, String), crate::db::CachedContentMeta>,
     config_top_entries: Option<&[ConfigTopEntry]>,
     db_names: &std::collections::HashMap<String, String>,
+    origins: &std::collections::HashMap<String, bool>,
 ) -> Vec<ContentEntry> {
     files
         .into_iter()
@@ -574,13 +575,26 @@ fn apply_cache(
                 })
             });
             ContentEntry {
-                file_name: f.file_name,
+                file_name: f.file_name.clone(),
                 name,
                 icon: hit.and_then(|c| c.icon.clone()),
                 enabled: f.enabled,
                 size_bytes: f.size_bytes,
                 meta_resolved: hit.is_some(),
                 has_config,
+                // Tracked rows carry the verdict; untracked files fall back
+                // to the sidecar check done by the caller; anything left
+                // over is user-added by elimination. Both spellings cover
+                // `.disabled`-suffixed rows, whose display name is stripped.
+                added_by_you: origins
+                    .get(&f.file_name)
+                    .or_else(|| {
+                        f.file_name
+                            .strip_suffix(DISABLED_SUFFIX)
+                            .and_then(|base| origins.get(base))
+                    })
+                    .copied()
+                    .unwrap_or(true),
             }
         })
         .collect()
@@ -755,13 +769,22 @@ pub async fn list_instance_content(
     // display name is a better match term than a not-yet-cache-resolved
     // row's filename alone, and this is one query for the whole instance,
     // not one per mod.
-    let db_names: std::collections::HashMap<String, String> = state
-        .db
-        .list_instance_mods(&instance_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| (m.file_name, m.mod_name))
+    let tracked = state.db.list_instance_mods(&instance_id).unwrap_or_default();
+    let db_names: std::collections::HashMap<String, String> = tracked
+        .iter()
+        .map(|m| (m.file_name.clone(), m.mod_name.clone()))
         .collect();
+    // Origin by filename for the "added by you" marking: tracked rows carry
+    // it directly; untracked files fall back to the pack sidecars (a
+    // watcher-placed manual download has no row yet but is still pack).
+    // Anything else reads as user-added — no pack claims it.
+    let mut origins: std::collections::HashMap<String, bool> = tracked
+        .iter()
+        .map(|m| (m.file_name.clone(), m.origin == crate::dto::ModOrigin::User))
+        .collect();
+    for name in crate::db::pack_filenames(&root) {
+        origins.entry(name).or_insert(false);
+    }
 
     // Directory listing + cache join — no jar/zip parsing for anything
     // already seen before — so this stays fast no matter how big the pack
@@ -775,6 +798,7 @@ pub async fn list_instance_content(
                 &cache,
                 Some(&config_top_entries),
                 &db_names,
+                &origins,
             ),
             resource_packs: apply_cache(
                 scan_dir(&root.join("resourcepacks"), ".zip"),
@@ -782,6 +806,7 @@ pub async fn list_instance_content(
                 &cache,
                 None,
                 &db_names,
+                &origins,
             ),
             shader_packs: apply_cache(
                 scan_dir(&root.join("shaderpacks"), ".zip"),
@@ -789,6 +814,7 @@ pub async fn list_instance_content(
                 &cache,
                 None,
                 &db_names,
+                &origins,
             ),
         }
     })
@@ -968,6 +994,155 @@ pub async fn check_launch_readiness(
     .await
     .map_err(|e| e.to_string())?;
     Ok(assess_readiness(instance.loader, &files.0, &files.1))
+}
+
+/// Lists singleplayer worlds (`saves/*/level.dat`) oldest detail omitted:
+/// name, last played, game mode, game version, icon. A corrupt or
+/// unreadable level.dat degrades to its folder name rather than failing
+/// the whole list — one broken world must not hide the rest.
+#[tauri::command]
+pub async fn list_instance_worlds(
+    state: State<'_, AppState>,
+    instance_id: String,
+) -> Result<Vec<WorldEntry>, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let _ = state.db.get_instance(&instance_id).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root.join("saves")) else {
+            return out;
+        };
+        let mut folders: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        folders.sort();
+        for folder in folders {
+            let folder_name = folder
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            out.push(read_world_entry(&folder, &folder_name));
+        }
+        // Most recently played first; undated (or corrupt) worlds sink.
+        out.sort_by_key(|w| std::cmp::Reverse(w.last_played_ms.unwrap_or(-1)));
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Lists saved multiplayer servers (`servers.dat`). No pinging, no
+/// editing — a read-only view. A missing file is an empty list, not an
+/// error (fresh instances have none).
+#[tauri::command]
+pub async fn list_instance_servers(
+    state: State<'_, AppState>,
+    instance_id: String,
+) -> Result<Vec<ServerEntry>, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let _ = state.db.get_instance(&instance_id).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || read_servers_file(&root.join("servers.dat")))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn read_world_entry(folder: &std::path::Path, folder_name: &str) -> WorldEntry {
+    let mut entry = WorldEntry {
+        folder_name: folder_name.to_string(),
+        name: None,
+        last_played_ms: None,
+        game_mode: None,
+        game_version: None,
+        icon: None,
+    };
+    if let Ok(icon_bytes) = std::fs::read(folder.join("icon.png")) {
+        if !icon_bytes.is_empty() {
+            entry.icon = Some(format!("data:image/png;base64,{}", base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                icon_bytes
+            )));
+        }
+    }
+    let Ok(bytes) = std::fs::read(folder.join("level.dat")) else {
+        return entry;
+    };
+    let Some(data) = nbt_root_data(&bytes).and_then(|root| match root.get("Data") {
+        Some(valence_nbt::Value::Compound(data)) => Some(data.clone()),
+        _ => None,
+    }) else {
+        return entry;
+    };
+    entry.name = data.get("LevelName").and_then(|v| match v {
+        valence_nbt::Value::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    entry.last_played_ms = data.get("LastPlayed").and_then(|v| v.as_i64());
+    entry.game_mode = data.get("GameType").and_then(|v| v.as_i32()).map(|mode| match mode {
+        0 => "Survival".to_string(),
+        1 => "Creative".to_string(),
+        2 => "Adventure".to_string(),
+        3 => "Spectator".to_string(),
+        _ => format!("Mode {mode}"),
+    });
+    entry.game_version = data.get("Version").and_then(|v| match v {
+        valence_nbt::Value::Compound(ver) => ver.get("Name").and_then(|n| match n {
+            valence_nbt::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    entry
+}
+
+fn read_servers_file(path: &std::path::Path) -> Vec<ServerEntry> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    // Vanilla writes servers.dat uncompressed; tolerate a gzipped one.
+    let root = nbt_root_data(&bytes);
+    let Some(list) = root.as_ref().and_then(|r| r.get("servers")) else {
+        return Vec::new();
+    };
+    let valence_nbt::Value::List(valence_nbt::List::Compound(entries)) = list else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let name = e.get("name").and_then(|v| match v {
+                valence_nbt::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })?;
+            let address = e.get("ip").and_then(|v| match v {
+                valence_nbt::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })?;
+            let icon = e.get("icon").and_then(|v| match v {
+                valence_nbt::Value::String(s) if !s.is_empty() => {
+                    Some(format!("data:image/png;base64,{s}"))
+                }
+                _ => None,
+            });
+            Some(ServerEntry { name, address, icon })
+        })
+        .collect()
+}
+
+/// Decodes NBT bytes that may be gzipped (level.dat always is) or raw
+/// (servers.dat is). Returns the root compound.
+fn nbt_root_data(bytes: &[u8]) -> Option<valence_nbt::Compound> {
+    use std::io::Read;
+    let raw: Vec<u8> = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        let mut decoder = flate2::read::GzDecoder::new(bytes);
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).ok()?;
+        out
+    } else {
+        bytes.to_vec()
+    };
+    valence_nbt::from_binary(&mut raw.as_slice()).ok().map(|(root, _)| root)
 }
 
 /// Resolves one file's display name + icon by opening just that jar/zip —
@@ -1248,7 +1423,7 @@ mod content_meta_cache_tests {
             normalized: normalize_for_match("curios-common"),
         }];
 
-        let entries = apply_cache(scanned, "mod", &cache, Some(&config_entries), &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &cache, Some(&config_entries), &HashMap::new(), &HashMap::new());
         assert!(entries[0].has_config);
     }
 
@@ -1266,7 +1441,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "Foo.jar", 100, 1000, Some("Foo Mod"), Some("data:image/png;base64,x")),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new(), &HashMap::new());
 
         assert!(entries[0].meta_resolved, "matching size+mtime should count as a cache hit");
         assert_eq!(entries[0].name.as_deref(), Some("Foo Mod"));
@@ -1287,7 +1462,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "Foo.jar", 100, 1000, Some("Foo Mod"), None),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new(), &HashMap::new());
 
         assert!(!entries[0].meta_resolved, "a changed file must not be served stale cached metadata");
         assert_eq!(entries[0].name, None);
@@ -1310,7 +1485,7 @@ mod content_meta_cache_tests {
             cache_row("mod", "NoIcon.jar", 50, 500, Some("No Icon Mod"), None),
         );
 
-        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &cache, None, &HashMap::new(), &HashMap::new());
 
         assert!(entries[0].meta_resolved);
         assert_eq!(entries[0].icon, None);
@@ -1324,7 +1499,7 @@ mod content_meta_cache_tests {
             size_bytes: 10,
             mtime_unix: 10,
         }];
-        let entries = apply_cache(scanned, "mod", &HashMap::new(), None, &HashMap::new());
+        let entries = apply_cache(scanned, "mod", &HashMap::new(), None, &HashMap::new(), &HashMap::new());
 
         assert!(!entries[0].meta_resolved);
         assert_eq!(entries[0].name, None);
@@ -1695,5 +1870,113 @@ mod launch_meta_tests {
         let report = assess_readiness(ModLoader::NeoForge, &files, &meta.embedded_ids);
         assert!(report.missing_deps.is_empty(), "{:?}", report.missing_deps);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod worlds_servers_tests {
+    use super::{read_servers_file, read_world_entry};
+    use std::io::Write;
+    use valence_nbt::compound;
+
+    fn gzip_nbt(root: valence_nbt::Compound) -> Vec<u8> {
+        let mut raw = Vec::new();
+        valence_nbt::to_binary(&root, &mut raw, "").unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn world_dir(label: &str, level_dat: Option<Vec<u8>>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("waybound-worlds-test-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let world = dir.join("My World");
+        std::fs::create_dir_all(&world).unwrap();
+        if let Some(bytes) = level_dat {
+            std::fs::write(world.join("level.dat"), bytes).unwrap();
+        }
+        dir
+    }
+
+    fn level_bytes() -> Vec<u8> {
+        gzip_nbt(valence_nbt::compound! {
+            "Data" => valence_nbt::compound! {
+                "LevelName" => "Overworld Adventures",
+                "LastPlayed" => 1_700_000_000_000_i64,
+                "GameType" => 1,
+                "Version" => valence_nbt::compound! { "Name" => "1.21.1" },
+            },
+        })
+    }
+
+    #[test]
+    fn world_entry_reads_name_mode_version_and_play_time() {
+        let dir = world_dir("full", Some(level_bytes()));
+        let entry = read_world_entry(&dir.join("My World"), "My World");
+        assert_eq!(entry.folder_name, "My World");
+        assert_eq!(entry.name.as_deref(), Some("Overworld Adventures"));
+        assert_eq!(entry.last_played_ms, Some(1_700_000_000_000));
+        assert_eq!(entry.game_mode.as_deref(), Some("Creative"));
+        assert_eq!(entry.game_version.as_deref(), Some("1.21.1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_level_dat_degrades_to_folder_name() {
+        let dir = world_dir("corrupt", Some(b"definitely not nbt".to_vec()));
+        let entry = read_world_entry(&dir.join("My World"), "My World");
+        assert_eq!(entry.folder_name, "My World");
+        assert!(entry.name.is_none());
+        assert!(entry.last_played_ms.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_level_dat_degrades_to_folder_name() {
+        let dir = world_dir("missing", None);
+        let entry = read_world_entry(&dir.join("My World"), "My World");
+        assert_eq!(entry.folder_name, "My World");
+        assert!(entry.name.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn servers_file_lists_name_and_address_with_icon() {
+        let dir = std::env::temp_dir().join("waybound-servers-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = Vec::new();
+        valence_nbt::to_binary(
+            &valence_nbt::compound! {
+                "servers" => valence_nbt::List::Compound(vec![
+                    valence_nbt::compound! { "name" => "Home", "ip" => "play.example.com:25565" },
+                    valence_nbt::compound! { "name" => "LAN", "ip" => "192.168.1.2:25565", "icon" => "aGVsbG8=" },
+                ]),
+            },
+            &mut raw,
+            "",
+        )
+        .unwrap();
+        // Vanilla writes servers.dat uncompressed.
+        std::fs::write(dir.join("servers.dat"), &raw).unwrap();
+        let entries = read_servers_file(&dir.join("servers.dat"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Home");
+        assert_eq!(entries[0].address, "play.example.com:25565");
+        assert!(entries[0].icon.is_none());
+        assert_eq!(
+            entries[1].icon.as_deref(),
+            Some("data:image/png;base64,aGVsbG8=")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_servers_file_is_empty_not_error() {
+        let dir = std::env::temp_dir().join("waybound-servers-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_servers_file(&dir.join("servers.dat")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

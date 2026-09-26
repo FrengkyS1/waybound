@@ -1,6 +1,6 @@
 [package]
 name = "waybound"
-version = "0.1.4"
+version = "0.1.5"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -37,6 +37,8 @@ hex = "0.4"
 futures = "0.3"
 base64 = "0.22"
 trash = "5"
+valence_nbt = { version = "0.8.0", features = ["binary"] }
+flate2 = "1.1.10"
 
 
 [target.'cfg(windows)'.dependencies]

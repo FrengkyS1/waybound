@@ -32,6 +32,16 @@ pub enum ModSource {
     Curseforge,
 }
 
+/// How a tracked mod arrived in the instance: installed directly by the
+/// user (Browse button, dependency auto-install) versus placed by a
+/// modpack import/sync. Powers the Content tab's "added by you" marking.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModOrigin {
+    User,
+    Pack,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {

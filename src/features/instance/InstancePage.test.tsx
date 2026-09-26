@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InstanceContent } from "../instances/api";
@@ -171,6 +171,7 @@ describe("Content tab file rows", () => {
     sizeBytes: 0,
     metaResolved: true,
     hasConfig: false,
+    addedByYou: false,
     ...over,
   });
 
@@ -249,5 +250,27 @@ describe("Content tab file rows", () => {
     // MB keeps one decimal, so a 1 MB file doesn't read as a bare "1 MB".
     expect(sizeOf("exact-mb.jar")).toBe("1.0 MB");
     expect(sizeOf("big.jar")).toBe("2.4 MB");
+  });
+
+  it("badges user-added mods and filters by origin", async () => {
+    await renderContent({
+      mods: [
+        entry({ fileName: "mine.jar", name: "Mine", addedByYou: true }),
+        entry({ fileName: "pack.jar", name: "Pack", addedByYou: false }),
+      ],
+    });
+
+    await screen.findByText("Mine");
+    expect(screen.getAllByText("Added by you")).toHaveLength(1);
+
+    const addedGroup = screen.getByRole("group", { name: "Added" });
+    // Narrow to just user-added rows.
+    fireEvent.click(within(addedGroup).getByRole("button", { name: /by you/i }));
+    expect(screen.getByText("mine.jar")).toBeInTheDocument();
+    expect(screen.queryByText("pack.jar")).not.toBeInTheDocument();
+
+    // And back to everything.
+    fireEvent.click(within(addedGroup).getByRole("button", { name: /^all/i }));
+    expect(screen.getByText("pack.jar")).toBeInTheDocument();
   });
 });

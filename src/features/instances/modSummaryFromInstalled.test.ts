@@ -12,6 +12,7 @@ function installed(overrides: Partial<InstalledMod> = {}): InstalledMod {
     source: "modrinth",
     fileName: "sodium-0.5.3.jar",
     installedAt: 1_700_000_000,
+    origin: "user",
     ...overrides,
   };
 }

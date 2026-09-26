@@ -525,6 +525,9 @@ impl InstanceService {
 
             icon.as_deref(),
 
+            // Direct user install (Browse button / update flow) — never pack.
+            crate::dto::ModOrigin::User,
+
         )?;
 
 
@@ -671,6 +674,8 @@ async fn install_dependency(
         &download.filename,
         &dest_path.display().to_string(),
         icon.as_deref(),
+        // Dependency pulled in by a user install — travels with it.
+        crate::dto::ModOrigin::User,
     )?;
 
     Ok(())
@@ -919,6 +924,8 @@ async fn install_required_dependencies(
                                 &download.filename,
                                 &dest_path.display().to_string(),
                                 icon.as_deref(),
+                                // Dependency pulled in by a user install — travels with it.
+                                crate::dto::ModOrigin::User,
                             )?;
                             Ok(())
                         }
@@ -1269,6 +1276,9 @@ async fn install_modpack(
 
         summary.icon_url.as_deref(),
 
+        // The pack archive itself — definitionally pack-placed.
+        crate::dto::ModOrigin::Pack,
+
     )?;
 
 
@@ -1416,6 +1426,8 @@ fn sync_mods_folder(
                     &row.file_name,
                     &file_path,
                     icon.as_deref(),
+                    // Same file, better id — the row's origin survives the swap.
+                    row.origin,
                 );
             }
         } else {
@@ -1492,7 +1504,7 @@ fn sync_mods_folder(
 
 
 
-    let _ = db.insert_instance_mods_batch(instance_id, &mods);
+    let _ = db.insert_instance_mods_batch(instance_id, &mods, crate::dto::ModOrigin::Pack);
 
     for stale in existing.iter().filter(|m| !seen_filenames.contains(&m.file_name)) {
         let _ = db.delete_instance_mod_by_file(instance_id, &stale.file_name);

@@ -1,5 +1,6 @@
 mod instances;
 pub use instances::CachedContentMeta;
+pub(crate) use instances::pack_filenames;
 
 use crate::dto::ModSummary;
 use rusqlite::{params, Connection};
@@ -110,6 +111,7 @@ impl Database {
                 file_name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 installed_at INTEGER NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'user',
                 UNIQUE(instance_id, mod_uid)
             );
 
@@ -161,6 +163,7 @@ impl Database {
             "ALTER TABLE content_meta_cache ADD COLUMN mod_id TEXT",
             "ALTER TABLE instances ADD COLUMN modpack_version_label TEXT",
             "ALTER TABLE instances ADD COLUMN modpack_project_uid TEXT",
+            "ALTER TABLE instance_mods ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -188,9 +191,15 @@ impl Database {
             params![APP_VERSION],
         );
 
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        // Backfill pack origins for rows predating the column (idempotent —
+        // only `user` rows matching a sidecar flip, so this is a no-op once
+        // caught up). Runs here with the other upgrade work rather than on
+        // any read path.
+        db.backfill_mod_origins();
+        Ok(db)
     }
 
     pub fn get_search_cache(&self, cache_key: &str) -> Result<Option<CachedSearch>, DbError> {

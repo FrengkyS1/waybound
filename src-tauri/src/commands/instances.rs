@@ -719,6 +719,7 @@ mod mod_summary_from_row_tests {
             file_name: "somemod.jar".to_string(),
             installed_at: 0,
             icon_url: Some("https://example.invalid/icon.png".to_string()),
+            origin: crate::dto::ModOrigin::User,
         }
     }
 

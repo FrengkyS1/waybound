@@ -61,6 +61,9 @@ export interface ContentEntry {
   /** True when at least one file/folder under `config/` looks like it
    * belongs to this mod — gates showing the Config button at all. */
   hasConfig: boolean;
+  /** True when the file was added by the user rather than placed by a
+   * modpack import. */
+  addedByYou: boolean;
 }
 
 export interface InstanceContent {
@@ -221,6 +224,31 @@ export async function getLoaderVersionInfo(
 
 export async function fetchInstanceMods(instanceId: string): Promise<InstalledMod[]> {
   return invoke<InstalledMod[]>("list_instance_mods", { instanceId });
+}
+
+export interface WorldEntry {
+  folderName: string;
+  name?: string;
+  lastPlayedMs?: number;
+  gameMode?: string;
+  gameVersion?: string;
+  icon?: string;
+}
+
+export interface ServerEntry {
+  name: string;
+  address: string;
+  icon?: string;
+}
+
+/** Singleplayer worlds from `saves/` — read-only list, no launching. */
+export async function fetchInstanceWorlds(instanceId: string): Promise<WorldEntry[]> {
+  return invoke<WorldEntry[]>("list_instance_worlds", { instanceId });
+}
+
+/** Saved multiplayer servers from `servers.dat` — read-only list. */
+export async function fetchInstanceServers(instanceId: string): Promise<ServerEntry[]> {
+  return invoke<ServerEntry[]>("list_instance_servers", { instanceId });
 }
 
 export async function removeModFromInstance(
