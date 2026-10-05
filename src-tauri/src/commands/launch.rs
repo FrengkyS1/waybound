@@ -21,18 +21,15 @@ use crate::launch::{prepare_launch, split_jvm_args, ProgressUpdate};
 
 use super::search::AppState;
 
+#[path = "launch_process.rs"]
+mod process;
+pub use process::ProcessIdentity;
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Marker file dropped in an instance's own game directory while its Java
-/// child process is alive. The instance's `AppState.launches` entry only
-/// covers the prepare/download phase and is gone within moments of the game
-/// actually starting (see `launch_instance`), and the whole map lives in this
-/// process's memory — closing Waybound while Minecraft keeps running (it's an
-/// independent OS process) loses all trace of it, so the Play button resets
-/// to launchable on the next start and lets a second copy be launched
-/// concurrently onto the same world files. This file plus [`is_pid_alive`] is
-/// what `get_running_instances` checks on startup to rebuild that state.
+/// Verified PID + process creation time, persisted while Minecraft owns the
+/// instance. Bare legacy PIDs block unsafe mutations but never authorize Stop.
 pub(crate) const PID_FILE_NAME: &str = ".waybound-pid";
 
 /// Where a run's captured stdout/stderr is persisted, relative to the
@@ -112,65 +109,15 @@ fn open_log_sink(instance_dir: &Path) -> LogSink {
 #[tauri::command]
 pub fn read_launch_log(instance_id: String) -> Result<Vec<String>, String> {
     let dir = crate::instances::paths::instance_root(&instance_id).map_err(|e| e.to_string())?;
-    let Ok(text) = std::fs::read_to_string(dir.join(LOG_FILE_NAME)) else {
+    let Ok(bytes) = std::fs::read(dir.join(LOG_FILE_NAME)) else {
         return Ok(Vec::new());
     };
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(LOG_TAIL_LINES);
     Ok(lines[start..].iter().map(|l| l.to_string()).collect())
 }
 
-/// Whether a process with this PID is still alive. Shells out to `tasklist`
-/// rather than adding a process-inspection crate: this project already treats
-/// a Windows-only helper process as an acceptable answer elsewhere (e.g. Java
-/// version probing), and this is a startup-only, once-per-instance check.
-#[cfg(windows)]
-fn is_pid_alive(pid: u32) -> bool {    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(windows))]
-fn is_pid_alive(pid: u32) -> bool {
-    // Signal 0 sends no signal but still errors if the process doesn't exist
-    // or isn't ours; `kill` is universally available without a crate.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Force-kills a game process for `stop_game`. Same no-new-crate policy as
-/// `is_pid_alive` above; hard kill, like Prism — there is no graceful
-/// "please save and quit" channel to a running game.
-#[cfg(windows)]
-fn kill_pid(pid: u32) -> std::io::Result<()> {
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| std::io::Error::other(format!("taskkill exited {status}")))
-}
-
-#[cfg(not(windows))]
-fn kill_pid(pid: u32) -> std::io::Result<()> {
-    let status = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| std::io::Error::other(format!("kill exited {status}")))
-}
 
 /// A Minecraft process detected as still running from a previous Waybound
 /// session, so the frontend can restore its Play button to the disabled
@@ -200,21 +147,27 @@ pub fn get_running_instances(
             continue;
         };
         let pid_file = dir.join(PID_FILE_NAME);
-        let Ok(contents) = std::fs::read_to_string(&pid_file) else {
-            continue;
+        let identity = match process::read_marker(&pid_file) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(error) => {
+                crate::activity::append_log(&error, "warning", None);
+                continue;
+            }
         };
-        let Ok(pid) = contents.trim().parse::<u32>() else {
-            let _ = std::fs::remove_file(&pid_file);
-            continue;
-        };
-        if is_pid_alive(pid) {
-            spawn_orphan_watcher(app.clone(), inst.id.clone(), pid_file.clone());
+        if process::matches(identity)? {
+            let mut pids = state.game_pids.lock().map_err(|e| e.to_string())?;
+            if pids.get(&inst.id) != Some(&identity) {
+                pids.insert(inst.id.clone(), identity);
+                spawn_orphan_watcher(app.clone(), inst.id.clone(), pid_file.clone(), identity);
+            }
+            drop(pids);
             running.push(RunningInstance {
                 instance_id: inst.id,
                 instance_name: inst.name,
             });
         } else {
-            let _ = std::fs::remove_file(&pid_file);
+            process::remove_marker_if_owned(&pid_file, identity);
         }
     }
     Ok(running)
@@ -224,16 +177,16 @@ pub fn get_running_instances(
 /// clean up its PID file and emit the same `launch://exited` event a launch
 /// started in this session would, so the frontend flips back to launchable
 /// through its existing listener with no new event type to handle.
-fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path::PathBuf) {
+fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path::PathBuf, identity: ProcessIdentity) {
     std::thread::spawn(move || {
-        let pid: Option<u32> = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-        let Some(pid) = pid else { return };
-        while is_pid_alive(pid) {
+        while process::matches(identity).unwrap_or(true) {
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
-        let _ = std::fs::remove_file(&pid_file);
+        process::remove_marker_if_owned(&pid_file, identity);
+        if let Ok(mut pids) = app.state::<AppState>().game_pids.lock() {
+            if pids.get(&instance_id) != Some(&identity) { return; }
+            pids.remove(&instance_id);
+        }
         let user_stopped = app
             .state::<AppState>()
             .stop_requests
@@ -262,28 +215,24 @@ fn spawn_orphan_watcher(app: AppHandle, instance_id: String, pid_file: std::path
 /// already holds, so there is nothing to report as an error.
 #[tauri::command]
 pub fn stop_game(state: State<'_, AppState>, instance_id: String) -> Result<(), String> {
-    let pid = state
-        .game_pids
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&instance_id)
-        .copied()
-        .or_else(|| {
-            let root = crate::instances::paths::instance_root(&instance_id).ok()?;
-            std::fs::read_to_string(root.join(PID_FILE_NAME))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-        });
+    let live = state.game_pids.lock().map_err(|e| e.to_string())?
+        .get(&instance_id).copied();
+    let pid = match live {
+        Some(identity) => Some(identity),
+        None => {
+            let root = crate::instances::paths::instance_root(&instance_id).map_err(|e| e.to_string())?;
+            process::read_marker(&root.join(PID_FILE_NAME))?
+        }
+    };
     let Some(pid) = pid else {
         return Ok(());
     };
     if let Ok(mut stops) = state.stop_requests.lock() {
         stops.insert(instance_id.clone());
     }
-    if let Err(err) = kill_pid(pid) {
-        // Lost the race with a natural exit: the reaper reports it normally,
-        // so withdraw the stop request rather than mislabel a future run.
-        if is_pid_alive(pid) {
+    if let Err(err) = process::stop(pid) {
+        // Lost the race with natural exit, or identity no longer matches.
+        if process::matches(pid).unwrap_or(true) {
             if let Ok(mut stops) = state.stop_requests.lock() {
                 stops.remove(&instance_id);
             }
@@ -448,72 +397,52 @@ async fn revalidate_account(client: &reqwest::Client, account: &Account) -> Resu
 /// a second Minecraft process onto the same world files based on nothing.
 pub(crate) fn instance_process_running(instance_root: &std::path::Path) -> Result<bool, String> {
     let path = instance_root.join(PID_FILE_NAME);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.to_string()),
-    };
-    let pid: u32 = raw.trim().parse().map_err(|_| {
-        format!("Corrupted launch marker in {}: delete the file before launching.", path.display())
-    })?;
-    Ok(is_pid_alive(pid))
+    match process::read_marker(&path)? {
+        Some(identity) => process::matches(identity),
+        None => Ok(false),
+    }
 }
 
 /// Prepare all files for an instance and launch Minecraft. Emits
 /// `launch://progress`, `launch://log`, `launch://started`, and
 /// `launch://exited` events keyed by `instanceId`.
 ///
-/// The prepare/download work runs in a spawned task so `cancel_launch` can
-/// abort it via `AbortHandle` — this interrupts every `.await` point in the
-/// pipeline (version manifest, libraries, assets, Java runtime, Forge/NeoForge
-/// installer) without needing a cancel flag threaded through each of those
-/// modules individually.
+/// Cancellation is cooperative: loader processors are killed and reaped before
+/// prepare releases instance ownership.
 #[tauri::command]
 pub async fn launch_instance(
     app: AppHandle,
     state: State<'_, AppState>,
     instance_id: String,
 ) -> Result<(), String> {
-    let task_app = app.clone();
     let operation = crate::instances::operations::acquire(&instance_id)?;
-    let task_instance_id = instance_id.clone();
-    let handle = tokio::spawn(async move { run_launch(task_app, task_instance_id, operation).await });
-    let abort_handle = handle.abort_handle();
-
-    state
-        .launches
-        .lock()
-        .unwrap()
-        .insert(instance_id.clone(), abort_handle.clone());
-
+    let cancel = crate::download::CancelToken::new();
+    state.launches.lock().map_err(|e| e.to_string())?
+        .insert(instance_id.clone(), cancel.clone());
+    let task_cancel = cancel.clone();
+    let task_id = instance_id.clone();
+    let handle = tokio::spawn(async move {
+        run_launch(app, task_id, operation, task_cancel).await
+    });
     let result = handle.await;
-    // Compare-and-remove: the frontend disables Play while a launch for this
-    // instance is in flight, so two concurrent launches of the same instance
-    // shouldn't happen today — but if that guard were ever bypassed, a plain
-    // `.remove()` here could delete a second, still-running launch's registry
-    // entry (inserted after this one) instead of this one's, silently making
-    // `cancel_launch` a no-op for it.
-    let mut launches = state.launches.lock().unwrap();
-    if launches.get(&instance_id).map(|h| h.id()) == Some(abort_handle.id()) {
+    let mut launches = state.launches.lock().map_err(|e| e.to_string())?;
+    if launches.get(&instance_id).is_some_and(|registered| registered.same_control(&cancel)) {
         launches.remove(&instance_id);
     }
     drop(launches);
-
     match result {
         Ok(inner) => inner,
-        Err(join_err) if join_err.is_cancelled() => Err("Launch cancelled".to_string()),
         Err(join_err) => Err(join_err.to_string()),
     }
 }
 
 /// Signals an in-flight launch (still preparing/downloading) to stop at its
 /// next await point. A no-op if the launch already finished or is already
-/// running the game — cancelling a running Minecraft process is a different
-/// concern (close the window / task-manager it), not covered here.
+/// running the game — use `stop_game` for a running Minecraft process.
 #[tauri::command]
 pub fn cancel_launch(state: State<'_, AppState>, instance_id: String) -> Result<(), String> {
-    if let Some(handle) = state.launches.lock().unwrap().get(&instance_id) {
-        handle.abort();
+    if let Some(handle) = state.launches.lock().map_err(|e| e.to_string())?.get(&instance_id) {
+        handle.cancel();
     }
     Ok(())
 }
@@ -521,7 +450,8 @@ pub fn cancel_launch(state: State<'_, AppState>, instance_id: String) -> Result<
 async fn run_launch(
     app: AppHandle,
     instance_id: String,
-    operation: crate::instances::operations::OperationGuard,
+    mut operation: crate::instances::operations::OperationGuard,
+    cancel: crate::download::CancelToken,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let instance = state
@@ -531,7 +461,10 @@ async fn run_launch(
         .ok_or_else(|| "Instance not found.".to_string())?;
 
     let client = crate::download::http_client().map_err(|e| e.to_string())?;
-    let account = ensure_account(&state, &client).await?;
+    let account = tokio::select! {
+        result = ensure_account(&state, &client) => result?,
+        _ = wait_launch_cancelled(&cancel) => return Err("Launch cancelled".into()),
+    };
 
     let game_root = crate::instances::paths::app_data_dir()
         .map_err(|e| e.to_string())?
@@ -583,12 +516,21 @@ async fn run_launch(
         java_override,
         max_memory,
         extra_jvm_args,
+        &cancel,
         &report,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| match error {
+        crate::launch::LaunchError::Cancelled => "Launch cancelled".to_string(),
+        error => error.to_string(),
+    })?;
 
-    revalidate_account(&client, &account).await?;
+    tokio::select! {
+        result = revalidate_account(&client, &account) => result?,
+        _ = wait_launch_cancelled(&cancel) => return Err("Launch cancelled".into()),
+    }
+    if cancel.is_cancelled() { return Err("Launch cancelled".into()); }
+    state.stop_requests.lock().map_err(|e| e.to_string())?.remove(&instance_id);
     crate::activity::append_log(
         &format!(
             "Launching {} (Minecraft {}, Java {})",
@@ -611,19 +553,39 @@ async fn run_launch(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start Java: {e}"))?;
-
-    // Record the PID so a startup check in a future Waybound session (after
-    // this one closes with the game still running) can tell this instance is
-    // still live rather than assuming it's launchable again. Best-effort:
-    // if this write fails, launching still proceeds exactly as before.
+    // A durable identity marker is mandatory before relinquishing mutation
+    // ownership: future sessions must not confuse a reused PID with this game.
     let pid_file = prepared.working_dir.join(PID_FILE_NAME);
-    let _ = std::fs::write(&pid_file, child.id().to_string());
-    // Remember the live PID so `stop_game` can kill a running game (the
-    // reaper thread below takes ownership of the Child itself, so without
-    // this there would be no handle left to stop it with).
-    if let Ok(mut pids) = state.game_pids.lock() {
-        pids.insert(instance_id.clone(), child.id());
+    let identity = match process::child_identity(&child) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            let _ = child.wait();
+            return Err("Java exited before its process identity could be recorded.".into());
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Could not verify launched Java process: {error}"));
+        }
+    };
+    // Publish the marker and registry identity under one registry lock so
+    // startup adoption cannot create a second watcher for our own child.
+    let mut pids = match state.game_pids.lock() {
+        Ok(pids) => pids,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Could not register running game identity: {error}"));
+        }
+    };
+    if let Err(error) = process::write_marker(&pid_file, identity) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Could not record running game identity: {error}"));
     }
+    pids.insert(instance_id.clone(), identity);
+    drop(pids);
+    operation.mark_running();
 
     let _ = app.emit(
         "launch://started",
@@ -652,19 +614,29 @@ async fn run_launch(
     let exit_app = app.clone();
     let exit_id = instance_id.clone();
     let exit_name = instance.name.clone();
+    let natives = prepared.natives.clone();
     std::thread::spawn(move || {
         let _operation = operation;
+        let _natives = natives;
         let code = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
-                Err(_) => break None,
+                Err(_) => {
+                    // A failed wait is not proof of exit. Keep native files
+                    // alive and the marker intact until identity is gone.
+                    if !process::matches(identity).unwrap_or(true) {
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
             }
         };
-        let _ = std::fs::remove_file(&pid_file);
+        process::remove_marker_if_owned(&pid_file, identity);
         let exit_state = exit_app.state::<AppState>();
         if let Ok(mut pids) = exit_state.game_pids.lock() {
-            pids.remove(&exit_id);
+            if pids.get(&exit_id) == Some(&identity) { pids.remove(&exit_id); }
         }
         // A deliberate stop reports as stopped, not crashed: the non-zero
         // exit code a kill produces would otherwise mislabel it.
@@ -729,8 +701,9 @@ fn spawn_log_reader<R>(
     R: std::io::Read + Send + 'static,
 {
     std::thread::spawn(move || {
-        let buffered = BufReader::new(reader);
-        for line in buffered.lines().map_while(Result::ok) {
+        let mut buffered = BufReader::new(reader);
+        let mut bytes = Vec::new();
+        while let Ok(Some(line)) = read_log_line(&mut buffered, &mut bytes) {
             if let Ok(mut sink) = sink.lock() {
                 sink.push(&line);
             }
@@ -744,6 +717,18 @@ fn spawn_log_reader<R>(
             );
         }
     });
+}
+
+fn read_log_line<R: BufRead>(reader: &mut R, bytes: &mut Vec<u8>) -> std::io::Result<Option<String>> {
+    bytes.clear();
+    if reader.read_until(b'\n', bytes)? == 0 { return Ok(None); }
+    if bytes.last() == Some(&b'\n') { bytes.pop(); }
+    if bytes.last() == Some(&b'\r') { bytes.pop(); }
+    Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+}
+
+async fn wait_launch_cancelled(cancel: &crate::download::CancelToken) {
+    cancel.cancelled().await;
 }
 
 // ---- Crash explanation ---------------------------------------------------
@@ -1074,6 +1059,16 @@ mod crash_reason_tests {
     }
 
     #[test]
+    fn non_utf8_log_line_does_not_end_following_output() {
+        let mut reader = std::io::Cursor::new(b"bad \xff\r\nnext\nlast".as_slice());
+        let mut bytes = Vec::new();
+        assert_eq!(super::read_log_line(&mut reader, &mut bytes).unwrap().as_deref(), Some("bad \u{fffd}"));
+        assert_eq!(super::read_log_line(&mut reader, &mut bytes).unwrap().as_deref(), Some("next"));
+        assert_eq!(super::read_log_line(&mut reader, &mut bytes).unwrap().as_deref(), Some("last"));
+        assert!(super::read_log_line(&mut reader, &mut bytes).unwrap().is_none());
+    }
+
+    #[test]
     fn malformed_dependency_lines_do_not_panic_or_half_explain() {
         // Header present, entries truncated/garbled: better to say nothing
         // than to emit a sentence with holes in it.
@@ -1197,44 +1192,3 @@ mod log_sink_tests {
     }
 }
 
-#[cfg(test)]
-mod pid_liveness_tests {
-    use super::is_pid_alive;
-
-    #[test]
-    fn reports_the_current_process_as_alive() {
-        // The one PID we can assert about with certainty: our own. If this
-        // regresses, every instance looks dead on startup and Waybound
-        // happily allows a second concurrent launch into the same world.
-        assert!(is_pid_alive(std::process::id()));
-    }
-
-    #[test]
-    fn reports_an_exited_process_as_dead() {
-        // Spawn something trivial, reap it, then ask. The inverse failure
-        // (a dead process reported alive) permanently wedges the Play
-        // button on "Running" with no way back short of editing the DB.
-        let mut child = if cfg!(windows) {
-            std::process::Command::new("cmd").args(["/C", "exit"]).spawn()
-        } else {
-            std::process::Command::new("true").spawn()
-        }
-        .expect("spawning a trivial process should work");
-
-        let pid = child.id();
-        child.wait().expect("child should exit");
-
-        // Not asserted as a hard invariant of the OS — PIDs are reusable in
-        // principle — but reuse this fast is vanishingly unlikely, and a
-        // flake here still points at something worth looking at.
-        assert!(!is_pid_alive(pid), "pid {pid} was reaped but still reads as alive");
-    }
-
-    #[test]
-    fn treats_an_implausible_pid_as_dead_rather_than_erroring() {
-        // The lookup shells out; a failure to run it must degrade to
-        // "not running" instead of propagating, or startup breaks entirely
-        // on a machine where the helper isn't available.
-        assert!(!is_pid_alive(u32::MAX));
-    }
-}

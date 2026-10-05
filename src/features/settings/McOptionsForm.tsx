@@ -583,6 +583,8 @@ function KeyBindRow({
       <span>{label}</span>
       <button
         type="button"
+        aria-label={`${label}: ${keyLabel(code)}${listening ? "; listening, press a key or mouse button; Escape to unbind" : ""}`}
+        aria-pressed={listening}
         className={`${styles.keyBindBtn} ${listening ? styles.keyBindListening : ""}`}
         disabled={disabled}
         onClick={() => setListening((v) => !v)}

@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::files::download_verified;
 use super::offline;
-use super::{LaunchError, ProgressUpdate};
+use super::{cancellable, check_cancelled, LaunchError, ProgressUpdate};
+use crate::download::CancelToken;
 
 const JAVA_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 const DOWNLOAD_CONCURRENCY: usize = 8;
@@ -64,11 +65,13 @@ pub async fn ensure_component<F>(
     client: &Client,
     runtimes_root: &Path,
     component: &str,
+    cancel: &CancelToken,
     report: &F,
 ) -> Result<PathBuf, LaunchError>
 where
     F: Fn(ProgressUpdate),
 {
+    check_cancelled(cancel)?;
     let dest_root = runtimes_root.join(component);
     let java_exe = dest_root.join("bin").join(java_exe_name());
     let marker = dest_root.join(".complete");
@@ -80,7 +83,7 @@ where
     let files = if let Some(files) = cached_files {
         files
     } else {
-        if java_exe.is_file() && local_java_works(java_exe.clone()).await? {
+        if java_exe.is_file() && local_java_works(&java_exe, cancel).await? {
             // Legacy installs have no hashes to audit. A successful JVM probe
             // permits local reuse, but does not certify the entire file tree.
             // Do not stamp completion or force a network request for migration.
@@ -90,9 +93,9 @@ where
             return Ok(java_exe);
         }
         report(ProgressUpdate::stage("Locating Java runtime", 0, 1));
-        let all: AllManifest = offline::fetch_json_cached(
+        let all: AllManifest = cancellable(cancel, offline::fetch_json_cached(
             client, runtimes_root, "java/all.json", JAVA_MANIFEST_URL,
-        ).await?;
+        )).await?;
         let os = os_key();
         let entry = all
             .get(os)
@@ -101,7 +104,7 @@ where
             .ok_or_else(|| LaunchError::Parse(format!(
                 "Mojang has no Java runtime '{component}' for {os}"
             )))?;
-        offline::fetch_json_cached(client, runtimes_root, &files_key, &entry.manifest.url).await?
+        cancellable(cancel, offline::fetch_json_cached(client, runtimes_root, &files_key, &entry.manifest.url)).await?
     };
     validate_manifest(&files)?;
     let record = serde_json::to_vec(&files)
@@ -117,6 +120,7 @@ where
 
     let mut jobs = Vec::new();
     for (rel, entry) in &files.files {
+        check_cancelled(cancel)?;
         let path = dest_root.join(rel);
         match entry.kind.as_str() {
             "file" => {
@@ -131,7 +135,7 @@ where
     let total = jobs.len() as u64;
     let mut done = 0u64;
     let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, sha1, path, exec)| async move {
-        download_verified(client, &url, &path, Some(&sha1), false).await?;
+        cancellable(cancel, download_verified(client, &url, &path, Some(&sha1), false)).await?;
         set_executable(&path, exec)?;
         Ok::<(), LaunchError>(())
     }))
@@ -141,15 +145,18 @@ where
         done += 1;
         if done % 20 == 0 || done == total {
             report(ProgressUpdate::stage("Verifying Java runtime", done, total));
+            tokio::task::yield_now().await;
         }
     }
     // Materialize links after files, so Windows can determine their type.
     for (rel, entry) in &files.files {
+        check_cancelled(cancel)?;
         if entry.kind == "link" {
             make_link(&dest_root.join(rel), entry.target.as_deref().expect("validated link entry"))?;
         }
     }
     for (rel, entry) in &files.files {
+        check_cancelled(cancel)?;
         let path = dest_root.join(rel);
         let valid = match entry.kind.as_str() {
             "directory" => path.is_dir(),
@@ -166,6 +173,7 @@ where
             "Java runtime '{component}' downloaded but {} is missing", java_exe.display()
         )));
     }
+    check_cancelled(cancel)?;
     std::fs::write(&marker, record)?;
     Ok(java_exe)
 }
@@ -200,31 +208,31 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
-async fn local_java_works(path: PathBuf) -> Result<bool, LaunchError> {
-    tokio::task::spawn_blocking(move || {
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-        let mut command = Command::new(path);
-        command.arg("-version").stdout(Stdio::null()).stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
+async fn local_java_works(path: &Path, cancel: &CancelToken) -> Result<bool, LaunchError> {
+    use std::process::Stdio;
+    let mut command = tokio::process::Command::new(path);
+    command.arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    check_cancelled(cancel)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return Ok(false),
+    };
+    // Await cancellation cleanup directly. Never detach a spawn_blocking probe
+    // while the preparation guard (and shared runtime ownership) is released.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::forge::wait_processor(&mut child, cancel),
+    ).await {
+        Ok(result) => Ok(result?.success()),
+        Err(_) => {
+            let _ = child.kill().await;
+            child.wait().await?;
+            check_cancelled(cancel)?;
+            Ok(false)
         }
-        let Ok(mut child) = command.spawn() else { return Ok(false); };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status.success());
-            }
-            if Instant::now() >= deadline {
-                child.kill()?;
-                child.wait()?;
-                return Ok(false);
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }).await.map_err(|e| LaunchError::Spawn(format!("Java probe failed: {e}")))?
+    }
 }
 
 
@@ -409,16 +417,42 @@ mod java_runtime_completion_tests {
     }
 
     #[tokio::test]
+    async fn cancellation_before_runtime_prepare_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = ensure_component(&Client::new(), dir.path(), "test-runtime", &cancel, &|_| {}).await;
+        assert!(matches!(result, Err(LaunchError::Cancelled)));
+        assert!(!dir.path().join("test-runtime").exists());
+        assert!(!dir.path().join("meta-cache").exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_verifying_files_never_publishes_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = install_fixture(dir.path());
+        let cancel = CancelToken::new();
+        let result = ensure_component(&Client::new(), dir.path(), "test-runtime", &cancel, &|progress| {
+            if progress.stage == "Verifying Java runtime" && progress.current == progress.total {
+                cancel.cancel();
+            }
+        }).await;
+        assert!(matches!(result, Err(LaunchError::Cancelled)));
+        assert!(!runtime.join(".complete").exists());
+        assert_eq!(std::fs::read(runtime.join("lib/runtime.dat")).unwrap(), b"runtime");
+    }
+
+    #[tokio::test]
     async fn markerless_cached_runtime_is_verified_without_downloading() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = install_fixture(dir.path());
-        let java = ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.unwrap();
+        let java = ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.unwrap();
         assert_eq!(java, runtime.join("bin").join(java_exe_name()));
         // Losing the metadata cache must not destroy offline verification.
         std::fs::remove_dir_all(dir.path().join("meta-cache")).unwrap();
-        ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.unwrap();
+        ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.unwrap();
         std::fs::write(runtime.join("lib/runtime.dat"), b"corrupt").unwrap();
-        assert!(ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.is_err());
+        assert!(ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.is_err());
         assert!(!runtime.join(".complete").exists());
     }
 
@@ -426,19 +460,19 @@ mod java_runtime_completion_tests {
     async fn missing_runtime_file_cannot_hide_behind_completion_record() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = install_fixture(dir.path());
-        ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.unwrap();
+        ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.unwrap();
         std::fs::remove_file(runtime.join("lib/runtime.dat")).unwrap();
-        assert!(ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.is_err());
+        assert!(ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.is_err());
         assert!(!runtime.join(".complete").exists());
         std::fs::write(runtime.join("lib/runtime.dat"), b"runtime").unwrap();
-        ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.unwrap();
+        ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.unwrap();
     }
 
     #[tokio::test]
     async fn completion_write_failure_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = install_fixture(dir.path());
-        let result = ensure_component(&Client::new(), dir.path(), "test-runtime", &|progress| {
+        let result = ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|progress| {
             if progress.stage == "Verifying Java runtime" && progress.current == progress.total {
                 std::fs::create_dir(runtime.join(".complete")).unwrap();
             }
@@ -454,7 +488,7 @@ mod java_runtime_completion_tests {
         let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
         manifest["files"]["lib/runtime.dat"].as_object_mut().unwrap().remove("downloads");
         std::fs::write(cache, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(matches!(ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await, Err(LaunchError::Parse(_))));
+        assert!(matches!(ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await, Err(LaunchError::Parse(_))));
         assert!(!runtime.join(".complete").exists());
     }
 
@@ -477,7 +511,7 @@ mod java_runtime_completion_tests {
         let java = runtime.join("bin/java");
         std::fs::write(&java, b"#!/bin/sh\nexit 0\n").unwrap();
         set_executable(&java, true).unwrap();
-        assert_eq!(ensure_component(&Client::new(), dir.path(), "test-runtime", &|_| {}).await.unwrap(), java);
+        assert_eq!(ensure_component(&Client::new(), dir.path(), "test-runtime", &CancelToken::new(), &|_| {}).await.unwrap(), java);
         assert!(!runtime.join(".complete").exists());
         assert!(!dir.path().join("meta-cache").exists());
     }

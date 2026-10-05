@@ -7,6 +7,7 @@ use crate::sources::curseforge_key::{
     curseforge_api_key_from_environment, extract_curseforge_api_key,
 };
 use serde::Serialize;
+use std::future::Future;
 use tauri::State;
 
 #[derive(Debug, Serialize)]
@@ -32,7 +33,6 @@ pub async fn test_curseforge_api_key(
             ok: false,
             http_status: 0,
             key_length: 0,
-            key_prefix: String::new(),
             message: "No CurseForge API key is saved yet.".to_string(),
             log: vec![
                 "No API key found in Waybound config.".to_string(),
@@ -75,7 +75,6 @@ pub async fn test_curseforge_docker_env_key(
                 ok: false,
                 http_status: 0,
                 key_length: 0,
-                key_prefix: String::new(),
                 message: "No Docker-style CF_API_KEY found.".to_string(),
                 log: vec![
                     "No CF_API_KEY in process environment.".to_string(),
@@ -125,26 +124,17 @@ pub async fn set_curseforge_api_key(
     Ok(status_from_state(&state))
 }
 
+// Unlike a pasted key, importing a file must validate before replacing a
+// working key. There is no unchecked env-import path.
 #[tauri::command]
 pub async fn import_curseforge_api_key_from_env_file(
     state: State<'_, super::search::AppState>,
     path: String,
-    skip_validation: Option<bool>,
 ) -> Result<CurseForgeStatus, String> {
     let resolved = resolve_env_file_path(&path)?;
     let read = read_docker_env_key_from_path(&resolved)?;
-    state
-        .config
-        .set_curseforge_api_key(read.key.clone())
-        .map_err(map_config_error)?;
-
     let key = read.key;
-
-    if !looks_like_curseforge_key(&key) {
-        return Err("Imported CF_API_KEY does not look like a valid CurseForge key.".to_string());
-    }
-
-    if !skip_validation.unwrap_or(true) {
+    save_validated_env_key(&state.config, &key, async {
         let probe = state
             .curseforge
             .probe_api_key(&key, Some("imported `.env` file"))
@@ -152,9 +142,22 @@ pub async fn import_curseforge_api_key_from_env_file(
         if !probe.ok {
             return Err(probe.message);
         }
-    }
+        Ok(())
+    }).await?;
 
     Ok(status_from_state(&state))
+}
+
+async fn save_validated_env_key(
+    config: &crate::config::ConfigStore,
+    key: &str,
+    validation: impl Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    if !looks_like_curseforge_key(key) {
+        return Err("Imported CF_API_KEY does not look like a valid CurseForge key.".to_string());
+    }
+    validation.await?;
+    config.set_curseforge_api_key(key.to_owned()).map_err(map_config_error)
 }
 
 #[tauri::command]
@@ -207,4 +210,47 @@ fn resolve_env_file_path(path: &str) -> Result<std::path::PathBuf, String> {
 
 fn map_config_error(error: ConfigError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_env_candidate_never_replaces_working_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = crate::config::ConfigStore::for_test(path.clone());
+        let working = "$2a$10$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0";
+        config.set_curseforge_api_key(working.to_owned()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let env = dir.path().join(".env");
+        std::fs::write(&env, "CF_API_KEY=invalid-private-candidate\n").unwrap();
+        let candidate = read_docker_env_key_from_path(&env).unwrap().key;
+        let error = save_validated_env_key(&config, &candidate, async {
+            panic!("invalid shape must not start network validation")
+        }).await.unwrap_err();
+        assert!(!error.contains(&candidate));
+        assert_eq!(config.stored_curseforge_api_key().as_deref(), Some(working));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_env_probe_keeps_saved_key_and_success_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = crate::config::ConfigStore::for_test(path.clone());
+        let working = "$2a$10$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0";
+        let candidate = "$2a$10$ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0";
+        config.set_curseforge_api_key(working.to_owned()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(save_validated_env_key(
+            &config, candidate, std::future::ready(Err("CurseForge returned HTTP 403.".into())),
+        ).await.is_err());
+        assert_eq!(config.stored_curseforge_api_key().as_deref(), Some(working));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        save_validated_env_key(&config, candidate, std::future::ready(Ok(()))).await.unwrap();
+        assert_eq!(config.stored_curseforge_api_key().as_deref(), Some(candidate));
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+    }
 }

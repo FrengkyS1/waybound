@@ -85,41 +85,62 @@ export function ProjectDetailPage({
   >();
   const [changelogBody, setChangelogBody] = useState<string | null>(null);
   const [changelogLoading, setChangelogLoading] = useState(false);
+  const [changelogError, setChangelogError] = useState<string | null>(null);
+  const [changelogAttempt, setChangelogAttempt] = useState(0);
+  const [detailAttempt, setDetailAttempt] = useState(0);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [activityLogs, setActivityLogs] = useState<
     Awaited<ReturnType<typeof fetchActivityLogs>>
   >([]);
+  const [logsError, setLogsError] = useState<string | null>(null);
 
   const isModpack = summary.projectType === "modpack";
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const loaded = await fetchModDetails(summary);
-        setDetail(loaded);
-        setContentVersionId(loaded.versions[0]?.id);
-        setChangelogVersionId(loaded.versions[0]?.id);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [summary]);
+    let active = true;
+    setLoading(true);
+    setError(null);
+    setDetail(null);
+    setContentVersionId(undefined);
+    setChangelogVersionId(undefined);
+    setInstallOpen(false);
+    setLightboxIndex(null);
+    void fetchModDetails(summary).then((loaded) => {
+      if (!active) return;
+      setDetail(loaded);
+      setContentVersionId(loaded.versions[0]?.id);
+      setChangelogVersionId(loaded.versions[0]?.id);
+    }).catch((err) => {
+      if (active) setError(err instanceof Error ? err.message : String(err));
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => { active = false; };
+  }, [summary, detailAttempt]);
 
   useEffect(() => {
+    let active = true;
+    setChangelogBody(null);
+    setChangelogError(null);
+    setChangelogLoading(false);
     if (tab !== "changelog" || !detail || !changelogVersionId) return;
     setChangelogLoading(true);
     void fetchVersionChangelog(detail.summary, changelogVersionId)
-      .then((value) => setChangelogBody(value))
-      .catch(() => setChangelogBody(null))
-      .finally(() => setChangelogLoading(false));
-  }, [tab, detail, changelogVersionId]);
+      .then((value) => { if (active) setChangelogBody(value); })
+      .catch((err) => { if (active) setChangelogError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { if (active) setChangelogLoading(false); });
+    return () => { active = false; };
+  }, [tab, detail, changelogVersionId, changelogAttempt]);
 
   useEffect(() => {
+    let active = true;
     if (tab !== "logs") return;
-    void fetchActivityLogs(100).then(setActivityLogs);
-  }, [tab]);
+    setLogsError(null);
+    void fetchActivityLogs(100)
+      .then((logs) => { if (active) setActivityLogs(logs); })
+      .catch((err) => { if (active) setLogsError(String(err)); });
+    return () => { active = false; };
+  }, [tab, summary.uid]);
 
   const data = detail?.summary ?? summary;
   const canInstall = isInstallableType(data.projectType);
@@ -159,13 +180,8 @@ export function ProjectDetailPage({
   const targetLoader = installTarget?.loader ?? null;
   function matchesInstance(gameVersions: string[], loaders: string[]): boolean {
     if (!targetMc && !targetLoader) return true;
-    const gvOk =
-      gameVersions.length === 0 ||
-      (targetMc != null && gameVersions.includes(targetMc));
-    const loaderOk =
-      targetLoader == null ||
-      targetLoader === "vanilla" ||
-      loaders.length === 0 ||
+    const gvOk = targetMc != null && gameVersions.includes(targetMc);
+    const loaderOk = data.projectType !== "mod" || targetLoader == null ||
       loaders.some((l) => l.toLowerCase() === targetLoader);
     return gvOk && loaderOk;
   }
@@ -208,8 +224,9 @@ export function ProjectDetailPage({
         </div>
 
         {loading && <p className={styles.status}>Loading project…</p>}
-        {error && <p className={styles.error}>{error}</p>}
+        {error && <p className={styles.error} role="alert">{error} <button type="button" onClick={() => setDetailAttempt((v) => v + 1)}>Retry project</button></p>}
         {toast && <p className={styles.toast}>{toast}</p>}
+        {tab === "logs" && logsError && <p className={styles.error} role="alert">{logsError}</p>}
 
         {!loading && (
           <>
@@ -380,6 +397,7 @@ export function ProjectDetailPage({
                     {changelogLoading && (
                       <p className={styles.emptyBody}>Loading changelog…</p>
                     )}
+                    {changelogError && <p className={styles.error} role="alert">{changelogError} <button type="button" onClick={() => setChangelogAttempt((v) => v + 1)}>Retry changelog</button></p>}
                     {!changelogLoading && changelogBody && (
                       <Suspense
                         fallback={
@@ -389,7 +407,7 @@ export function ProjectDetailPage({
                         <MarkdownBody content={changelogBody} />
                       </Suspense>
                     )}
-                    {!changelogLoading && !changelogBody && (
+                    {!changelogLoading && !changelogError && !changelogBody && (
                       <p className={styles.emptyBody}>
                         No changelog for this version.
                       </p>

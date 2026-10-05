@@ -399,6 +399,7 @@
 
 .infoCard,
 .settingsCard,
+.configCard,
 .dangerCard {
   padding: var(--space-4);
   background: var(--surface-sheen), var(--color-surface);
@@ -931,13 +932,17 @@
   min-height: 44px;
 }
 
+.configCard,
 .dangerCard {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
+}
+.dangerCard {
   border-color: color-mix(in srgb, var(--color-error) 25%, var(--color-border-subtle));
 }
+.configCard .cardTitle,
 .dangerCard .cardTitle {
   margin: 0;
 }

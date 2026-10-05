@@ -68,7 +68,7 @@ fn merge_into(target: &mut ModSummary, incoming: ModSummary) {
         }
     }
 
-    if incoming.updated_at > target.updated_at {
+    if crate::sources::updated_key(&incoming.updated_at) > crate::sources::updated_key(&target.updated_at) {
         target.updated_at = incoming.updated_at;
     }
 
@@ -77,12 +77,12 @@ fn merge_into(target: &mut ModSummary, incoming: ModSummary) {
 
 fn stable_uid(item: &ModSummary) -> String {
     if let Some(id) = item.modrinth_id.as_ref() {
-        return format!("mod:{id}");
+        return format!("modrinth:{id}");
     }
     if let Some(id) = item.curseforge_id {
-        return format!("mod:cf:{id}");
+        return format!("curseforge:{id}");
     }
-    format!("mod:slug:{}", normalize_slug(&item.slug))
+    item.uid.clone()
 }
 
 fn slug_match(a: &str, b: &str) -> bool {
@@ -129,7 +129,10 @@ mod tests {
 
     fn sample(slug: &str, name: &str, source: ModSource) -> ModSummary {
         ModSummary {
-            uid: format!("{slug}-uid"),
+            uid: match source {
+                ModSource::Modrinth => "modrinth:abc".to_string(),
+                ModSource::Curseforge => "curseforge:1".to_string(),
+            },
             slug: slug.to_string(),
             name: name.to_string(),
             description: String::new(),
@@ -163,6 +166,29 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert!(merged[0].sources.contains(&ModSource::Modrinth));
         assert!(merged[0].sources.contains(&ModSource::Curseforge));
+        assert_eq!(merged[0].uid, "modrinth:abc");
+    }
+
+    #[test]
+    fn canonical_uid_is_independent_of_source_order() {
+        let merged = dedupe_mods(vec![
+            sample("sodium", "Sodium", ModSource::Curseforge),
+            sample("sodium", "Sodium", ModSource::Modrinth),
+        ]);
+        assert_eq!(merged[0].uid, "modrinth:abc");
+        assert_eq!(merged[0].curseforge_id, Some(1));
+        assert_eq!(merged[0].modrinth_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn merged_timestamp_keeps_newer_fraction_regardless_of_source_order() {
+        let mut whole = sample("sodium", "Sodium", ModSource::Curseforge);
+        whole.updated_at = "2026-01-01T00:00:00Z".to_string();
+        let mut fraction = sample("sodium", "Sodium", ModSource::Modrinth);
+        fraction.updated_at = "2026-01-01T00:00:00.001Z".to_string();
+        for hits in [vec![whole.clone(), fraction.clone()], vec![fraction.clone(), whole.clone()]] {
+            assert_eq!(dedupe_mods(hits)[0].updated_at, fraction.updated_at);
+        }
     }
 
     #[test]

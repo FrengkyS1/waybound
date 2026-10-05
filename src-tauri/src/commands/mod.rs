@@ -9,10 +9,10 @@ pub mod search;
 pub mod settings;
 pub mod transfer;
 
-pub use auth::{get_account, logout, microsoft_login};
+pub use auth::{cancel_microsoft_login, get_account, logout, microsoft_login};
 pub use content::{
     check_launch_readiness, get_content_meta, list_instance_content, list_instance_servers,
-    list_instance_worlds, list_mod_configs, list_world_files, read_config_file,
+    list_instance_worlds, list_instance_configs, list_mod_configs, list_world_files, read_config_file,
     read_world_file, remove_content_file, set_content_enabled, write_config_file,
     write_world_file,
 };

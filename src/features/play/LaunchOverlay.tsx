@@ -64,6 +64,10 @@ function LaunchCard({ launch }: { launch: LaunchState }) {
   const [stopping, setStopping] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
+  useEffect(() => {
+    setStopping(false);
+  }, [launch.phase, launch.startedAtMs]);
+
   // Auto-scroll the log to the newest line.
   useEffect(() => {
     if (showLog && logRef.current) {

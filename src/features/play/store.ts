@@ -4,6 +4,7 @@ import { create } from "zustand";
 import {
   addPlayTime,
   cancelLaunch,
+  cancelMicrosoftLogin,
   getAccount,
   getRunningInstances,
   launchInstance,
@@ -62,6 +63,7 @@ interface PlayStore {
   init: () => Promise<void>;
   signIn: () => Promise<AccountPublic | null>;
   signOut: () => Promise<void>;
+  cancelSignIn: () => Promise<void>;
   refreshAccount: () => Promise<void>;
   play: (instanceId: string, instanceName: string) => Promise<void>;
   /** Signals the backend to stop an in-flight prepare/download at its next await point. */
@@ -73,7 +75,6 @@ interface PlayStore {
   launchDockMinimized: boolean;
   setLaunchDockMinimized: (minimized: boolean) => void;
   dismissLaunch: (instanceId: string) => void;
-  clearDevicePrompt: () => void;
   clearLogs: (instanceId: string) => void;
   /** Fills the Logs tab from the instance's persisted log file when this
    * session has nothing in memory for it — a crash from before the app was
@@ -86,6 +87,8 @@ const LOG_FLUSH_MS = 150;
 let listenersReady = false;
 /** Instances whose on-disk log has already been offered to this session. */
 const restoredFromDisk = new Set<string>();
+let activeLoginId: string | null = null;
+let loginCancelled = false;
 
 // A chatty modpack can emit hundreds of log lines per second. Applying each
 // one as its own store update floods React with re-renders (the always-mounted
@@ -152,15 +155,30 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
   },
 
   signIn: async () => {
+    if (get().signingIn) return null;
+    const loginId = crypto.randomUUID();
+    activeLoginId = loginId;
+    loginCancelled = false;
     set({ signingIn: true, devicePrompt: null });
     try {
-      const account = await microsoftLogin();
-      set({ account, signingIn: false, devicePrompt: null });
+      const account = await microsoftLogin(loginId);
+      if (activeLoginId !== loginId || loginCancelled) return null;
+      set({ account });
       return account;
-    } catch (err) {
-      set({ signingIn: false });
-      throw err;
+    } finally {
+      if (activeLoginId === loginId) {
+        activeLoginId = null;
+        set({ signingIn: false, devicePrompt: null });
+      }
     }
+  },
+
+  cancelSignIn: async () => {
+    const loginId = activeLoginId;
+    if (!loginId) return;
+    loginCancelled = true;
+    set({ devicePrompt: null });
+    await cancelMicrosoftLogin(loginId);
   },
 
   signOut: async () => {
@@ -225,7 +243,6 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
       const { [instanceId]: _removed, ...rest } = state.launches;
       return { launches: rest };
     }),
-  clearDevicePrompt: () => set({ devicePrompt: null }),
 
   loadStoredLogs: async (instanceId) => {
     // Once per instance per session: "Clear" must stay cleared, and a live
@@ -269,8 +286,10 @@ async function registerListeners(
   const unlisten: UnlistenFn[] = [];
 
   unlisten.push(
-    await listen<DeviceCodePrompt>("auth://device-code", (event) => {
-      set({ devicePrompt: event.payload });
+    await listen<{ loginId: string; prompt: DeviceCodePrompt }>("auth://device-code", (event) => {
+      if (get().signingIn && !loginCancelled && event.payload.loginId === activeLoginId) {
+        set({ devicePrompt: event.payload.prompt });
+      }
     }),
   );
 

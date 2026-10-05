@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
@@ -159,4 +159,22 @@ describe("PlayButton readiness gate", () => {
       expect(calls.filter((c) => c.cmd === "stop_game")).toHaveLength(1),
     );
   });
+});
+
+it("re-arms Stop when a new run replaces the same instance", () => {
+  const launch = {
+    instanceId: "inst-1", instanceName: "Test Instance",
+    phase: "running" as const, stage: "Running", current: 0, total: 0,
+    logs: [], exitCode: null, error: null, startedAtMs: 1,
+    crashed: false, crashReason: null,
+  };
+  usePlayStore.setState({ launches: { "inst-1": launch } });
+  renderButton();
+  fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
+  expect(screen.getByRole("button", { name: "Stopping…" })).toBeDisabled();
+  act(() => usePlayStore.setState({
+    launches: { "inst-1": { ...launch, startedAtMs: 2 } },
+  }));
+  fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
+  expect(calls.filter((call) => call.cmd === "stop_game")).toHaveLength(2);
 });

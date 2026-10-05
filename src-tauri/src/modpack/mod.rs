@@ -4,9 +4,12 @@ mod preview;
 mod transaction;
 
 pub use curseforge::import_curseforge_modpack_zip;
+pub(crate) use curseforge::prepare_curseforge_modpack_zip;
 pub use curseforge::is_curseforge_modpack_zip;
-pub(crate) use curseforge::{curseforge_file_url, pending_missing_mods, remove_pack_manifest_entry};
+pub(crate) use curseforge::{curseforge_file_url, pending_missing_mods, prepare_manual_pack_replacement, prepare_pending_pack_update, remove_pack_manifest_entry, stage_completed_pack_update};
 pub use modrinth::import_modrinth_mrpack_bytes;
+pub(crate) use modrinth::prepare_modrinth_mrpack_bytes;
+pub(crate) use transaction::{PackTransaction, MAX_PACK_FILE_BYTES};
 pub use modrinth::is_mrpack_bytes;
 pub use preview::{preview_curseforge_modpack, preview_modrinth_modpack};
 
@@ -68,6 +71,18 @@ pub struct ModpackImportResult {    pub message: String,
     pub version_label: Option<String>,
 }
 
+pub(crate) struct PreparedModpackImport {
+    pub transaction: PackTransaction,
+    pub result: ModpackImportResult,
+}
+
+impl PreparedModpackImport {
+    pub async fn commit(self, cancel: &crate::download::CancelToken) -> Result<ModpackImportResult, ModpackError> {
+        self.transaction.commit(cancel).await?;
+        Ok(self.result)
+    }
+}
+
 /// The loader (and exact build) a pack archive declares for itself.
 ///
 /// A CurseForge pack's per-file list carries no loader signal — the truth
@@ -78,8 +93,9 @@ pub struct ModpackImportResult {    pub message: String,
 /// loader is a category guess that defaults to Forge — this is what put a
 /// NeoForge pack (ATM10) on a Forge instance, where every NeoForge jar
 /// silently fails to register and the game dies on "missing" mandatory
-/// dependencies that are all sitting in `mods/`. The installer calls this
-/// on the downloaded bytes and corrects the instance before importing.
+/// dependencies that are all sitting in `mods/`. The installer reads this
+/// before staging, then publishes the selected loader with the verified files.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PackDeclaredLoader {
     pub loader: ModLoader,
     /// Exact build from the manifest, when the pack pins one.

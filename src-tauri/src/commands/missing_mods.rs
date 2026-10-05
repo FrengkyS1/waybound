@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -14,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
 use crate::dto::instance::MissingMod;
 use crate::instances::paths::instance_root;
-use crate::launch::files::file_sha1;
+use crate::download::{contained_join, ensure_contained_path, CancelToken, DownloadError, MAX_DOWNLOAD_BYTES};
 use crate::instances::operations::acquire;
 
 const BROWSER_WINDOW_LABEL: &str = "missing-mods-browser";
@@ -31,19 +32,35 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_WATCH_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const WATCH_TIMEOUT_PER_MOD: Duration = Duration::from_secs(5 * 60);
 
-fn watch_timeout(mod_count: usize) -> Duration {
-    MIN_WATCH_TIMEOUT.max(WATCH_TIMEOUT_PER_MOD * mod_count as u32)
+static ACTIVE_WATCHES: LazyLock<Mutex<HashMap<String, CancelToken>>> = LazyLock::new(Default::default);
+
+fn replace_watch(instance_id: &str, cancel: Option<CancelToken>) -> Result<(), String> {
+    let mut watches = ACTIVE_WATCHES.lock().map_err(|_| "Downloads watcher registry is unavailable.".to_string())?;
+    let previous = match cancel {
+        Some(cancel) => watches.insert(instance_id.to_string(), cancel),
+        None => watches.remove(instance_id),
+    };
+    if let Some(previous) = previous { previous.cancel(); }
+    Ok(())
 }
 
-/// Checks (and immediately flips) the one-time "prompt CurseForge login"
-/// flag. Pure config read/write — safe to call synchronously from the
-/// command's dispatcher thread, unlike the actual window creation below.
-fn should_prompt_curseforge_login(config: &crate::config::ConfigStore) -> bool {
-    if config.curseforge_login_prompted() {
-        return false;
+struct WatchGuard {
+    instance_id: String,
+    cancel: CancelToken,
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        if let Ok(mut watches) = ACTIVE_WATCHES.lock() {
+            if watches.get(&self.instance_id).is_some_and(|token| token.same_control(&self.cancel)) {
+                watches.remove(&self.instance_id);
+            }
+        }
     }
-    let _ = config.mark_curseforge_login_prompted();
-    true
+}
+
+fn watch_timeout(mod_count: usize) -> Duration {
+    MIN_WATCH_TIMEOUT.max(WATCH_TIMEOUT_PER_MOD * mod_count as u32)
 }
 
 /// Opens a separate window at CurseForge's own login page alongside whatever
@@ -54,17 +71,17 @@ fn should_prompt_curseforge_login(config: &crate::config::ConfigStore) -> bool {
 /// spawned task like every other window creation in this file — WebView2
 /// window creation isn't safe to call directly from a command's dispatcher
 /// thread.
-fn open_curseforge_login_window(app: &AppHandle) {
-    let Ok(url) = Url::parse("https://www.curseforge.com/account/login") else {
-        return;
-    };
-    if let Err(err) = WebviewWindowBuilder::new(app, LOGIN_WINDOW_LABEL, WebviewUrl::External(url))
+fn open_curseforge_login_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(LOGIN_WINDOW_LABEL) {
+        return window.set_focus().map_err(|err| format!("Could not focus CurseForge login window: {err}"));
+    }
+    let url = Url::parse("https://www.curseforge.com/account/login").map_err(|err| err.to_string())?;
+    WebviewWindowBuilder::new(app, LOGIN_WINDOW_LABEL, WebviewUrl::External(url))
         .title("Log in to CurseForge (optional) \u{2014} Waybound")
         .inner_size(900.0, 700.0)
         .build()
-    {
-        crate::activity::append_log(&format!("Could not open CurseForge login window: {err}"), "warn", None);
-    }
+        .map_err(|err| format!("Could not open CurseForge login window: {err}"))?;
+    Ok(())
 }
 
 /// Same curseforge.com-only restriction the single-window flow uses below —
@@ -90,32 +107,33 @@ fn validate_curseforge_url(url: &str) -> Result<Url, String> {
 /// this command's dispatcher thread — that thread pool is shared with every
 /// other command, so a stuck window creation previously froze the whole app.
 #[tauri::command]
-pub fn open_missing_mods_browser(
+pub async fn open_missing_mods_browser(
     app: AppHandle,
     state: tauri::State<'_, super::search::AppState>,
     url: String,
 ) -> Result<(), String> {
     let parsed = validate_curseforge_url(&url)?;
-    let prompt_login = should_prompt_curseforge_login(&state.config);
+    let prompt_login = !state.config.curseforge_login_prompted();
 
     tauri::async_runtime::spawn(async move {
         if prompt_login {
-            open_curseforge_login_window(&app);
+            open_curseforge_login_window(&app)?;
         }
         if let Some(window) = app.get_webview_window(BROWSER_WINDOW_LABEL) {
-            if let Err(err) = window.navigate(parsed) {
-                crate::activity::append_log(&format!("Could not navigate missing-mods browser: {err}"), "warn", None);
-                return;
-            }
-            let _ = window.set_focus();
-        } else if let Err(err) = WebviewWindowBuilder::new(&app, BROWSER_WINDOW_LABEL, WebviewUrl::External(parsed))
-            .title("Download mod \u{2014} Waybound")
-            .inner_size(1000.0, 800.0)
-            .build()
-        {
-            crate::activity::append_log(&format!("Could not open missing-mods browser: {err}"), "warn", None);
+            window.navigate(parsed).map_err(|err| format!("Could not navigate missing-mods browser: {err}"))?;
+            window.set_focus().map_err(|err| format!("Could not focus missing-mods browser: {err}"))?;
+        } else {
+            WebviewWindowBuilder::new(&app, BROWSER_WINDOW_LABEL, WebviewUrl::External(parsed))
+                .title("Download mod \u{2014} Waybound")
+                .inner_size(1000.0, 800.0)
+                .build()
+                .map_err(|err| format!("Could not open missing-mods browser: {err}"))?;
         }
-    });
+        Ok::<(), String>(())
+    }).await.map_err(|err| format!("Could not open missing-mods browser: {err}"))??;
+    if prompt_login {
+        state.config.mark_curseforge_login_prompted().map_err(|err| format!("Could not save CurseForge login prompt preference: {err}"))?;
+    }
 
     Ok(())
 }
@@ -126,7 +144,7 @@ pub fn open_missing_mods_browser(
 /// Lets the user work through "click Download" on each page without
 /// round-tripping to the app's prev/next stepper between every one.
 #[tauri::command]
-pub fn open_all_missing_mods_browsers(
+pub async fn open_all_missing_mods_browsers(
     app: AppHandle,
     state: tauri::State<'_, super::search::AppState>,
     urls: Vec<String>,
@@ -135,31 +153,35 @@ pub fn open_all_missing_mods_browsers(
         .iter()
         .map(|u| validate_curseforge_url(u))
         .collect::<Result<_, _>>()?;
-    let prompt_login = should_prompt_curseforge_login(&state.config);
+    if parsed.is_empty() { return Ok(()); }
+    let prompt_login = !state.config.curseforge_login_prompted();
 
     tauri::async_runtime::spawn(async move {
         if prompt_login {
-            open_curseforge_login_window(&app);
+            open_curseforge_login_window(&app)?;
         }
+        let mut errors = Vec::new();
         for (i, url) in parsed.into_iter().enumerate() {
             let label = format!("{BROWSER_WINDOW_LABEL}-{i}");
             let offset = (i as f64) * 30.0;
-            if let Some(window) = app.get_webview_window(&label) {
-                if let Err(err) = window.navigate(url) {
-                    crate::activity::append_log(&format!("Could not navigate missing-mods browser: {err}"), "warn", None);
-                    continue;
-                }
-                let _ = window.set_focus();
-            } else if let Err(err) = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
-                .title("Download mod \u{2014} Waybound")
-                .inner_size(1000.0, 800.0)
-                .position(80.0 + offset, 80.0 + offset)
-                .build()
-            {
-                crate::activity::append_log(&format!("Could not open missing-mods browser: {err}"), "warn", None);
+            let result = if let Some(window) = app.get_webview_window(&label) {
+                window.navigate(url).and_then(|()| window.set_focus()).map(|()| ())
+            } else {
+                WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
+                    .title("Download mod \u{2014} Waybound")
+                    .inner_size(1000.0, 800.0)
+                    .position(80.0 + offset, 80.0 + offset)
+                    .build().map(|_| ())
+            };
+            if let Err(err) = result {
+                errors.push(format!("Could not open missing-mods browser {}: {err}", i + 1));
             }
         }
-    });
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    }).await.map_err(|err| format!("Could not open missing-mods browsers: {err}"))??;
+    if prompt_login {
+        state.config.mark_curseforge_login_prompted().map_err(|err| format!("Could not save CurseForge login prompt preference: {err}"))?;
+    }
 
     Ok(())
 }
@@ -181,20 +203,27 @@ struct MissingModsWatchDoneEvent {
     still_missing: Vec<String>,
 }
 
-/// Closes whichever window was showing this mod's page, now that its file
-/// has landed — there's nothing left to do on that page. Closes the
-/// per-index window from `open_all_missing_mods_browsers` unconditionally
-/// (it only ever shows this one mod), and the single shared stepper window
-/// only if it's still pointed at this exact mod's URL — it's reused across
-/// mods, so closing it unconditionally could yank the page out from under
-/// the user mid-step on a different one.
-fn close_missing_mods_window(app: &AppHandle, original_index: usize, url: &str) {
-    let indexed_label = format!("{BROWSER_WINDOW_LABEL}-{original_index}");
-    if let Some(window) = app.get_webview_window(&indexed_label) {
-        let _ = window.close();
-    }
-    if let Some(window) = app.get_webview_window(BROWSER_WINDOW_LABEL) {
-        if window.url().map(|u| u.as_str() == url).unwrap_or(false) {
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissingModsWatchErrorEvent {
+    instance_id: String,
+    error: String,
+}
+
+fn report_watch_error(app: &AppHandle, instance_id: &str, error: String) {
+    let _ = app.emit("missing-mods://error", MissingModsWatchErrorEvent {
+        instance_id: instance_id.to_string(),
+        error,
+    });
+}
+
+/// A retry/dismiss can change page indices. Match the URL, never close another
+/// download page merely because its old index was reused.
+fn close_missing_mods_window(app: &AppHandle, url: &str) {
+    for (label, window) in app.webview_windows() {
+        if (label == BROWSER_WINDOW_LABEL || label.starts_with("missing-mods-browser-"))
+            && window.url().is_ok_and(|current| current.as_str() == url)
+        {
             let _ = window.close();
         }
     }
@@ -238,154 +267,516 @@ fn is_shaderpack_file(path: &Path) -> bool {
     })
 }
 
+fn hash_download(path: &Path, cancel: &CancelToken) -> Result<String, DownloadError> {
+    use sha1::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = sha1::Sha1::new();
+    let mut received = 0usize;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() { return Err(DownloadError::Cancelled); }
+        let count = file.read(&mut buffer)?;
+        if count == 0 { break; }
+        if count > MAX_DOWNLOAD_BYTES.saturating_sub(received) {
+            return Err(DownloadError::TooLarge(MAX_DOWNLOAD_BYTES));
+        }
+        hash.update(&buffer[..count]);
+        received += count;
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+fn map_pack_error(error: crate::modpack::ModpackError) -> DownloadError {
+    match error {
+        crate::modpack::ModpackError::Download(error) => error,
+        crate::modpack::ModpackError::Io(error) => DownloadError::Io(error),
+        error => DownloadError::Io(std::io::Error::other(error.to_string())),
+    }
+}
+
+fn record_manual_pack_download(
+    db: &crate::db::Database,
+    instance_id: &str,
+    item: &MissingMod,
+    target: &Path,
+) -> Result<(), crate::modpack::ModpackError> {
+    let uid = format!("curseforge:{}", item.project_id);
+    let existing = db.get_instance_mod(instance_id, &uid)
+        .map_err(|error| crate::modpack::ModpackError::Other(format!("Could not read manual-download tracking: {error}")))?;
+    let name = existing.as_ref().map_or(item.name.as_str(), |(row, _)| row.mod_name.as_str());
+    let icon = existing.as_ref().and_then(|(row, _)| row.icon_url.as_deref());
+    let origin = existing.as_ref().map_or(crate::dto::ModOrigin::Pack, |(row, _)| row.origin);
+    let filename = target.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| crate::modpack::ModpackError::Other("Manual-download target has an invalid filename".into()))?;
+    db.insert_instance_mod(
+        instance_id, &uid, name, crate::dto::ModSource::Curseforge, filename,
+        &target.display().to_string(), icon, origin,
+    ).map_err(|error| crate::modpack::ModpackError::Other(format!("Could not record manual download: {error}")))?;
+    Ok(())
+}
+
+/// Stage and verify a complete sibling before publication. Pack receipts own
+/// pending replacements; unrelated existing destinations are never clobbered.
+fn place_download(
+    downloads_dir: &Path,
+    source: &Path,
+    root: &Path,
+    dest_dir: &Path,
+    dest: &Path,
+    item: &MissingMod,
+    cancel: &CancelToken,
+    publish: impl FnOnce(&Path) -> Result<(), crate::modpack::ModpackError>,
+) -> Result<(), DownloadError> {
+    use sha1::Digest;
+    use std::io::{Read, Write};
+
+    ensure_contained_path(downloads_dir, source)?;
+    ensure_contained_path(root, dest_dir)?;
+    ensure_contained_path(dest_dir, dest)?;
+    let mut input = std::fs::File::open(source)?;
+    let mut staged = tempfile::Builder::new().prefix(".waybound-manual-").tempfile_in(dest_dir)?;
+    let mut digest = sha1::Sha1::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut received = 0usize;
+    loop {
+        if cancel.is_cancelled() { return Err(DownloadError::Cancelled); }
+        let count = input.read(&mut buffer)?;
+        if count == 0 { break; }
+        if count > MAX_DOWNLOAD_BYTES.saturating_sub(received) {
+            return Err(DownloadError::TooLarge(MAX_DOWNLOAD_BYTES));
+        }
+        staged.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+        received += count;
+    }
+    let actual_sha1 = hex::encode(digest.finalize());
+    if item.sha1.as_deref().is_some_and(|expected| !actual_sha1.eq_ignore_ascii_case(expected)) {
+        return Err(DownloadError::HashMismatch("sha1".into()));
+    }
+    zip::ZipArchive::new(staged.reopen()?).map_err(|err| {
+        DownloadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Downloaded archive is incomplete or invalid: {err}")))
+    })?;
+    staged.as_file().sync_all()?;
+    if cancel.is_cancelled() { return Err(DownloadError::Cancelled); }
+    ensure_contained_path(dest_dir, dest)?;
+    if let Some((transaction, target)) = crate::modpack::prepare_manual_pack_replacement(root, item.project_id, &item.filename, staged.path())
+        .map_err(map_pack_error)?
+    {
+        tauri::async_runtime::block_on(transaction.commit_with(cancel, || publish(&target))).map_err(map_pack_error)?;
+    } else {
+        let disabled = contained_join(dest_dir, &format!("{}{}", item.filename, crate::commands::content::DISABLED_SUFFIX))?;
+        let dest = if disabled.exists() { disabled.as_path() } else { dest };
+        match std::fs::symlink_metadata(dest) {
+            Ok(_) => {
+                if !hash_download(dest, cancel)?.eq_ignore_ascii_case(&actual_sha1) {
+                    return Err(DownloadError::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists,
+                        "Existing destination differs from this download; move it aside before retrying.")));
+                }
+                // A verified existing destination is already placed; preserve it.
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                staged.persist_noclobber(dest).map_err(|err| DownloadError::Io(err.error))?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    // Source cleanup is best effort, only for the same bytes we published.
+    if ensure_contained_path(downloads_dir, source).is_ok()
+        && hash_download(source, cancel).is_ok_and(|hash| hash.eq_ignore_ascii_case(&actual_sha1))
+    {
+        let _ = std::fs::remove_file(source);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn watch_for_missing_mods(app: AppHandle, instance_id: String, mods: Vec<MissingMod>) -> Result<(), String> {
+    if mods.is_empty() {
+        return replace_watch(&instance_id, None);
+    }
+    // Reserve ownership before validation: even a failed restart silences the
+    // old watcher, and a slower earlier request cannot replace a newer one.
+    let cancel = CancelToken::new();
+    replace_watch(&instance_id, Some(cancel.clone()))?;
+    let watch = WatchGuard { instance_id: instance_id.clone(), cancel: cancel.clone() };
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
-    let mods_dir = root.join("mods");
-    let resourcepacks_dir = root.join("resourcepacks");
-    let shaderpacks_dir = root.join("shaderpacks");
-    std::fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&resourcepacks_dir).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&shaderpacks_dir).map_err(|e| e.to_string())?;
+    let mods_dir = contained_join(&root, "mods").map_err(|e| e.to_string())?;
+    let resourcepacks_dir = contained_join(&root, "resourcepacks").map_err(|e| e.to_string())?;
+    let shaderpacks_dir = contained_join(&root, "shaderpacks").map_err(|e| e.to_string())?;
+    for dir in [&mods_dir, &resourcepacks_dir, &shaderpacks_dir] {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        ensure_contained_path(&root, dir).map_err(|e| e.to_string())?;
+    }
+    for item in &mods {
+        contained_join(&mods_dir, &item.filename).map_err(|e| e.to_string())?;
+    }
+    let downloads_dir = dirs::download_dir().ok_or_else(|| "Could not locate your Downloads folder.".to_string())?;
+    ensure_contained_path(&downloads_dir, &downloads_dir).map_err(|e| e.to_string())?;
+    std::fs::read_dir(&downloads_dir).map_err(|e| format!("Could not read Downloads: {e}. Check folder access and retry."))?;
 
-    let Some(downloads_dir) = dirs::download_dir() else {
-        return Err("Could not locate your Downloads folder.".to_string());
-    };
-
-    tauri::async_runtime::spawn(async move {
-        // Original index travels with each mod (not just its position in
-        // `remaining`, which shifts on every removal) — it's the same index
-        // `open_all_missing_mods_browsers` used for that mod's window label,
-        // so a placement can close the one window that's done its job.
-        let mut remaining: Vec<(usize, MissingMod)> = mods.into_iter().enumerate().collect();
+    // Hashing/copying large archives must not block async command workers.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _watch = watch;
+        let mut remaining = mods;
         let total = remaining.len() as u32;
         let mut placed_names = Vec::new();
         let deadline = Instant::now() + watch_timeout(remaining.len());
-        // path -> (mtime, sha1) — a file already hashed and not matched
-        // doesn't need re-hashing every second until it changes; this is
-        // what keeps a large unrelated file in Downloads from being read
-        // and hashed once per poll tick for the whole watch window.
-        let mut hash_cache: HashMap<PathBuf, (SystemTime, String)> = HashMap::new();
-
-        while !remaining.is_empty() && Instant::now() < deadline {
-            let Ok(entries) = std::fs::read_dir(&downloads_dir) else {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            };
-
-            for entry in entries.flatten() {
-                if remaining.is_empty() {
-                    break;
-                }
-                let source = entry.path();
-                if !source.is_file() || !is_candidate_file(&source) {
-                    continue;
-                }
-
-                let matched_index = remaining.iter().position(|(_, m)| {
-                    match &m.sha1 {
-                        Some(expected) => {
-                            let mtime = entry.metadata().and_then(|md| md.modified()).ok();
-                            let sha1 = match (mtime, hash_cache.get(&source)) {
-                                (Some(mtime), Some((cached_mtime, cached_sha1))) if mtime == *cached_mtime => {
-                                    Some(cached_sha1.clone())
-                                }
-                                _ => {
-                                    let sha1 = file_sha1(&source);
-                                    if let (Some(mtime), Some(sha1)) = (mtime, &sha1) {
-                                        hash_cache.insert(source.clone(), (mtime, sha1.clone()));
-                                    }
-                                    sha1
-                                }
-                            };
-                            sha1.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(expected))
+        let mut hash_cache: HashMap<PathBuf, (SystemTime, u64, String)> = HashMap::new();
+        let result = (|| -> Result<(), String> {
+            while !remaining.is_empty() && Instant::now() < deadline {
+                if cancel.is_cancelled() { return Ok(()); }
+                let entries = std::fs::read_dir(&downloads_dir)
+                    .map_err(|e| format!("Could not read Downloads: {e}. Check folder access and retry watching."))?;
+                for entry in entries {
+                    if cancel.is_cancelled() || remaining.is_empty() { break; }
+                    let entry = entry.map_err(|e| format!("Could not inspect Downloads: {e}. Retry watching."))?;
+                    let source = entry.path();
+                    if !is_candidate_file(&source) { continue; }
+                    ensure_contained_path(&downloads_dir, &source).map_err(|e| format!("Unsafe download path: {e}"))?;
+                    let metadata = std::fs::symlink_metadata(&source).map_err(|e| format!("Could not inspect downloaded file: {e}. Retry watching."))?;
+                    if !metadata.is_file() { continue; }
+                    if metadata.len() > MAX_DOWNLOAD_BYTES as u64 {
+                        if remaining.iter().any(|item| source.file_name().and_then(|name| name.to_str()) == Some(item.filename.as_str())) {
+                            return Err(format!("Downloaded file exceeds the {MAX_DOWNLOAD_BYTES}-byte limit. Choose the expected file and retry watching."));
                         }
-                        // No hash reported for this file (rare/old CurseForge
-                        // entries) — fall back to the exact filename match.
-                        None => source.file_name().and_then(|n| n.to_str()) == Some(m.filename.as_str()),
+                        continue;
                     }
-                });
-
-                let Some(idx) = matched_index else { continue };
-                let is_jar = remaining[idx].1.filename.to_ascii_lowercase().ends_with(".jar");
-                let dest_dir = if is_jar {
-                    &mods_dir
-                } else if is_shaderpack_file(&source) {
-                    &shaderpacks_dir
-                } else {
-                    &resourcepacks_dir
-                };
-                // `filename` ultimately comes from CurseForge's API — never
-                // trust it as a bare path component. `safe_join` rejects any
-                // `..`/root/prefix component, same as every other write site
-                // in this codebase (`modpack/curseforge.rs`'s `safe_join`
-                // calls), so a crafted `fileName` can't redirect this write
-                // outside the instance's mods/resourcepacks folder.
-                let Ok(dest) = crate::download::safe_join(dest_dir, &remaining[idx].1.filename) else {
-                    continue;
-                };
-
-                // A same-volume rename is the common case. Falling back to
-                // copy+delete (needed if Downloads and the instance folder
-                // are on different volumes) counts as placed on the copy
-                // alone — the destination file is what actually matters, and
-                // gating "placed" on the source cleanup too meant a
-                // transient lock on the just-downloaded file (a real
-                // possibility on Windows: AV scan, indexer) left a correctly
-                // placed mod reported as still missing.
-                // Exclusive for just this placement transaction — a long
-                // watch must never pin the instance busy, but a single
-                // rename/copy must never race an install or the game.
-                let Ok(_operation) = acquire(&instance_id) else {
-                    continue;
-                };
-                let placed = std::fs::rename(&source, &dest).is_ok() || {
-                    let copied = std::fs::copy(&source, &dest).is_ok();
-                    if copied {
-                        let _ = std::fs::remove_file(&source);
+                    let source_hash = if remaining.iter().any(|item| item.sha1.is_some()) {
+                        let mtime = metadata.modified().map_err(|e| e.to_string())?;
+                        if !hash_cache.get(&source).is_some_and(|(cached_time, cached_len, _)| *cached_time == mtime && *cached_len == metadata.len()) {
+                            let hash = hash_download(&source, &cancel).map_err(|e| format!("Could not verify downloaded file: {e}. Wait for browser download to finish and retry watching."))?;
+                            hash_cache.insert(source.clone(), (mtime, metadata.len(), hash));
+                        }
+                        hash_cache.get(&source).map(|(_, _, hash)| hash.as_str())
+                    } else {
+                        None
+                    };
+                    let matched_index = remaining.iter().position(|item| match &item.sha1 {
+                        Some(expected) => source_hash.is_some_and(|hash| hash.eq_ignore_ascii_case(expected)),
+                        None => source.file_name().and_then(|name| name.to_str()) == Some(item.filename.as_str()),
+                    });
+                    let Some(idx) = matched_index else { continue };
+                    let dest_dir = if remaining[idx].filename.to_ascii_lowercase().ends_with(".jar") {
+                        &mods_dir
+                    } else if is_shaderpack_file(&source) {
+                        &shaderpacks_dir
+                    } else {
+                        &resourcepacks_dir
+                    };
+                    let dest = contained_join(dest_dir, &remaining[idx].filename).map_err(|e| e.to_string())?;
+                    let _operation = acquire(&instance_id).map_err(|e| format!("Could not place {}: {e} Retry watching after the instance is idle.", remaining[idx].name))?;
+                    match place_download(&downloads_dir, &source, &root, dest_dir, &dest, &remaining[idx], &cancel, |target| {
+                        record_manual_pack_download(&app.state::<super::search::AppState>().db, &instance_id, &remaining[idx], target)
+                    }) {
+                        Err(DownloadError::Cancelled) => return Ok(()),
+                        Err(err) => return Err(format!("Could not place {}: {err}. Original download and existing destination are preserved; retry watching after resolving this.", remaining[idx].name)),
+                        Ok(()) => {}
                     }
-                    copied
-                };
-                if placed {
-                    let (original_index, entry) = remaining.remove(idx);
+                    let watches = ACTIVE_WATCHES.lock().map_err(|_| "Downloads watcher registry is unavailable.".to_string())?;
+                    if cancel.is_cancelled() || !watches.get(&instance_id).is_some_and(|token| token.same_control(&cancel)) {
+                        return Ok(());
+                    }
+                    let entry = remaining.remove(idx);
                     hash_cache.remove(&source);
-                    close_missing_mods_window(&app, original_index, &entry.url);
+                    close_missing_mods_window(&app, &entry.url);
                     placed_names.push(entry.name.clone());
-                    let _ = app.emit(
-                        "missing-mods://placed",
-                        MissingModPlacedEvent {
-                            instance_id: instance_id.clone(),
-                            name: entry.name,
-                            remaining: remaining.len() as u32,
-                            total,
-                        },
-                    );
+                    let _ = app.emit("missing-mods://placed", MissingModPlacedEvent {
+                        instance_id: instance_id.clone(), name: entry.name,
+                        remaining: remaining.len() as u32, total,
+                    });
+                }
+                if !remaining.is_empty() {
+                    let wait = tauri::async_runtime::block_on(async {
+                        cancel.wait(tokio::time::sleep(POLL_INTERVAL)).await
+                    });
+                    if matches!(wait, Err(DownloadError::Cancelled)) { return Ok(()); }
                 }
             }
-
-            if remaining.is_empty() {
-                break;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-
-        let _ = app.emit(
-            "missing-mods://done",
-            MissingModsWatchDoneEvent {
-                instance_id,
-                placed: placed_names,
-                still_missing: remaining.into_iter().map(|(_, m)| m.name).collect(),
-            },
-        );
+            Ok(())
+        })();
+        let Ok(watches) = ACTIVE_WATCHES.lock() else { return };
+        if cancel.is_cancelled() || !watches.get(&instance_id).is_some_and(|token| token.same_control(&cancel)) { return; }
+        if let Err(error) = result { report_watch_error(&app, &instance_id, error); }
+        let _ = app.emit("missing-mods://done", MissingModsWatchDoneEvent {
+            instance_id, placed: placed_names,
+            still_missing: remaining.into_iter().map(|item| item.name).collect(),
+        });
     });
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_candidate_file, validate_curseforge_url, watch_timeout, MIN_WATCH_TIMEOUT};
+    use super::*;
     use std::path::Path;
+    use std::io::Write;
+
+    #[test]
+    fn replacing_watch_cancels_old_without_old_guard_removing_new_watch() {
+        let id = "manual-watch-replacement-fixture";
+        let first = CancelToken::new();
+        replace_watch(id, Some(first.clone())).unwrap();
+        let old_guard = WatchGuard { instance_id: id.into(), cancel: first.clone() };
+        let second = CancelToken::new();
+        replace_watch(id, Some(second.clone())).unwrap();
+        assert!(first.is_cancelled());
+        drop(old_guard);
+        assert!(ACTIVE_WATCHES.lock().unwrap().get(id).unwrap().same_control(&second));
+        replace_watch(id, None).unwrap();
+        assert!(second.is_cancelled());
+        assert!(!ACTIVE_WATCHES.lock().unwrap().contains_key(id));
+    }
+
+    fn archive(bytes: &[u8]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file("fixture.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn missing(bytes: &[u8]) -> MissingMod {
+        use sha1::Digest;
+        MissingMod {
+            project_id: 123, name: "Fixture".into(), filename: "fixture.jar".into(),
+            url: "https://www.curseforge.com/minecraft/mc-mods/fixture/download/123".into(),
+            sha1: Some(hex::encode(sha1::Sha1::digest(bytes))),
+        }
+    }
+
+    #[test]
+    fn manual_copy_verifies_sibling_before_publish_and_cleans_source() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = archive(b"complete");
+        let source = downloads.path().join("fixture (1).jar");
+        let dest = root.path().join("fixture.jar");
+        std::fs::write(&source, &bytes).unwrap();
+        place_download(downloads.path(), &source, root.path(), root.path(), &dest, &missing(&bytes), &CancelToken::new(), |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn mismatched_or_partial_manual_copy_preserves_existing_and_source() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = downloads.path().join("fixture.jar");
+        let dest = root.path().join("fixture.jar");
+        let expected = archive(b"complete");
+        std::fs::write(&source, b"partial").unwrap();
+        std::fs::write(&dest, b"original").unwrap();
+        assert!(matches!(
+            place_download(downloads.path(), &source, root.path(), root.path(), &dest, &missing(&expected), &CancelToken::new(), |_| Ok(())),
+            Err(DownloadError::HashMismatch(_))
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"partial");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        let mut no_hash = missing(&expected);
+        no_hash.sha1 = None;
+        assert!(place_download(downloads.path(), &source, root.path(), root.path(), &dest, &no_hash, &CancelToken::new(), |_| Ok(())).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unrelated_existing_destination_is_not_clobbered_by_valid_download() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = archive(b"replacement");
+        let source = downloads.path().join("fixture.jar");
+        let dest = root.path().join("fixture.jar");
+        std::fs::write(&source, &bytes).unwrap();
+        std::fs::write(&dest, b"unrelated").unwrap();
+        assert!(place_download(downloads.path(), &source, root.path(), root.path(), &dest, &missing(&bytes), &CancelToken::new(), |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cancelled_manual_copy_never_publishes_or_removes_source() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = archive(b"complete");
+        let source = downloads.path().join("fixture.jar");
+        let dest = root.path().join("fixture.jar");
+        std::fs::write(&source, &bytes).unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(place_download(downloads.path(), &source, root.path(), root.path(), &dest, &missing(&bytes), &cancel, |_| Ok(())), Err(DownloadError::Cancelled)));
+        assert!(!dest.exists());
+        assert!(source.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    fn pending_receipt(root: &Path, old_bytes: &[u8], new_bytes: &[u8]) -> PathBuf {
+        use sha1::Digest;
+        let receipt = root.join(".curseforge-pack-manifest.json");
+        let item = missing(new_bytes);
+        let entries = serde_json::json!([{
+            "project_id": item.project_id, "file_id": 456, "name": item.name,
+            "filename": item.filename, "url": item.url, "sha1": item.sha1,
+            "pending": true,
+            "retained_files": [{
+                "filename": "old.jar",
+                "sha1": hex::encode(sha1::Sha1::digest(old_bytes))
+            }]
+        }]);
+        std::fs::write(&receipt, serde_json::to_vec(&entries).unwrap()).unwrap();
+        receipt
+    }
+
+    fn fixture_database(path: &Path, root: &Path) -> crate::db::Database {
+        let db = crate::db::Database::open_at(path).unwrap();
+        db.insert_instance(&crate::dto::instance::InstanceSummary {
+            id: "manual-fixture".into(), name: "Manual fixture".into(),
+            minecraft_version: "1.20.1".into(), loader: crate::dto::ModLoader::Forge,
+            loader_version: None, mod_count: 0, created_at: 1,
+            root_path: root.display().to_string(), icon: None, last_played: None,
+            total_play_seconds: 0, modpack_version_label: None, modpack_project_uid: None,
+        }).unwrap();
+        db
+    }
+
+    fn record_old_fixture(db: &crate::db::Database, old: &Path) -> crate::dto::instance::InstalledMod {
+        db.insert_instance_mod(
+            "manual-fixture", "curseforge:123", "Tracked project name",
+            crate::dto::ModSource::Curseforge,
+            old.file_name().unwrap().to_str().unwrap(), &old.display().to_string(),
+            Some("data:image/png;base64,fixture"), crate::dto::ModOrigin::Pack,
+        ).unwrap()
+    }
+
+    #[test]
+    fn manual_pack_replacement_preserves_disabled_state_and_publishes_receipt() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mods = root.path().join("mods");
+        std::fs::create_dir(&mods).unwrap();
+        let old_bytes = archive(b"old pack version");
+        let new_bytes = archive(b"new pack version");
+        let old = mods.join(format!("old.jar{}", crate::commands::content::DISABLED_SUFFIX));
+        std::fs::write(&old, &old_bytes).unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let db = fixture_database(&dbdir.path().join("library.db"), root.path());
+        let previous = record_old_fixture(&db, &old);
+        let receipt = pending_receipt(root.path(), &old_bytes, &new_bytes);
+        let source = downloads.path().join("fixture (1).jar");
+        std::fs::write(&source, &new_bytes).unwrap();
+        let dest = mods.join("fixture.jar");
+        place_download(downloads.path(), &source, root.path(), &mods, &dest, &missing(&new_bytes), &CancelToken::new(), |target| {
+            record_manual_pack_download(&db, "manual-fixture", &missing(&new_bytes), target)
+        }).unwrap();
+        let disabled = mods.join(format!("fixture.jar{}", crate::commands::content::DISABLED_SUFFIX));
+        assert_eq!(std::fs::read(disabled).unwrap(), new_bytes);
+        assert!(!dest.exists());
+        assert!(!old.exists());
+        assert!(!source.exists());
+        let entries: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+        assert_eq!(entries[0]["pending"], false);
+        assert_eq!(entries[0]["retained_files"], serde_json::json!([]));
+        assert_eq!(entries[0]["sha1"], serde_json::json!(missing(&new_bytes).sha1.unwrap()));
+        let (tracked, path) = db.get_instance_mod("manual-fixture", "curseforge:123").unwrap().unwrap();
+        assert_eq!(tracked.id, previous.id);
+        assert_eq!(tracked.mod_name, previous.mod_name);
+        assert_eq!(tracked.icon_url, previous.icon_url);
+        assert_eq!(tracked.origin, previous.origin);
+        assert_eq!(tracked.file_name, format!("fixture.jar{}", crate::commands::content::DISABLED_SUFFIX));
+        assert_eq!(Path::new(&path), mods.join(&tracked.file_name));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn manual_database_publication_failure_rolls_back_files_receipt_and_tracking() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let db = fixture_database(&dbdir.path().join("library.db"), root.path());
+        let mods = root.path().join("mods");
+        std::fs::create_dir(&mods).unwrap();
+        let old_bytes = archive(b"old pack version");
+        let new_bytes = archive(b"new pack version");
+        let old = mods.join("old.jar");
+        std::fs::write(&old, &old_bytes).unwrap();
+        let previous = record_old_fixture(&db, &old);
+        let receipt = pending_receipt(root.path(), &old_bytes, &new_bytes);
+        let original_receipt = std::fs::read(&receipt).unwrap();
+        let source = downloads.path().join("fixture.jar");
+        std::fs::write(&source, &new_bytes).unwrap();
+        let dest = mods.join("fixture.jar");
+        db.conn().unwrap().execute_batch(
+            "CREATE TRIGGER reject_manual_metadata BEFORE UPDATE ON instance_mods
+             BEGIN SELECT RAISE(ABORT, 'metadata publication fixture'); END;"
+        ).unwrap();
+        let result = place_download(
+            downloads.path(), &source, root.path(), &mods, &dest, &missing(&new_bytes), &CancelToken::new(),
+            |target| {
+                assert_eq!(target, dest);
+                assert!(dest.exists());
+                assert!(!old.exists());
+                record_manual_pack_download(&db, "manual-fixture", &missing(&new_bytes), target)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&receipt).unwrap(), original_receipt);
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes);
+        assert!(!dest.exists());
+        let (tracked, path) = db.get_instance_mod("manual-fixture", "curseforge:123").unwrap().unwrap();
+        assert_eq!(tracked.id, previous.id);
+        assert_eq!(tracked.file_name, previous.file_name);
+        assert_eq!(tracked.mod_name, previous.mod_name);
+        assert_eq!(tracked.icon_url, previous.icon_url);
+        assert_eq!(tracked.origin, previous.origin);
+        assert_eq!(Path::new(&path), old);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_pack_removal_failure_rolls_back_new_file_and_receipt() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mods = root.path().join("mods");
+        std::fs::create_dir(&mods).unwrap();
+        let old_bytes = archive(b"old pack version");
+        let new_bytes = archive(b"new pack version");
+        let old = mods.join("old.jar");
+        std::fs::write(&old, &old_bytes).unwrap();
+        let receipt = pending_receipt(root.path(), &old_bytes, &new_bytes);
+        let original_receipt = std::fs::read(&receipt).unwrap();
+        let source = downloads.path().join("fixture.jar");
+        std::fs::write(&source, &new_bytes).unwrap();
+        let dest = mods.join("fixture.jar");
+        // Allow receipt verification to read the retained file, but deny its
+        // rename/removal after the new download has been published.
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(1).open(&old).unwrap();
+        assert!(place_download(downloads.path(), &source, root.path(), &mods, &dest, &missing(&new_bytes), &CancelToken::new(), |_| Ok(())).is_err());
+        drop(locked);
+        assert_eq!(std::fs::read(old).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(receipt).unwrap(), original_receipt);
+        assert_eq!(std::fs::read(source).unwrap(), new_bytes);
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn already_placed_disabled_manual_download_stays_disabled() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = archive(b"disabled user version");
+        let source = downloads.path().join("fixture.jar");
+        let dest = root.path().join("fixture.jar");
+        let disabled = root.path().join(format!("fixture.jar{}", crate::commands::content::DISABLED_SUFFIX));
+        std::fs::write(&source, &bytes).unwrap();
+        std::fs::write(&disabled, &bytes).unwrap();
+        place_download(downloads.path(), &source, root.path(), root.path(), &dest, &missing(&bytes), &CancelToken::new(), |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(disabled).unwrap(), bytes);
+        assert!(!dest.exists());
+        assert!(!source.exists());
+    }
 
     #[test]
     fn watch_timeout_scales_with_mod_count_but_has_a_floor() {

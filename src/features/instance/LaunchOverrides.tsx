@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useTimedMessage } from "../../hooks/useTimedMessage";
@@ -25,7 +25,47 @@ interface LaunchOverridesProps {
   onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
 }
 
-const LOADER_HAS_LATEST_BUILD = new Set(["fabric", "forge", "neoforge", "quilt"]);
+const LOADER_HAS_LATEST_BUILD: Record<string, true> = {
+  fabric: true, forge: true, neoforge: true, quilt: true,
+};
+
+// Numeric components mirror the backend's version_key ordering; normalize
+// legacy game-version prefixes and compare prereleases before stable builds.
+function isNewerLoaderBuild(candidate: string, current: string | undefined, mcVersion: string): boolean {
+  if (!current) return true;
+  const parse = (value: string) => {
+    const normalized = value.trim().replace(/^v/, "");
+    const build = normalized.startsWith(`${mcVersion}-`)
+      ? normalized.slice(mcVersion.length + 1) : normalized;
+    const match = /^(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(build);
+    if (!match) return null;
+    return { core: match[1].split(".").map(BigInt), pre: match[2]?.split(".") };
+  };
+  const next = parse(candidate);
+  const installed = parse(current);
+  if (!next || !installed) return false;
+  for (let i = 0; i < Math.max(next.core.length, installed.core.length); i++) {
+    const a = next.core[i] ?? 0n;
+    const b = installed.core[i] ?? 0n;
+    if (a !== b) return a > b;
+  }
+  if (!next.pre || !installed.pre) return !next.pre && !!installed.pre;
+  for (let i = 0; i < Math.max(next.pre.length, installed.pre.length); i++) {
+    const a = next.pre[i];
+    const b = installed.pre[i];
+    if (a === b) continue;
+    if (a === undefined || b === undefined) return b === undefined;
+    const aNumeric = /^\d+$/.test(a);
+    const bNumeric = /^\d+$/.test(b);
+    if (aNumeric && bNumeric) {
+      if (BigInt(a) === BigInt(b)) continue;
+      return BigInt(a) > BigInt(b);
+    }
+    if (aNumeric !== bNumeric) return !aNumeric;
+    return a > b;
+  }
+  return false;
+}
 
 /**
  * Per-instance launch overrides. Any field left on "Use global" falls back to
@@ -48,6 +88,7 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
   const [applyingLoader, setApplyingLoader] = useState(false);
   const [loaderError, setLoaderError] = useState<string | null>(null);
   const [confirmApplyOpen, setConfirmApplyOpen] = useState(false);
+  const loaderCheckGeneration = useRef(0);
 
   useEffect(() => {
     void (async () => {
@@ -66,53 +107,70 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
     })();
   }, [instanceId]);
 
-  // A previous instance's "here's a newer build" result has no bearing on
-  // whatever instance is showing now — drop it rather than let it linger
-  // across a navigation.
+  // Ignore checks from a previous instance/build, even when they finish after
+  // navigation. Their latest build must never be offered for another target.
   useEffect(() => {
+    loaderCheckGeneration.current++;
     setLatestLoaderVersion(null);
     setRecommendedLoaderVersion(null);
     setLoaderInfoStale(false);
     setLoaderError(null);
-  }, [instanceId]);
+    setCheckingLoader(false);
+    setConfirmApplyOpen(false);
+    return () => {
+      loaderCheckGeneration.current++;
+    };
+  }, [instanceId, instance.loader, instance.minecraftVersion, instance.loaderVersion]);
 
-  const supportsLoaderUpdate = LOADER_HAS_LATEST_BUILD.has(instance.loader);
+  const supportsLoaderUpdate = LOADER_HAS_LATEST_BUILD[instance.loader] === true;
+  const newerLoaderAvailable = latestLoaderVersion !== null
+    && isNewerLoaderBuild(latestLoaderVersion, instance.loaderVersion, instance.minecraftVersion);
 
   async function handleCheckForLoaderUpdate() {
+    const generation = ++loaderCheckGeneration.current;
     setCheckingLoader(true);
     setLoaderError(null);
     try {
-      // The cached index covers every loader (including Fabric/Quilt, which
-      // the legacy lookup below doesn't know) and reports recommended
-      // separately; Forge keeps its conservative recommended-first offer.
+      // Explicit updates use latest; recommended may be older than an
+      // intentionally pinned build and must never become a downgrade offer.
       const info = await getLoaderVersionInfo(instance.loader, instance.minecraftVersion);
-      const offer =
-        instance.loader === "forge" ? (info.recommended ?? info.latest) : info.latest;
+      if (generation !== loaderCheckGeneration.current) return;
+      const offer = info.latest;
       setLatestLoaderVersion(offer);
       setRecommendedLoaderVersion(
         info.recommended && info.recommended !== offer ? info.recommended : null,
       );
       setLoaderInfoStale(info.fromCache);
     } catch (err) {
+      if (generation !== loaderCheckGeneration.current) return;
+      if (instance.loader === "forge") {
+        // The legacy Forge lookup returns recommended, not latest.
+        setLatestLoaderVersion(null);
+        setLoaderError(err instanceof Error ? err.message : String(err));
+        return;
+      }
       // Fall back to the legacy direct lookup rather than failing outright
       // (e.g. a cold cache with no network for the index but a reachable
       // promotions endpoint is near-impossible, but cheap to cover).
       try {
-        setLatestLoaderVersion(await getLatestLoaderVersion(instanceId));
+        const latest = await getLatestLoaderVersion(instanceId);
+        if (generation !== loaderCheckGeneration.current) return;
+        setLatestLoaderVersion(latest);
         setRecommendedLoaderVersion(null);
         setLoaderInfoStale(false);
       } catch (fallbackErr) {
+        if (generation !== loaderCheckGeneration.current) return;
         setLoaderError(
           fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
         );
       }
     } finally {
-      setCheckingLoader(false);
+      if (generation === loaderCheckGeneration.current) setCheckingLoader(false);
     }
   }
 
   async function handleApplyLoaderVersion() {
-    if (!latestLoaderVersion) return;
+    if (!latestLoaderVersion || !newerLoaderAvailable) return;
     setApplyingLoader(true);
     setLoaderError(null);
     try {
@@ -239,18 +297,18 @@ export function LaunchOverrides({ instance, onLoaderVersionChange }: LaunchOverr
           {instance.loaderVersion
             ? `Loader version: ${instance.loaderVersion}`
             : "Loader version: automatic (uses whatever build is currently recommended at launch)."}
-          {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
+          {newerLoaderAvailable && (
             <> - a newer build, {latestLoaderVersion}, is available.</>
           )}
-          {latestLoaderVersion && latestLoaderVersion === instance.loaderVersion && (
-            <> You're on the latest recommended build.</>
+          {latestLoaderVersion && !newerLoaderAvailable && (
+            <> No newer build is available.</>
           )}
           {recommendedLoaderVersion && (
             <> Recommended build: {recommendedLoaderVersion}.</>
           )}
           {loaderInfoStale && latestLoaderVersion && <> (from cache — offline)</>}
         </p>
-        {latestLoaderVersion && latestLoaderVersion !== instance.loaderVersion && (
+        {newerLoaderAvailable && (
           <button
             type="button"
             className={styles.primaryBtn}

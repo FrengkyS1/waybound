@@ -22,9 +22,10 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Frontend typecheck + build
+      - name: Frontend tests + typecheck + build
         run: |
           npm ci
+          npm test
           npm run build
 
       - name: Rust tests

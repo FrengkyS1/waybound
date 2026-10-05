@@ -39,7 +39,7 @@ pub struct InstanceSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentEntry {
-    /// Display file name (without the `.disabled` suffix).
+    /// Exact physical basename, including `.disabled` when disabled.
     pub file_name: String,
     /// The mod's own declared display name (from fabric.mod.json / mods.toml /
     /// mcmod.info), when it could be read from the jar. Falls back to a

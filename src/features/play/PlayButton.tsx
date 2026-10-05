@@ -32,10 +32,10 @@ export function PlayButton({
   const isRunning = launch?.phase === "running";
   const isBusyHere = isPreparing || isRunning;
 
-  // The exit event clears the launch entry, which re-arms the button.
+  // A new process must have a fresh Stop action even if React batches transitions.
   useEffect(() => {
-    if (!isRunning) setStopping(false);
-  }, [isRunning]);
+    setStopping(false);
+  }, [isRunning, instanceId, launch?.startedAtMs]);
 
   const [checking, setChecking] = useState(false);
   const [readiness, setReadiness] = useState<LaunchReadiness | null>(null);

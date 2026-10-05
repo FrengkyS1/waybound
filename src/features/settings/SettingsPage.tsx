@@ -8,6 +8,7 @@ import {
   testDockerCurseForgeEnvKey,
   testSavedCurseForgeApiKey,
   type CurseForgeKeySource,
+  type CurseForgeProbeResult,
 } from "./api";
 
 import styles from "./SettingsPage.module.css";
@@ -105,7 +106,7 @@ export function SettingsPage() {
     clearFeedback();
 
     try {
-      await importCurseForgeApiKeyFromEnvFile(envFilePath, true);
+      await importCurseForgeApiKeyFromEnvFile(envFilePath);
 
       await refreshStatus();
 
@@ -376,21 +377,13 @@ export function SettingsPage() {
   );
 }
 
-function formatProbeSummary(result: {
-  message: string;
-
-  httpStatus: number;
-
-  keyPrefix: string;
-
-  keyLength: number;
-}): string {
+function formatProbeSummary(
+  result: Pick<CurseForgeProbeResult, "message" | "httpStatus" | "keyLength">,
+): string {
   return [
     result.message,
 
     result.httpStatus ? `HTTP ${result.httpStatus}` : null,
-
-    result.keyPrefix ? `Key prefix: ${result.keyPrefix}` : null,
 
     `Key length: ${result.keyLength}`,
   ]

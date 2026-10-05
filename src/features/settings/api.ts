@@ -14,7 +14,6 @@ export interface CurseForgeProbeResult {
   ok: boolean;
   httpStatus: number;
   keyLength: number;
-  keyPrefix: string;
   message: string;
   log: string[];
 }
@@ -39,11 +38,9 @@ export async function clearCurseForgeApiKey(): Promise<CurseForgeStatus> {
 
 export async function importCurseForgeApiKeyFromEnvFile(
   path: string,
-  skipValidation = true,
 ): Promise<CurseForgeStatus> {
   return invoke<CurseForgeStatus>("import_curseforge_api_key_from_env_file", {
     path,
-    skipValidation,
   });
 }
 

@@ -14,7 +14,9 @@ export interface ModVersionSummary {
   name: string;
   versionNumber: string;
   publishedAt: string;
+  /** Minecraft versions only, excluding CurseForge loader/side tags. */
   gameVersions: string[];
+  /** This version's loader declarations, not project-wide categories. */
   loaders: ModLoader[];
   downloads: number;
   changelog?: string;

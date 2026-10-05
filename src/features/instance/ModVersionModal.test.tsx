@@ -1,8 +1,8 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ModDetail, ModVersionSummary } from "../browse/detailTypes";
+import type { InstallModResult, ModDetail, ModVersionSummary } from "../browse/detailTypes";
 import type { ModSummary } from "../browse/types";
 
 /**
@@ -66,6 +66,14 @@ function detail(versions: ModVersionSummary[]): ModDetail {
 
 const noop = () => {};
 
+function installResult(over: Partial<InstallModResult> = {}): InstallModResult {
+  return {
+    installed: null, message: "Installed", hasSkipped: false, missingMods: [],
+    instance: { id: "inst-1", name: "Test", minecraftVersion: "1.21.1", loader: "neoforge", modCount: 1, rootPath: "C:/isolated/inst-1" },
+    ...over,
+  };
+}
+
 function renderModal() {
   render(
     <ModVersionModal
@@ -106,7 +114,7 @@ beforeEach(async () => {
         }),
       ]);
     if (cmd === "update_mod_in_instance")
-      return { installed: null, message: "Installed", instance: null };
+      return installResult();
     return undefined;
   });
   ({ ModVersionModal } = await import("./ModVersionModal"));
@@ -191,7 +199,7 @@ describe("ModVersionModal", () => {
             fileName: "somemod-1.0.jar",
           }),
         ]);
-      if (cmd === "install_mod_to_instance")
+      if (cmd === "update_mod_in_instance")
         return {
           installed: {
             id: 1,
@@ -203,9 +211,10 @@ describe("ModVersionModal", () => {
             installedAt: 1,
           },
           message: "Installed",
-          instance: null,
+          instance: installResult().instance,
+          hasSkipped: false,
+          missingMods: [],
         };
-      if (cmd === "remove_content_file") return undefined;
       return undefined;
     });
     vi.resetModules();
@@ -219,18 +228,105 @@ describe("ModVersionModal", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: /^install$/i })[0]);
 
-    // Untracked install goes through the normal path pinned to the picked
-    // version, then drops the superseded jar.
+    // Identification records the actual file; updates use one atomic path.
     await waitFor(() =>
-      expect(calls.filter((c) => c.cmd === "install_mod_to_instance")).toHaveLength(1),
+      expect(calls.filter((c) => c.cmd === "update_mod_in_instance")).toHaveLength(1),
     );
-    const input = calls.find((c) => c.cmd === "install_mod_to_instance")!.args.input as Record<
-      string,
-      unknown
-    >;
-    expect(input).toMatchObject({ versionId: "v-new", instanceId: "inst-1" });
-    await waitFor(() =>
-      expect(calls.filter((c) => c.cmd === "remove_content_file")).toHaveLength(1),
-    );
+    expect(calls.find((c) => c.cmd === "update_mod_in_instance")!.args).toMatchObject({
+      versionId: "v-new", instanceId: "inst-1", fileName: "somemod-1.0.jar",
+    });
+    expect(calls.filter((c) => c.cmd === "install_mod_to_instance" || c.cmd === "remove_content_file")).toEqual([]);
+  });
+
+  it("retains manual-download update results in the install dock", async () => {
+    const manual = { projectId: 123, name: "Some Mod", filename: "somemod-2.0.jar", url: "https://www.curseforge.com/minecraft/mc-mods/some-mod/download/123" };
+    mockIPC((cmd) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_mod_summary_for_content") return summary;
+      if (cmd === "get_mod_details") return detail([version({ id: "picked" })]);
+      if (cmd === "update_mod_in_instance") return installResult({ message: "Download Some Mod manually", hasSkipped: true, missingMods: [manual] });
+    });
+    const { useInstallStore } = await import("../install/installStore");
+    renderModal();
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    await waitFor(() => expect(useInstallStore.getState().installs[0]).toMatchObject({
+      status: "done", missingMods: [manual], message: "Download Some Mod manually",
+    }));
+  });
+
+  it("does not remove an identified old jar until its replacement actually lands", async () => {
+    const removed = vi.fn();
+    mockIPC((cmd) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_mod_summary_for_content") throw new Error("not tracked");
+      if (cmd === "identify_mod_file") return { summary, fileName: "somemod-1.0.jar", versionId: "old", versionNumber: "1.0", matchedFileName: "somemod-1.0.jar" };
+      if (cmd === "get_mod_details") return detail([version({ id: "picked" })]);
+      if (cmd === "update_mod_in_instance") return installResult({ hasSkipped: true, missingMods: [{ projectId: 123, name: "Some Mod", filename: "somemod-2.0.jar", url: "https://www.curseforge.com/minecraft/mc-mods/some-mod/download/123" }] });
+      if (cmd === "remove_content_file") return removed();
+    });
+    const { useInstallStore } = await import("../install/installStore");
+    renderModal();
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    await waitFor(() => expect(useInstallStore.getState().installs[0].status).toBe("done"));
+    expect(removed).not.toHaveBeenCalled();
+  });
+
+  it("keeps atomic replacement failures retryable for identified installs", async () => {
+    mockIPC((cmd) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_mod_summary_for_content") throw new Error("not tracked");
+      if (cmd === "identify_mod_file") return { summary, fileName: "somemod-1.0.jar", versionId: "old", versionNumber: "1.0", matchedFileName: "somemod-1.0.jar" };
+      if (cmd === "get_mod_details") return detail([version({ id: "picked" })]);
+      if (cmd === "update_mod_in_instance") throw new Error("old jar locked");
+    });
+    const { useInstallStore } = await import("../install/installStore");
+    renderModal();
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    await waitFor(() => expect(useInstallStore.getState().installs[0].status).toBe("error"));
+    expect(useInstallStore.getState().installs[0].error).toContain("old jar locked");
+    expect(screen.getByRole("button", { name: "Install" })).toBeEnabled();
+  });
+
+  it("finishes through the store without calling a closed modal's callbacks", async () => {
+    let finish!: (result: InstallModResult) => void;
+    mockIPC((cmd) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_mod_summary_for_content") return summary;
+      if (cmd === "get_mod_details") return detail([version({ id: "picked" })]);
+      if (cmd === "update_mod_in_instance") return new Promise<InstallModResult>((resolve) => { finish = resolve; });
+    });
+    const installed = vi.fn();
+    const close = vi.fn();
+    const { useInstallStore } = await import("../install/installStore");
+    const page = render(<ModVersionModal instanceId="inst-1" minecraftVersion="1.21.1" loader="neoforge" fileName="somemod-1.0.jar" modLabel="Some Mod" onClose={close} onInstalled={installed} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Install" }));
+    await waitFor(() => expect(useInstallStore.getState().installs[0].status).toBe("installing"));
+    page.unmount();
+    await act(async () => { finish(installResult()); });
+    expect(useInstallStore.getState().installs[0].status).toBe("done");
+    expect(installed).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("marks a disabled physical file installed and updates that exact file", async () => {
+    const updates: unknown[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_mod_summary_for_content") return summary;
+      if (cmd === "get_mod_details") return detail([
+        version({ id: "old", name: "Current", fileName: "somemod-1.0.jar" }),
+        version({ id: "next", name: "Next", fileName: "somemod-2.0.jar" }),
+      ]);
+      if (cmd === "update_mod_in_instance") { updates.push(args); return installResult(); }
+      return null;
+    });
+    const completed = vi.fn();
+    render(<ModVersionModal instanceId="inst-1" minecraftVersion="1.21.1" loader="neoforge"
+      fileName="somemod-1.0.jar.disabled" modLabel="Some Mod" onClose={noop} onInstalled={completed} />);
+    const current = (await screen.findByText("Current")).closest("li")!;
+    expect(within(current).getByRole("button", { name: "Installed" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    await waitFor(() => expect(completed).toHaveBeenCalled());
+    expect(updates[0]).toMatchObject({ fileName: "somemod-1.0.jar.disabled", versionId: "next" });
   });
 });

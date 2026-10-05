@@ -192,7 +192,7 @@ impl DevicePoll {
 /// `interval` seconds and retry), `Ok(Some(..))` on success.
 pub async fn poll_for_token(
     client: &reqwest::Client,
-    poll: &DevicePoll,
+    poll: &mut DevicePoll,
 ) -> Result<Option<(String, String, u64)>, AuthError> {
     if poll.is_expired() {
         return Err(AuthError::Expired);
@@ -222,7 +222,11 @@ pub async fn poll_for_token(
         .await
         .unwrap_or(TokenErrorResponse { error: String::new() });
     match err.error.as_str() {
-        "authorization_pending" | "slow_down" => Ok(None),
+        "authorization_pending" => Ok(None),
+        "slow_down" => {
+            poll.interval = poll.interval.saturating_add(5);
+            Ok(None)
+        }
         "expired_token" | "code_expired" => Err(AuthError::Expired),
         "authorization_declined" | "access_denied" => Err(AuthError::Declined),
         other => Err(AuthError::Unexpected("token endpoint", other.to_string())),

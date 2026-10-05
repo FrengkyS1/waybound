@@ -1,7 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 
-import { checkAndInstall, type UpdateStatus, type UpdateState } from "./updater";
+import {
+  checkAndInstall,
+  getUpdateStatus,
+  subscribeToUpdates,
+  type UpdateState,
+} from "./updater";
 
 import styles from "./SettingsPage.module.css";
 
@@ -17,29 +22,19 @@ const STATUS_LABEL: Record<UpdateState, string> = {
 
 export function UpdateSection() {
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
-  const [status, setStatus] = useState<UpdateStatus>({ state: "idle" });
-  const [busy, setBusy] = useState(false);
-  const running = useRef(false);
+  const status = useSyncExternalStore(subscribeToUpdates, getUpdateStatus);
+  const busy = status.state === "checking" || status.state === "available"
+    || status.state === "downloading" || status.state === "installing";
 
   useEffect(() => {
-    void getVersion().then(setCurrentVersion);
+    let active = true;
+    void getVersion().then((version) => {
+      if (active) setCurrentVersion(version);
+    }).catch(() => {});
+    return () => {
+      active = false;
+    };
   }, []);
-
-  async function handleCheck() {
-    if (running.current) return;
-    running.current = true;
-    setBusy(true);
-    setStatus({ state: "checking" });
-    try {
-      // checkAndInstall reports phase transitions through its callback; the
-      // returned value is the final state we render as well.
-      const result = await checkAndInstall(setStatus);
-      setStatus(result);
-    } finally {
-      running.current = false;
-      setBusy(false);
-    }
-  }
 
   const ready = status.state === "available";
   const downloading = status.state === "downloading";
@@ -93,9 +88,9 @@ export function UpdateSection() {
           type="button"
           className={styles.primary}
           disabled={busy}
-          onClick={() => void handleCheck()}
+          onClick={() => void checkAndInstall()}
         >
-          {busy ? "Checking…" : "Check for updates"}
+          {busy ? STATUS_LABEL[status.state] : "Check for updates"}
         </button>
       </div>
     </section>

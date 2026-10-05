@@ -11,23 +11,22 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::path::Path;
-use std::process::Command;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::process::Command;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use crate::dto::ModLoader;
+use crate::download::CancelToken;
 
-use super::files::{download_verified, maven_path, GamePaths};
+use super::files::{download_verified, file_sha1, maven_path, GamePaths};
 use super::manifest::VersionJson;
-use super::{LaunchError, ProgressUpdate};
+use super::{cancellable, check_cancelled, LaunchError, ProgressUpdate};
 
 const FORGE_MAVEN: &str = "https://maven.minecraftforge.net";
 const FORGE_PROMOTIONS: &str =
@@ -70,6 +69,8 @@ struct Processor {
     classpath: Vec<String>,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    outputs: HashMap<String, String>,
 }
 
 /// Resolve the newest loader version for a game version, or use the caller's.
@@ -300,25 +301,25 @@ pub async fn prepare<F>(
     loader_version: &str,
     vanilla: &VersionJson,
     java_path: &str,
+    cancel: &CancelToken,
     report: &F,
 ) -> Result<VersionJson, LaunchError>
 where
     F: Fn(ProgressUpdate),
 {
+    check_cancelled(cancel)?;
     let id = install_id(loader, game_version, loader_version);
     let install_dir = paths.version_dir(&id);
     let version_json_path = install_dir.join(format!("{id}.json"));
     let marker = install_dir.join(".installed");
 
-    // Fast path: already installed.
-    if marker.exists() && version_json_path.exists() {
-        let raw = std::fs::read(&version_json_path)?;
-        let profile: VersionJson = serde_json::from_slice(&raw)
-            .map_err(|e| LaunchError::Parse(format!("cached loader version: {e}")))?;
-        if profile.inherits_from.as_deref() != Some(game_version) {
-            return Err(LaunchError::Parse(format!("Installed loader does not match Minecraft {game_version}")));
-        }
+    // A marker alone cannot prove processor outputs remain intact. Old "ok"
+    // markers and damaged profiles are rebuilt from the cached installer.
+    if let Some(profile) = installed_profile(&version_json_path, &marker, paths, game_version) {
         return Ok(super::fabric::merge_onto_parent(profile, vanilla.clone()));
+    }
+    if marker.exists() {
+        std::fs::remove_file(&marker)?;
     }
 
     report(ProgressUpdate::stage("Downloading loader installer", 0, 1));
@@ -328,7 +329,7 @@ where
     // recovering interrupted preparations without touching the live install.
     let url = installer_url(loader, game_version, loader_version);
     let installer_path = install_dir.join("installer.jar");
-    download_verified(client, &url, &installer_path, None, false).await?;
+    cancellable(cancel, download_verified(client, &url, &installer_path, None, false)).await?;
     let installer_bytes = std::fs::read(&installer_path)?;
 
     // Extract the two JSON descriptors.
@@ -340,7 +341,7 @@ where
     if let Some(downloads) = &vanilla.downloads {
         if let Some(client_dl) = &downloads.client {
             let dest = paths.client_jar(game_version);
-            download_verified(client, &client_dl.url, &dest, client_dl.sha1.as_deref(), false).await?;
+            cancellable(cancel, download_verified(client, &client_dl.url, &dest, client_dl.sha1.as_deref(), false)).await?;
         }
     }
 
@@ -353,23 +354,21 @@ where
         .chain(version_profile.libraries.iter());
     report(ProgressUpdate::stage("Downloading loader libraries", 0, 1));
     for lib in all_libs {
-        fetch_loader_library(client, lib, &libs_root, &installer_bytes).await?;
+        check_cancelled(cancel)?;
+        cancellable(cancel, fetch_loader_library(client, lib, &libs_root, &installer_bytes)).await?;
     }
 
     // Resolve `data` entries (extract bundled files, resolve maven refs).
     let data_dir = install_dir.join("data");
     let mut data: HashMap<String, String> = HashMap::new();
     for (key, sided) in &install_profile.data {
+        check_cancelled(cancel)?;
         let resolved = resolve_data_value(&sided.client, &libs_root, &installer_bytes, &data_dir)?;
         data.insert(key.clone(), resolved);
     }
 
-    // Run each client-side processor in order. Each one is a real subprocess
-    // (deobfuscation/patching) that can take several seconds, with several
-    // processors per install — running them via spawn_blocking gives a
-    // genuine yield point between processors so a cancelled launch actually
-    // stops between them instead of only after every processor has finished,
-    // and keeps this blocking work off the async runtime's worker threads.
+    // Await every processor directly: cancellation kills and reaps its child
+    // before the preparation future returns and releases the instance guard.
     let total = install_profile.processors.len();
     for (i, proc) in install_profile.processors.iter().enumerate() {
         if let Some(sides) = &proc.sides {
@@ -382,24 +381,81 @@ where
             (i + 1) as u64,
             total as u64,
         ));
-        let proc = proc.clone();
-        let libs_root = libs_root.clone();
-        let data = data.clone();
-        let paths = paths.clone();
-        let game_version = game_version.to_string();
-        let java_path = java_path.to_string();
-        tokio::task::spawn_blocking(move || {
-            run_processor(&proc, &libs_root, &data, &paths, &game_version, &java_path)
-        })
-        .await
-        .map_err(|e| LaunchError::Spawn(format!("processor task panicked: {e}")))??;
+        run_processor(proc, &libs_root, &data, paths, game_version, java_path, cancel).await?;
     }
+    check_cancelled(cancel)?;
+    let receipt = installed_artifacts(&version_profile, &install_profile, &data, paths, game_version)?;
     let raw = raw_version_json(&installer_bytes)?;
-    std::fs::write(&version_json_path, serde_json::to_vec_pretty(&raw)
+    super::offline::write_atomic(&version_json_path, &serde_json::to_vec_pretty(&raw)
         .map_err(|e| LaunchError::Parse(e.to_string()))?)?;
-    std::fs::write(&marker, b"ok")?;
+    super::offline::write_atomic(&marker, &serde_json::to_vec(&receipt)
+        .map_err(|e| LaunchError::Parse(e.to_string()))?)?;
 
     Ok(super::fabric::merge_onto_parent(version_profile, vanilla.clone()))
+}
+
+#[derive(Deserialize, Serialize)]
+struct InstalledArtifact {
+    path: PathBuf,
+    sha1: String,
+}
+
+fn installed_profile(
+    version_path: &Path,
+    marker: &Path,
+    paths: &GamePaths,
+    game_version: &str,
+) -> Option<VersionJson> {
+    let profile: VersionJson = serde_json::from_slice(&std::fs::read(version_path).ok()?).ok()?;
+    if profile.inherits_from.as_deref() != Some(game_version) { return None; }
+    let receipt: Vec<InstalledArtifact> = serde_json::from_slice(&std::fs::read(marker).ok()?).ok()?;
+    if receipt.iter().any(|artifact| file_sha1(&artifact.path).as_deref() != Some(artifact.sha1.as_str())) {
+        return None;
+    }
+    for lib in &profile.libraries {
+        let Some(artifact) = lib.downloads.as_ref().and_then(|downloads| downloads.artifact.as_ref()) else { continue };
+        if !artifact.url.is_empty() { continue; }
+        let relative = artifact.path.clone().or_else(|| maven_path(&lib.name))?;
+        let path = paths.libraries().join(relative);
+        let entry = receipt.iter().find(|entry| entry.path == path)?;
+        if artifact.sha1.as_ref().is_some_and(|expected| expected != &entry.sha1) { return None; }
+    }
+    Some(profile)
+}
+
+fn installed_artifacts(
+    version: &VersionJson,
+    install: &InstallProfile,
+    data: &HashMap<String, String>,
+    paths: &GamePaths,
+    game_version: &str,
+) -> Result<Vec<InstalledArtifact>, LaunchError> {
+    let libs_root = paths.libraries();
+    let mut outputs: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for lib in &version.libraries {
+        let Some(artifact) = lib.downloads.as_ref().and_then(|downloads| downloads.artifact.as_ref()) else { continue };
+        if !artifact.url.is_empty() { continue; }
+        let relative = artifact.path.clone().or_else(|| maven_path(&lib.name))
+            .ok_or_else(|| LaunchError::Parse(format!("bad generated library: {}", lib.name)))?;
+        outputs.insert(libs_root.join(relative), artifact.sha1.clone());
+    }
+    for processor in &install.processors {
+        if processor.sides.as_ref().is_some_and(|sides| !sides.iter().any(|side| side == "client")) { continue; }
+        for (path, hash) in &processor.outputs {
+            let path = substitute_processor_arg(path, data, &libs_root, paths, game_version);
+            let path = PathBuf::from(path.trim_matches('\''));
+            let path = if path.is_absolute() { path } else { paths.root.join(path) };
+            let hash = substitute_processor_arg(hash, data, &libs_root, paths, game_version);
+            outputs.insert(path, Some(hash.trim_matches('\'').to_string()));
+        }
+    }
+    outputs.into_iter().map(|(path, expected)| {
+        let sha1 = file_sha1(&path).ok_or_else(|| LaunchError::Parse(format!("loader processor did not create {}", path.display())))?;
+        if expected.as_ref().is_some_and(|expected| !sha1.eq_ignore_ascii_case(expected)) {
+            return Err(LaunchError::HashMismatch { url: path.to_string_lossy().to_string() });
+        }
+        Ok(InstalledArtifact { path, sha1 })
+    }).collect()
 }
 
 /// Read the raw version.json value (preserving all fields) for caching.
@@ -422,18 +478,23 @@ fn read_json_from_zip<T: for<'de> Deserialize<'de>>(
 }
 
 /// Extract a single file from the installer jar to `dest`.
-fn extract_from_zip(zip_bytes: &[u8], name: &str, dest: &Path) -> Result<(), LaunchError> {
+fn extract_from_zip(zip_bytes: &[u8], name: &str, dest: &Path) -> Result<bool, LaunchError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
         .map_err(|e| LaunchError::Extract(e.to_string()))?;
-    let mut file = archive
-        .by_name(name)
-        .map_err(|_| LaunchError::Parse(format!("installer has no {name}")))?;
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(false),
+        Err(error) => return Err(LaunchError::Extract(error.to_string())),
+    };
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut out = std::fs::File::create(dest)?;
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    let mut out = tempfile::NamedTempFile::new_in(parent)?;
     std::io::copy(&mut file, &mut out)?;
-    Ok(())
+    out.as_file().sync_all()?;
+    out.persist(dest).map_err(|error| LaunchError::Io(error.error))?;
+    Ok(true)
 }
 
 async fn fetch_loader_library(
@@ -458,12 +519,10 @@ async fn fetch_loader_library(
     let dest = libs_root.join(&rel);
 
     if artifact.url.is_empty() {
-        // Empty URL means either bundled inside the installer under
-        // `maven/<path>`, or a processor *output* produced later. Extract it if
-        // present; if not, skip silently (a processor will create it).
-        if !dest.exists() {
-            let _ = extract_from_zip(installer_bytes, &format!("maven/{rel}"), &dest);
-        }
+        // Re-extract bundled files during repair, even when damaged files
+        // already exist. Missing members are processor outputs, validated
+        // before publishing the completion receipt.
+        extract_from_zip(installer_bytes, &format!("maven/{rel}"), &dest)?;
     } else {
         download_verified(client, &artifact.url, &dest, artifact.sha1.as_deref(), false).await?;
     }
@@ -487,20 +546,23 @@ fn resolve_data_value(
     } else if let Some(path) = value.strip_prefix('/') {
         let dest = crate::download::safe_join(data_dir, path)
             .map_err(|e| LaunchError::Parse(e.to_string()))?;
-        extract_from_zip(installer_bytes, path, &dest)?;
+        if !extract_from_zip(installer_bytes, path, &dest)? {
+            return Err(LaunchError::Parse(format!("installer has no {path}")));
+        }
         Ok(dest.to_string_lossy().to_string())
     } else {
         Ok(value.to_string())
     }
 }
 
-fn run_processor(
+async fn run_processor(
     proc: &Processor,
     libs_root: &Path,
     data: &HashMap<String, String>,
     paths: &GamePaths,
     game_version: &str,
     java_path: &str,
+    cancel: &CancelToken,
 ) -> Result<(), LaunchError> {
     let sep = if cfg!(windows) { ";" } else { ":" };
 
@@ -534,13 +596,21 @@ fn run_processor(
         .current_dir(&paths.root);
     #[cfg(windows)]
     processor_cmd.creation_flags(CREATE_NO_WINDOW);
-    let output = processor_cmd
-        .output()
-        .map_err(|e| LaunchError::Spawn(e.to_string()))?;
+    let stdout_file = tempfile::NamedTempFile::new()?;
+    let stderr_file = tempfile::NamedTempFile::new()?;
+    processor_cmd
+        .stdout(Stdio::from(stdout_file.reopen()?))
+        .stderr(Stdio::from(stderr_file.reopen()?))
+        .kill_on_drop(true);
+    check_cancelled(cancel)?;
+    let mut child = processor_cmd.spawn().map_err(|e| LaunchError::Spawn(e.to_string()))?;
+    let status = wait_processor(&mut child, cancel).await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if !status.success() {
+        let stderr_bytes = std::fs::read(stderr_file.path())?;
+        let stdout_bytes = std::fs::read(stdout_file.path())?;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let tail: String = stderr
             .lines()
             .chain(stdout.lines())
@@ -553,6 +623,25 @@ fn run_processor(
         )));
     }
     Ok(())
+}
+
+pub(super) async fn wait_processor(
+    child: &mut tokio::process::Child,
+    cancel: &CancelToken,
+) -> Result<std::process::ExitStatus, LaunchError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // kill() waits too, but always call wait() so even a raced exit or
+            // kill failure cannot return while the child remains unreaped.
+            let _ = child.kill().await;
+            // A kill can race natural exit. Successful wait, not kill's return
+            // value, proves cancellation may release shared output ownership.
+            child.wait().await?;
+            Err(LaunchError::Cancelled)
+        }
+        result = child.wait() => result.map_err(LaunchError::Io),
+    }
 }
 
 fn substitute_processor_arg(
@@ -607,6 +696,109 @@ fn main_class_of(jar: &Path) -> Result<String, LaunchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use sha1::Digest;
+
+    fn fixture_installer(path: &Path, generated_path: &str, contents: &[u8]) {
+        let profile = serde_json::to_vec(&serde_json::json!({
+            "id": "forge-fixture", "inheritsFrom": "fixture",
+            "mainClass": "example.Main",
+            "libraries": [{
+                "name": "example:generated:1",
+                "downloads": {"artifact": {
+                    "path": generated_path, "url": "",
+                    "sha1": hex::encode(sha1::Sha1::digest(contents))
+                }}
+            }]
+        })).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, bytes) in [
+            ("version.json".to_string(), profile.as_slice()),
+            ("install_profile.json".to_string(), &b"{}"[..]),
+            (format!("maven/{generated_path}"), contents),
+        ] {
+            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_fast_path_repairs_missing_and_corrupt_generated_artifacts() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = GamePaths::new(scratch.path().join("game"));
+        let install_dir = paths.version_dir(&install_id(ModLoader::Forge, "fixture", "1"));
+        let relative = "example/generated/1/generated-1.jar";
+        let expected = b"generated artifact fixture";
+        fixture_installer(&install_dir.join("installer.jar"), relative, expected);
+        let vanilla: VersionJson = serde_json::from_value(serde_json::json!({"id": "fixture"})).unwrap();
+        let client = Client::builder().proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .timeout(std::time::Duration::from_secs(1)).build().unwrap();
+        let cancel = CancelToken::new();
+        let generated = paths.libraries().join(relative);
+        for damage in [None, Some("missing"), Some("corrupt"), Some("legacy-marker"), Some("profile")] {
+            match damage {
+                Some("missing") => std::fs::remove_file(&generated).unwrap(),
+                Some("corrupt") => std::fs::write(&generated, b"corrupt").unwrap(),
+                Some("legacy-marker") => std::fs::write(install_dir.join(".installed"), b"ok").unwrap(),
+                Some("profile") => std::fs::write(install_dir.join("forge-fixture-1.json"), b"broken JSON").unwrap(),
+                _ => {}
+            }
+            let profile = prepare(&client, &paths, ModLoader::Forge, "fixture", "1", &vanilla, "unused", &cancel, &|_| {}).await.unwrap();
+            assert_eq!(profile.main_class.as_deref(), Some("example.Main"));
+            assert_eq!(std::fs::read(&generated).unwrap(), expected);
+            let receipt: Vec<InstalledArtifact> = serde_json::from_slice(&std::fs::read(install_dir.join(".installed")).unwrap()).unwrap();
+            assert_eq!(receipt.len(), 1);
+            assert_eq!(receipt[0].path, generated);
+        }
+    }
+
+    #[test]
+    fn processor_output_receipt_requires_present_and_correct_hash() {
+        use sha1::Digest;
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = GamePaths::new(scratch.path().to_owned());
+        let output = scratch.path().join("generated.dat");
+        let hash = hex::encode(sha1::Sha1::digest(b"expected"));
+        let mut data = HashMap::new();
+        data.insert("OUTPUT".into(), output.to_string_lossy().to_string());
+        data.insert("HASH".into(), hash);
+        let install: InstallProfile = serde_json::from_value(serde_json::json!({
+            "processors": [{"jar": "unused:processor:1", "outputs": {"{OUTPUT}": "{HASH}"}}]
+        })).unwrap();
+        let version: VersionJson = serde_json::from_value(serde_json::json!({"id": "fixture"})).unwrap();
+        assert!(installed_artifacts(&version, &install, &data, &paths, "fixture").is_err());
+        std::fs::write(&output, b"corrupt").unwrap();
+        assert!(matches!(installed_artifacts(&version, &install, &data, &paths, "fixture"), Err(LaunchError::HashMismatch { .. })));
+        std::fs::write(&output, b"expected").unwrap();
+        assert_eq!(installed_artifacts(&version, &install, &data, &paths, "fixture").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_processor_is_killed_and_reaped_before_return() {
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(not(windows))]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        assert!(child.id().is_some());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = wait_processor(&mut child, &cancel).await;
+        assert!(matches!(result, Err(LaunchError::Cancelled)));
+        assert!(child.id().is_none(), "cancel must return only after reaping child");
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     fn versions(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

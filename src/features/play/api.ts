@@ -37,8 +37,12 @@ export async function getAccount(): Promise<AccountPublic | null> {
 }
 
 /** Runs the full device-code flow; resolves once the user finishes signing in. */
-export async function microsoftLogin(): Promise<AccountPublic> {
-  return invoke<AccountPublic>("microsoft_login");
+export async function microsoftLogin(loginId: string): Promise<AccountPublic> {
+  return invoke<AccountPublic>("microsoft_login", { loginId });
+}
+
+export async function cancelMicrosoftLogin(loginId: string): Promise<void> {
+  await invoke("cancel_microsoft_login", { loginId });
 }
 
 export async function logout(): Promise<void> {

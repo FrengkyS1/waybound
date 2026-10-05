@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InstanceContent } from "../instances/api";
@@ -37,7 +37,7 @@ const asyncNoop = async () => {};
 
 async function renderPage(
   instance: InstanceSummary,
-  tab: "overview" | "content" = "overview",
+  tab: "overview" | "content" | "settings" = "overview",
 ) {
   if (!InstancePage) ({ InstancePage } = await import("./InstancePage"));
   render(
@@ -287,5 +287,134 @@ describe("Content tab file rows", () => {
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "ftb r" } });
     expect(screen.getByText("FTB Ranks")).toBeInTheDocument();
     expect(screen.queryByText("Unrelated")).not.toBeInTheDocument();
+  });
+});
+
+describe("background content completion", () => {
+  it("reloads mounted Content for its instance, not another install", async () => {
+    let files: InstanceContent["mods"] = [];
+    const fetches = vi.fn(() => ({ mods: files, resourcePacks: [], shaderPacks: [] }));
+    mockIPC((cmd) => cmd === "list_instance_content" ? fetches() : cmd === "list_pending_missing_mods" ? [] : null);
+    await renderPage(summary(), "content");
+    await screen.findByText("No content yet");
+    // IPC listeners initialize only after mockIPC exists.
+    const { useInstallStore } = await import("../install/installStore");
+    const count = fetches.mock.calls.length;
+    await act(async () => { useInstallStore.setState((s) => ({ instanceRefreshTicks: { ...s.instanceRefreshTicks, other: 1 } })); });
+    expect(fetches).toHaveBeenCalledTimes(count);
+    files = [{ fileName: "landed.jar", name: "Landed mod", enabled: true, sizeBytes: 1, metaResolved: true, hasConfig: false, addedByYou: true }];
+    await act(async () => { useInstallStore.setState((s) => ({ instanceRefreshTicks: { ...s.instanceRefreshTicks, "inst-1": (s.instanceRefreshTicks["inst-1"] ?? 0) + 1 } })); });
+    expect(await screen.findByText("Landed mod")).toBeInTheDocument();
+    expect(fetches).toHaveBeenCalledTimes(count + 1);
+  });
+
+  it("does not let a late content response overwrite the newest completion", async () => {
+    const requests: ((value: InstanceContent) => void)[] = [];
+    mockIPC((cmd) => cmd === "list_instance_content"
+      ? new Promise<InstanceContent>((resolve) => { requests.push(resolve); })
+      : cmd === "list_pending_missing_mods" ? [] : null);
+    await renderPage(summary(), "content");
+    const { useInstallStore } = await import("../install/installStore");
+    const earlier = requests.length - 1;
+    await act(async () => { useInstallStore.setState((s) => ({ instanceRefreshTicks: { ...s.instanceRefreshTicks, "inst-1": (s.instanceRefreshTicks["inst-1"] ?? 0) + 1 } })); });
+    const latest = requests.length - 1;
+    expect(latest).toBeGreaterThan(earlier);
+    await act(async () => { requests[latest]({
+      mods: [{ fileName: "new.jar", name: "Newest", enabled: true, sizeBytes: 1, metaResolved: true, hasConfig: false, addedByYou: true }],
+      resourcePacks: [], shaderPacks: [],
+    }); });
+    expect(await screen.findByText("Newest")).toBeInTheDocument();
+    await act(async () => { requests[earlier]({ mods: [], resourcePacks: [], shaderPacks: [] }); });
+    expect(screen.getByText("Newest")).toBeInTheDocument();
+  });
+
+  it.each(["toggle", "remove"] as const)("keeps failed %s explanation after restoring content", async (action) => {
+    const fetches = vi.fn(() => ({
+      mods: [{ fileName: "original.jar", name: "Original", enabled: true, sizeBytes: 1, metaResolved: true, hasConfig: false, addedByYou: true }],
+      resourcePacks: [], shaderPacks: [],
+    }));
+    mockIPC((cmd) => {
+      if (cmd === "list_instance_content") return fetches();
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "set_content_enabled" || cmd === "remove_content_file") throw new Error("Content change refused");
+      return null;
+    });
+    await renderPage(summary(), "content");
+    await screen.findByText("Original");
+    if (action === "toggle") {
+      fireEvent.click(screen.getByRole("button", { name: "Enabled" }));
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "Remove original.jar" }));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Remove" }));
+    }
+    await waitFor(() => expect(fetches.mock.calls.length).toBeGreaterThan(1));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Content change refused");
+    expect(screen.getByText("Original")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enabled" })).toBeEnabled();
+  });
+
+  it("uses the physical renamed filename for subsequent row actions", async () => {
+    const updates: unknown[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === "list_instance_content") return {
+        mods: [{ fileName: "jade.jar", enabled: true, sizeBytes: 1, metaResolved: true, hasConfig: false, addedByYou: true }],
+        resourcePacks: [], shaderPacks: [],
+      };
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "set_content_enabled") updates.push(args);
+      return null;
+    });
+    await renderPage(summary(), "content");
+    fireEvent.click(await screen.findByRole("button", { name: "Enabled" }));
+    expect(await screen.findByText("jade.jar.disabled")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Disabled" }));
+    await waitFor(() => expect(updates).toHaveLength(2));
+    expect(updates).toEqual([
+      { instanceId: "inst-1", category: "mod", fileName: "jade.jar", enabled: false },
+      { instanceId: "inst-1", category: "mod", fileName: "jade.jar.disabled", enabled: true },
+    ]);
+    expect(screen.queryByText("jade.jar.disabled")).not.toBeInTheDocument();
+  });
+});
+
+describe("instance config entry", () => {
+  it("opens all configs while running and keeps failed save drafts retryable", async () => {
+    const writes: unknown[] = [];
+    mockIPC((cmd, args) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "list_instance_configs") return [{ relativePath: "config/general.toml", displayName: "general.toml" }];
+      if (cmd === "read_config_file") return "enabled = true";
+      if (cmd === "get_instance_options") return { options: {}, overrides: {} };
+      if (cmd === "get_launch_settings") return { detected: [] };
+      if (cmd === "get_instance_launch_config") return {};
+      if (cmd === "write_config_file") {
+        writes.push(args);
+        if (writes.length === 1) throw new Error("Permission denied");
+      }
+      return null;
+    });
+    const { usePlayStore } = await import("../play/store");
+    await act(async () => {
+      usePlayStore.setState({ launches: { "inst-1": {
+        instanceId: "inst-1", instanceName: "Test Instance", phase: "running", stage: "Running",
+        current: 0, total: 0, logs: [], exitCode: null, error: null, startedAtMs: 1,
+        crashed: false, crashReason: null,
+      } } });
+    });
+    await renderPage(summary(), "settings");
+    expect(screen.getByText(/Minecraft is running\. Saves are allowed/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Config files" }));
+    const editor = await screen.findByRole("textbox", { name: "Editing general.toml" });
+    fireEvent.change(editor, { target: { value: "enabled = false" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Permission denied");
+    expect(editor).toHaveValue("enabled = false");
+    fireEvent.click(screen.getByRole("button", { name: "Retry Save" }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes).toEqual([
+      { instanceId: "inst-1", relativePath: "config/general.toml", contents: "enabled = false", expectedContents: "enabled = true" },
+      { instanceId: "inst-1", relativePath: "config/general.toml", contents: "enabled = false", expectedContents: "enabled = true" },
+    ]);
+    await act(async () => { usePlayStore.setState({ launches: {} }); });
   });
 });

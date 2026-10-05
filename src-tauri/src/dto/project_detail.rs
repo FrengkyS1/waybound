@@ -42,7 +42,9 @@ pub struct ModVersionSummary {
     pub name: String,
     pub version_number: String,
     pub published_at: String,
+    /// Minecraft versions only; source loader/side tags belong outside this list.
     pub game_versions: Vec<String>,
+    /// Actual loader declarations for this version, not project-wide categories.
     pub loaders: Vec<ModLoader>,
     pub downloads: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -138,14 +138,78 @@ fn text_override_path(path: &str) -> bool {
     matches!(Path::new(&path).extension().and_then(|v| v.to_str()), Some("json" | "json5" | "toml" | "cfg" | "conf" | "properties" | "yaml" | "yml" | "txt" | "xml" | "snbt" | "mcmeta" | "js" | "zs" | "groovy" | "lua" | "csv"))
 }
 
-fn safe_text(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else { return false; };
+fn safe_string(text: &str) -> bool {
     if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) { return false; }
-    // Conservative by design: do not echo a matched line or value in an error.
     // Normalize separators so access_token, accessToken and access-token agree.
+    // Never return matched keys, source lines, or values to callers.
     let folded: String = text.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect();
     !["token", "password", "passwd", "secret", "credential", "apikey", "authorization", "bearer", "privatekey", "webhook", "sessionid", "clientkey"].iter().any(|needle| folded.contains(needle))
         && !text.contains("://") // URLs can embed credentials, signed queries, or private endpoints.
+}
+
+// Check JSON while decoding, rather than first collecting a map: duplicate
+// keys must not discard an earlier credential-bearing value.
+struct ShareableJson(bool);
+
+impl<'de> Deserialize<'de> for ShareableJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ShareableJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> { Ok(ShareableJson(true)) }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> { Ok(ShareableJson(true)) }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> { Ok(ShareableJson(true)) }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> { Ok(ShareableJson(true)) }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> { Ok(ShareableJson(true)) }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> { Ok(ShareableJson(safe_string(value))) }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                let mut safe = true;
+                while let Some(value) = sequence.next_element::<ShareableJson>()? { safe &= value.0; }
+                Ok(ShareableJson(safe))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut safe = true;
+                while let Some(key) = map.next_key::<String>()? {
+                    safe &= safe_string(&key);
+                    safe &= map.next_value::<ShareableJson>()?.0;
+                }
+                Ok(ShareableJson(safe))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn safe_toml(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => safe_string(value),
+        toml::Value::Array(values) => values.iter().all(safe_toml),
+        toml::Value::Table(table) => table.iter().all(|(key, value)| safe_string(key) && safe_toml(value)),
+        _ => true,
+    }
+}
+
+fn safe_text(path: &str, bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return false; };
+    // Parsed TOML omits comments. Inspect source too, so comments containing
+    // plaintext credentials or private URLs cannot slip into shared overrides.
+    if !safe_string(text) { return false; }
+    let extension = Path::new(path).extension().and_then(|value| value.to_str()).unwrap_or("");
+    if extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("mcmeta") {
+        serde_json::from_slice::<ShareableJson>(bytes).is_ok_and(|value| value.0)
+    } else if extension.eq_ignore_ascii_case("toml") {
+        toml::from_str::<toml::Value>(text).is_ok_and(|value| safe_toml(&value))
+    } else {
+        // Arbitrary languages cannot be proven secret-free. This is only a
+        // conservative lexical guard, not semantic parsing; refuse all escape
+        // sequences rather than pretending unsupported decoding was checked.
+        !text.contains('\\')
+            && !(extension.eq_ignore_ascii_case("xml") && text.contains('&'))
+    }
 }
 
 fn hash_file(path: &Path, cancel: &CancelToken) -> Result<(Hashes, u64), String> {
@@ -252,7 +316,7 @@ pub(super) async fn export(instance: &InstanceSummary, destination: &Path, cance
         let source = root.join(&relative);
         if text_override_path(&path) {
             let bytes = read_bounded(&source, MAX_TEXT).map_err(|_| format!("Cannot export override {path}: unreadable or larger than 8 MiB."))?;
-            if !safe_text(&bytes) { return Err(format!("Cannot export {path}: config/script may contain credentials, private URLs, or non-text data. Remove private settings from a separate shareable copy before exporting.")); }
+            if !safe_text(&path, &bytes) { return Err(format!("Cannot export {path}: config/script may contain credentials, private URLs, invalid structured data, non-text data, or escapes in a format without a supported decoder. JSON/TOML keys and values are decoded; other formats receive conservative text checks only. Review private settings in a separate shareable copy before exporting.")); }
             override_size += bytes.len() as u64;
             if override_size > MAX_OVERRIDES { return Err("Text overrides exceed the 256 MiB export limit.".into()); }
             let copy = stage.0.join(&relative);
@@ -360,11 +424,84 @@ mod tests {
 
     #[test]
     fn suspicious_config_is_refused_without_requiring_a_specific_format() {
-        assert!(safe_text(b"{\"difficulty\": 3, \"enabled\": true}"));
-        assert!(safe_text(b"ServerEvents.recipes(event => { event.remove({id: 'mod:recipe'}); });"));
+        assert!(safe_text("config/example.json", b"{\"difficulty\": 3, \"enabled\": true}"));
+        assert!(safe_text("scripts/recipes.js", b"ServerEvents.recipes(event => { event.remove({id: 'mod:recipe'}); });"));
         for content in [b"access_token = 'example'".as_slice(), b"{\"apiKey\":\"example\"}", b"PASSWORD: example", b"endpoint=https://user:pass@example.test", b"\xff\x00"] {
-            assert!(!safe_text(content));
+            assert!(!safe_text("config/example.cfg", content));
         }
+    }
+
+    #[test]
+    fn structured_credentials_are_checked_after_unicode_decoding() {
+        for json in [
+            r#"{"\u0074oken": "sensitive-value"}"#,
+            r#"{"\u0070ass\u0077ord": "sensitive-value"}"#,
+            r#"{"setting": "\u0070ass\u0077ord sensitive-value"}"#,
+            r#"{"nested": [{"api\u004bey": "sensitive-value"}]}"#,
+            r#"{"setting": "https\u003a//user:pass@example.test"}"#,
+            r#"{"setting": "\u0062earer sensitive-value", "setting": false}"#,
+        ] {
+            assert!(!safe_text("config/example.JSON", json.as_bytes()));
+        }
+        for toml in [
+            r#""\u0074oken" = "sensitive-value""#,
+            r#""\u0070ass\u0077ord" = "sensitive-value""#,
+            r#"setting = "\u0070ass\u0077ord sensitive-value""#,
+            "[nested]\n\"api\\u004bey\" = \"sensitive-value\"",
+            r#"setting = "https\u003a//user:pass@example.test""#,
+            r#"setting = "\u0062earer sensitive-value""#,
+        ] {
+            assert!(!safe_text("config/example.TOML", toml.as_bytes()));
+        }
+        assert!(safe_text("config/example.json", br#"{"\u0065nabled": true, "list": [null, 1, 2.5, "recipe"]}"#));
+        assert!(safe_text("config/example.toml", b"[general]\nenabled = true\nitems = [1, 2]\n"));
+        assert!(!safe_text("config/example.json", b"{bad json"));
+        assert!(!safe_text("config/example.toml", b"enabled = ["));
+        assert!(!safe_text("scripts/example.js", br#"settings["\u0074oken"] = "sensitive-value";"#));
+        assert!(!safe_text("config/example.toml", b"enabled = true\n# password = private-value\n"));
+        assert!(!safe_text("config/example.toml", b"enabled = true\n# https://private.example.test\n"));
+        assert!(!safe_text("config/example.xml", br#"<pass&#x77;ord>sensitive-value</pass&#x77;ord>"#));
+        for content in [
+            r#"setting = "\U00000070assword""#,
+            r#"setting = "\160assword""#,
+            r#"setting = "\N{LATIN SMALL LETTER P}assword""#,
+        ] {
+            assert!(!safe_text("scripts/example.lua", content.as_bytes()));
+        }
+    }
+
+    #[tokio::test]
+    async fn escaped_credentials_abort_export_without_echo_or_publication() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let config = source.path().join("config");
+        fs::create_dir(&config).unwrap();
+        let instance = InstanceSummary {
+            id: "private-export-test".into(), name: "Private export".into(),
+            minecraft_version: "1.21.1".into(), loader: ModLoader::Vanilla,
+            loader_version: None, mod_count: 0, created_at: 0,
+            root_path: source.path().to_string_lossy().into_owned(), icon: None,
+            last_played: None, total_play_seconds: 0,
+            modpack_version_label: None, modpack_project_uid: None,
+        };
+        for (filename, contents) in [
+            ("example.json", r#"{"\u0074oken": "credential-value-that-must-stay-private"}"#),
+            ("password.json", r#"{"\u0070ass\u0077ord": "credential-value-that-must-stay-private"}"#),
+            ("example.toml", r#""\u0074oken" = "credential-value-that-must-stay-private""#),
+            ("password.toml", r#""\u0070ass\u0077ord" = "credential-value-that-must-stay-private""#),
+        ] {
+            let file = config.join(filename);
+            fs::write(&file, contents).unwrap();
+            let target = output.path().join("shared.mrpack");
+            let error = export(&instance, &target, &CancelToken::new()).await.unwrap_err();
+            assert!(error.contains("Cannot export"));
+            assert!(!error.contains("credential-value-that-must-stay-private"));
+            assert!(!error.contains(contents));
+            assert!(!target.exists());
+            assert_eq!(fs::read_to_string(&file).unwrap(), contents);
+            fs::remove_file(file).unwrap();
+        }
+        assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
     }
 
     fn local() -> LocalFile {

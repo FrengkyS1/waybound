@@ -22,6 +22,37 @@ export type UpdateState =
   | "uptodate"
   | "error";
 
+// Updater work belongs to the app session, not a Settings component mount.
+let status: UpdateStatus = { state: "idle" };
+let installJob: Promise<UpdateStatus> | null = null;
+let checkJob: Promise<Update | null> | null = null;
+const subscribers = new Set<() => void>();
+
+export function getUpdateStatus(): UpdateStatus {
+  return status;
+}
+
+export function subscribeToUpdates(listener: () => void): () => void {
+  subscribers.add(listener);
+  return () => {
+    subscribers.delete(listener);
+  };
+}
+
+function publish(next: UpdateStatus) {
+  status = next;
+  subscribers.forEach((listener) => listener());
+}
+
+function checkForUpdate(): Promise<Update | null> {
+  if (!checkJob) {
+    checkJob = Promise.resolve().then(() => check()).finally(() => {
+      checkJob = null;
+    });
+  }
+  return checkJob;
+}
+
 /**
  * A lightweight, silent check-only probe for use at startup — never installs
  * anything. Returns the version string of an available update, or `null`
@@ -31,7 +62,8 @@ export type UpdateState =
  */
 export async function fetchAvailableUpdate(): Promise<string | null> {
   try {
-    const update = await check();
+    if (installJob) return (await installJob).version ?? null;
+    const update = await checkForUpdate();
     return update ? update.version : null;
   } catch {
     return null;
@@ -43,29 +75,36 @@ export async function fetchAvailableUpdate(): Promise<string | null> {
  * downloads and installs it (the convenience `downloadAndInstall` — the
  * installer runs and the app relaunches into the new version afterwards).
  *
- * Reports progress/phase changes through `onStatus`. Returns the final state
- * once the flow finishes or errors. Never throws: any failure (including an
- * unconfigured updater, e.g. when no pubkey/endpoint is set yet) is surfaced
- * as an `"error"` state with a readable `detail`.
+ * State and the single in-flight operation survive Settings navigation.
+ * Subscribers receive phase changes; the returned promise resolves to the
+ * final state. Failures become an `"error"` state with readable `detail`.
  */
-export async function checkAndInstall(
-  onStatus: (s: UpdateStatus) => void,
-): Promise<UpdateStatus> {
-  onStatus({ state: "checking" });
+export function checkAndInstall(): Promise<UpdateStatus> {
+  if (installJob) return installJob;
+  installJob = Promise.resolve().then(runCheckAndInstall).then((result) => {
+    // A successful passive installer is terminal until the app restarts.
+    if (result.state !== "installing") installJob = null;
+    publish(result);
+    return result;
+  });
+  publish({ state: "checking" });
+  return installJob;
+}
+
+async function runCheckAndInstall(): Promise<UpdateStatus> {
 
   let update: Update | null;
   try {
-    update = await check();
+    update = await checkForUpdate();
   } catch (err) {
     return fail(err, "Couldn't reach the update server.");
   }
 
   if (!update) {
-    onStatus({ state: "uptodate" });
     return { state: "uptodate" };
   }
 
-  onStatus({
+  publish({
     state: "available",
     version: update.version,
     notes: update.body,
@@ -81,15 +120,16 @@ export async function checkAndInstall(
     await update.downloadAndInstall((event) => {
       if (event.event === "Started") {
         total = event.data.contentLength ?? 0;
+        publish({ state: "downloading", version: update.version });
       } else if (event.event === "Progress") {
         downloaded += event.data.chunkLength;
-        onStatus({
+        publish({
           state: "downloading",
           version: update.version,
           progress: total > 0 ? downloaded / total : undefined,
         });
       } else if (event.event === "Finished") {
-        onStatus({ state: "installing", version: update.version });
+        publish({ state: "installing", version: update.version });
       }
     });
   } catch (err) {

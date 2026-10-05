@@ -39,7 +39,6 @@ export function BrowsePage({
 }: BrowsePageProps) {
   const results = useBrowseStore((s) => s.results);
   const totalHits = useBrowseStore((s) => s.totalHits);
-  const query = useBrowseStore((s) => s.query);
   const loading = useBrowseStore((s) => s.loading);
   const error = useBrowseStore((s) => s.error);
   const warnings = useBrowseStore((s) => s.warnings);
@@ -92,11 +91,13 @@ export function BrowsePage({
     listRef.current?.scrollTo({ top: 0 });
   }, [offset]);
 
-  const pageStart = totalHits === 0 ? 0 : offset + 1;
-  // Cross-source dedup can merge two full pages' worth of hits into fewer
-  // unique results, so the page-end count must reflect what's actually
-  // rendered, not the raw per-source page size.
-  const pageEnd = Math.min(offset + results.length, totalHits);
+  const pageStart = results.length === 0 ? 0 : offset + 1;
+  const pageEnd = offset + results.length;
+  const pageSummary = results.length > 0
+    ? `${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} of ${totalHits.toLocaleString()}`
+    : offset > 0
+      ? `No results on this page · ${totalHits.toLocaleString()} results`
+      : "0 results";
   const hasPrev = offset > 0;
   const hasNext = offset + limit < totalHits;
 
@@ -161,10 +162,7 @@ export function BrowsePage({
           {loading && <span className={styles.status}>Loading…</span>}
           {!loading && !error && (
             <span className={styles.status}>
-              {totalHits > 0
-                ? `${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} of ${totalHits.toLocaleString()}`
-                : "0 results"}
-              {!query.trim() && " · Modrinth"}
+              {pageSummary}
             </span>
           )}
           {error && <span className={styles.error}>{error}</span>}
@@ -199,10 +197,13 @@ export function BrowsePage({
       <div className={styles.list} role="list" ref={listRef}>
         {!loading && results.length === 0 && !error && (
           <div className={styles.empty}>
-            <p className={styles.emptyTitle}>No results</p>
+            <p className={styles.emptyTitle}>
+              {hasPrev ? "No results on this page" : "No results"}
+            </p>
             <p className={styles.emptyHint}>
-              Try a different search term, or clear the version/loader filters
-              above.
+              {hasPrev
+                ? "Go back to the previous page, or change your search and filters."
+                : "Try a different search term, or clear the version/loader filters above."}
             </p>
           </div>
         )}
@@ -222,7 +223,7 @@ export function BrowsePage({
         ))}
       </div>
 
-      {totalHits > limit && (
+      {(hasPrev || hasNext) && (
         <nav className={styles.pagination} aria-label="Pagination">
           <button
             type="button"
@@ -233,8 +234,7 @@ export function BrowsePage({
             ← Previous
           </button>
           <span className={styles.pageInfo}>
-            {pageStart.toLocaleString()}–{pageEnd.toLocaleString()} of{" "}
-            {totalHits.toLocaleString()}
+            {pageSummary}
           </span>
           <button
             type="button"

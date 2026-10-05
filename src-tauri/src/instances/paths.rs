@@ -245,11 +245,8 @@ mod instance_id_containment_tests {
     }
 
     #[test]
-    fn a_name_with_a_colon_is_not_treated_as_a_drive_prefix() {
-        // Only a single-letter drive spec is a Windows path prefix; anything
-        // else stays a normal component and remains inside the root.
-        let root = instances_root().unwrap();
-        let joined = instance_root("weird:name").unwrap();
-        assert!(joined.starts_with(&root), "{joined:?} escaped {root:?}");
+    fn a_colon_in_an_instance_id_is_rejected_as_an_unsafe_filename() {
+        // A colon can address an NTFS alternate data stream, not an instance.
+        assert!(matches!(instance_root("weird:name"), Err(PathError::UnsafeInstanceId(_))));
     }
 }

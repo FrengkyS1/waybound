@@ -3,7 +3,7 @@ use crate::dto::project_detail::{BodyFormat, GalleryItem, ModDetail, ModVersionS
 use crate::dto::{
     ContentType, ModLoader, ModSearchQuery, ModSearchResult, ModSource, ModSummary, SortIndex,
 };
-use crate::instances::ResolvedDownload;
+use crate::instances::{ResolvedDependency, ResolvedDownload};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -157,14 +157,19 @@ impl ModrinthClient {
             loaders.dedup();
         }
 
+        let mut updated_summary = summary.clone();
+        updated_summary.uid = format!("modrinth:{}", project.id);
+        updated_summary.modrinth_id = Some(project.id);
+        updated_summary.loaders = loaders.clone();
         let (mc, loader) = pick_suggested_mc_loader(&versions, &loaders);
+        let suggested_instance = suggest_instance_from_mod(&updated_summary, &mc, loader);
         let body = project.body.unwrap_or_else(|| project.description.clone());
         let external_url = project.url.or_else(|| {
             Some(format!("https://modrinth.com/project/{project_id}"))
         });
 
         Ok(ModDetail {
-            summary: summary.clone(),
+            summary: updated_summary,
             body,
             body_format: BodyFormat::Markdown,
             categories: project.categories,
@@ -183,7 +188,7 @@ impl ModrinthClient {
                 })
                 .collect(),
             versions: version_summaries,
-            suggested_instance: suggest_instance_from_mod(summary, &mc, loader),
+            suggested_instance,
         })
     }
 
@@ -216,19 +221,10 @@ impl ModrinthClient {
         version_id: &str,
         mc_version: &str,
         loader: ModLoader,
+        content_type: ContentType,
     ) -> Result<ResolvedDownload, ModrinthError> {
-        let response = self
-            .http
-            .get(format!("{BASE_URL}/version/{version_id}"))
-            .send()
-            .await?
-            .error_for_status()?;
-        let version: ModrinthVersion = decode_json(response).await?;
-        // The version picker lists every release; this guard is what stops an
-        // easy mis-click ("Add" on a row tagged Fabric) from installing it
-        // into a NeoForge instance.
-        ensure_version_matches(&version, mc_version, loader)?;
-        version_to_download(&version).ok_or(ModrinthError::NotFound)
+        let version = self.fetch_version_detail(version_id).await?;
+        resolve_version_detail(&version, mc_version, loader, content_type)
     }
 
     pub async fn resolve_download(
@@ -248,30 +244,18 @@ impl ModrinthClient {
             return self.query_versions(project_id, None, None).await;
         }
 
-        let loader_name = loader.as_modrinth();
+        let required_loader = (content_type == ContentType::Mod).then(|| loader.as_modrinth());
         if let Ok(download) = self
-            .query_versions(project_id, Some(mc_version), Some(loader_name))
+            .query_versions(project_id, Some(mc_version), required_loader)
             .await
         {
             return Ok(download);
         }
-        if content_type != ContentType::Mod {
-            // Resourcepacks and other loader-agnostic content legitimately
-            // have no loader tag to match — fall back to a game-version-only
-            // match for them. Mods do NOT get this fallback: a build for the
-            // right MC version but the wrong loader is useless in this
-            // instance, and silently installing e.g. the Fabric jar into a
-            // NeoForge instance is exactly the bug this guard exists for.
-            if let Ok(download) = self
-                .query_versions(project_id, Some(mc_version), None)
-                .await
-            {
-                return Ok(download);
-            }
-        }
 
+        // Widen only the upstream query, never local compatibility checks.
         let versions = self.fetch_all_versions(project_id).await?;
-        pick_mod_version(&versions, mc_version, loader).ok_or(ModrinthError::NotFound)
+        pick_compatible_version(&versions, Some(mc_version), required_loader)
+            .ok_or(ModrinthError::NotFound)
     }
 
     /// Every file's own project name + icon, resolved by content hash —
@@ -413,7 +397,7 @@ impl ModrinthClient {
                 serde_json::to_string(&[version]).unwrap_or_else(|_| "[]".into()),
             ));
         }
-        if let Some(loader) = loader.filter(|v| !v.is_empty() && *v != "minecraft") {
+        if let Some(loader) = loader.filter(|v| !v.is_empty()) {
             query.push((
                 "loaders",
                 serde_json::to_string(&[loader]).unwrap_or_else(|_| "[]".into()),
@@ -430,8 +414,7 @@ impl ModrinthClient {
         let response = request.send().await?.error_for_status()?;
         let versions: Vec<ModrinthVersion> = decode_json(response).await?;
         let sorted = sort_versions_newest_first(versions);
-        pick_newest_stable(&sorted)
-            .and_then(version_to_download)
+        pick_compatible_version(&sorted, mc_version, loader)
             .ok_or(ModrinthError::NotFound)
     }
 
@@ -472,55 +455,6 @@ impl ModrinthClient {
             curseforge_id: None,
             modrinth_id: Some(project.id),
         })
-    }
-
-    /// Project ids the version that `query_versions` would pick declares as
-    /// hard requirements.
-    ///
-    /// Deliberately best-effort: this drives an *extra* convenience install,
-    /// so a lookup failure has to leave the user with the mod they actually
-    /// asked for rather than failing the whole operation. Only
-    /// `dependency_type == "required"` counts — `optional` is the user's
-    /// call, `incompatible` must never be installed, and `embedded` is
-    /// already inside the jar.
-    pub(crate) async fn required_dependency_ids(
-        &self,
-        project_id: &str,
-        mc_version: &str,
-        loader: &str,
-    ) -> Vec<String> {
-        let mut request = self
-            .http
-            .get(format!("{BASE_URL}/project/{project_id}/version"));
-        if !mc_version.is_empty() {
-            request = request.query(&[(
-                "game_versions",
-                serde_json::to_string(&[mc_version]).unwrap_or_else(|_| "[]".into()),
-            )]);
-        }
-        if !loader.is_empty() && loader != "minecraft" {
-            request = request.query(&[(
-                "loaders",
-                serde_json::to_string(&[loader]).unwrap_or_else(|_| "[]".into()),
-            )]);
-        }
-
-        let Ok(response) = request.send().await else {
-            return Vec::new();
-        };
-        let Ok(response) = response.error_for_status() else {
-            return Vec::new();
-        };
-        let Ok(versions) = decode_json::<Vec<ModrinthVersion>>(response).await else {
-            return Vec::new();
-        };
-
-        // Same ordering as `query_versions`, so the dependencies reported
-        // belong to the version that actually gets downloaded.
-        let sorted = sort_versions_newest_first(versions);
-        pick_newest_stable(&sorted)
-            .map(|version| required_dependency_ids_of(version))
-            .unwrap_or_default()
     }
 
     async fn fetch_all_versions(&self, project_id: &str) -> Result<Vec<ModrinthVersion>, ModrinthError> {
@@ -671,6 +605,7 @@ pub struct ModrinthVersion {
 #[derive(Debug, Deserialize)]
 pub struct ModrinthVersionDependency {
     pub project_id: Option<String>,
+    pub version_id: Option<String>,
     #[serde(default)]
     pub dependency_type: String,
     pub file_name: Option<String>,
@@ -678,6 +613,7 @@ pub struct ModrinthVersionDependency {
 
 #[derive(Debug, Deserialize)]
 struct ModrinthProject {
+    id: String,
     description: String,
     body: Option<String>,
     #[serde(default)]
@@ -748,25 +684,23 @@ fn pick_suggested_mc_loader(
     (mc, loader)
 }
 
-/// The `required` dependencies of one version, deduplicated and in declared
-/// order. Split out from the network call above purely so the filtering
-/// rules (which types count, dropping the id-less entries Modrinth uses for
-/// "some file, no project") are testable without HTTP.
-pub(crate) fn required_dependency_ids_of(version: &ModrinthVersion) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Requirements from this exact version. Keep version-only dependencies and
+/// distinct pins for the same project; closure resolution must not pick latest.
+pub(crate) fn required_dependencies_of(version: &ModrinthVersion) -> Vec<ResolvedDependency> {
+    let mut out = Vec::new();
     for dep in &version.dependencies {
         if dep.dependency_type != "required" {
             continue;
         }
-        // A dependency can name a bare file with no project behind it;
-        // there's nothing resolvable to install in that case.
-        let Some(project_id) = dep.project_id.as_deref() else {
-            continue;
-        };
-        if project_id.is_empty() || out.iter().any(|seen| seen == project_id) {
+        let project_id = dep.project_id.clone().filter(|id| !id.is_empty());
+        let version_id = dep.version_id.clone().filter(|id| !id.is_empty());
+        if project_id.is_none() && version_id.is_none() {
             continue;
         }
-        out.push(project_id.to_string());
+        let required = ResolvedDependency::Modrinth { project_id, version_id };
+        if !out.contains(&required) {
+            out.push(required);
+        }
     }
     out
 }
@@ -779,23 +713,10 @@ fn is_stable_channel(version_type: &str) -> bool {
     version_type != "beta" && version_type != "alpha"
 }
 
-/// Newest-first input, stable-preferred pick — the shared "which version"
-/// rule for every unpinned resolution path.
-fn pick_newest_stable<'a>(versions: &'a [ModrinthVersion]) -> Option<&'a ModrinthVersion> {
-    versions
-        .iter()
-        .find(|v| is_stable_channel(&v.version_type))
-        .or_else(|| versions.first())
-}
 
-/// Modrinth's `/version` listing has no documented sort guarantee — relying
-/// on whatever order it happens to come back in silently installed a
-/// months-old release once (6.12.0 instead of a since-published 7.4.1,
-/// breaking every mod in a pack that declared a minimum version against it).
-/// `date_published` is an ISO 8601 string, so a plain string sort is already
-/// chronologically correct with no parsing needed.
+/// The API has no sort guarantee; normalize UTC fractions before ordering.
 fn sort_versions_newest_first(mut versions: Vec<ModrinthVersion>) -> Vec<ModrinthVersion> {
-    versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
+    versions.sort_by(|a, b| crate::sources::updated_key(&b.date_published).cmp(&crate::sources::updated_key(&a.date_published)));
     versions
 }
 
@@ -808,61 +729,63 @@ fn version_to_download(version: &ModrinthVersion) -> Option<ResolvedDownload> {
     Some(ResolvedDownload {
         url: file.url.clone(),
         filename: file.filename.clone(),
+        curseforge_file_id: None,
         hashes: file.hashes.clone(),
+        dependencies: required_dependencies_of(version),
     })
 }
 
-fn pick_mod_version(
-    versions: &[ModrinthVersion],
+/// Resolve an already-fetched exact version without another API request.
+pub(crate) fn resolve_version_detail(
+    version: &ModrinthVersion,
     mc_version: &str,
     loader: ModLoader,
+    content_type: ContentType,
+) -> Result<ResolvedDownload, ModrinthError> {
+    ensure_version_matches(version, mc_version, loader, content_type)?;
+    version_to_download(version).ok_or(ModrinthError::NotFound)
+}
+
+fn pick_compatible_version(
+    versions: &[ModrinthVersion],
+    mc_version: Option<&str>,
+    loader: Option<&str>,
 ) -> Option<ResolvedDownload> {
-    let loader_name = loader.as_modrinth();
-    // Stable pass, then any pass: a beta-only mod still resolves rather
-    // than erroring, but never shadows a release.
+    // Input is newest-first. Prefer stable only within compatible versions.
     for stable_only in [true, false] {
         for version in versions {
             if stable_only && !is_stable_channel(&version.version_type) {
                 continue;
             }
-            if !version.game_versions.iter().any(|v| v == mc_version) {
-                continue;
-            }
-            if version.loaders.iter().any(|l| l == loader_name)
-                || loader == ModLoader::Vanilla
-            {
+            if version_matches(version, mc_version, loader) {
                 if let Some(download) = version_to_download(version) {
                     return Some(download);
                 }
             }
         }
     }
-    // Deliberately no any-loader / any-version fallback: this path only runs
-    // when the filtered query found nothing, and for mods a wrong-loader jar
-    // is worse than an honest "no compatible file" error.
     None
 }
 
-/// Rejects a specific version that doesn't list the instance's game version
-/// or loader. Untagged fields pass (Modrinth marks resourcepacks with empty
-/// `loaders`, and game-version lists are occasionally incomplete), Vanilla
-/// targets pass the loader check.
+fn version_matches(version: &ModrinthVersion, mc_version: Option<&str>, loader: Option<&str>) -> bool {
+    mc_version.filter(|value| !value.is_empty()).map_or(true, |expected| {
+        version.game_versions.iter().any(|value| value == expected)
+    }) && loader.filter(|value| !value.is_empty()).map_or(true, |expected| {
+        version.loaders.iter().any(|value| value == expected)
+    })
+}
+
+/// Pinned mods require a matching loader. Loader-agnostic content is validated
+/// only against the game version, not the instance's mod loader.
 fn ensure_version_matches(
     version: &ModrinthVersion,
     mc_version: &str,
     loader: ModLoader,
+    content_type: ContentType,
 ) -> Result<(), ModrinthError> {
-    let mc_ok = mc_version.is_empty()
-        || version.game_versions.is_empty()
-        || version.game_versions.iter().any(|v| v == mc_version);
-    if !mc_ok {
+    let required_loader = (content_type == ContentType::Mod).then(|| loader.as_modrinth());
+    if !version_matches(version, Some(mc_version), required_loader) {
         return Err(ModrinthError::Incompatible);
-    }
-    if loader != ModLoader::Vanilla && !version.loaders.is_empty() {
-        let want = loader.as_modrinth();
-        if !want.is_empty() && !version.loaders.iter().any(|l| l == want) {
-            return Err(ModrinthError::Incompatible);
-        }
     }
     Ok(())
 }
@@ -890,6 +813,7 @@ impl ContentType {
     fn from_modrinth_categories(project_type: &str, categories: &[String]) -> Self {
         match project_type {
             "modpack" => ContentType::Modpack,
+            "resourcepack" => ContentType::Resourcepack,
             "shader" => ContentType::Shader,
             _ if categories.iter().any(|c| c == "resourcepack") => ContentType::Resourcepack,
             _ => ContentType::Mod,
@@ -990,82 +914,97 @@ mod version_tests {
             vec!["2026-07-24T00:00:00Z", "2026-03-01T00:00:00Z", "2026-01-01T00:00:00Z"]
         );
     }
+
+    #[test]
+    fn source_timestamp_precision_does_not_reverse_version_order() {
+        let sorted = sort_versions_newest_first(vec![
+            version_with_date("2026-01-01T00:00:00Z"),
+            version_with_date("2026-01-01T00:00:00.001Z"),
+            version_with_date("2026-01-01T00:00:00.01Z"),
+        ]);
+        assert_eq!(sorted[0].date_published, "2026-01-01T00:00:00.01Z");
+        assert_eq!(sorted[2].date_published, "2026-01-01T00:00:00Z");
+    }
 }
 
 #[cfg(test)]
 mod required_dependency_tests {
-    use super::{required_dependency_ids_of, ModrinthVersion, ModrinthVersionDependency};
+    use super::{ensure_version_matches, pick_compatible_version, required_dependencies_of, resolve_version_detail, version_to_download, ContentType, ModLoader, ModrinthVersion, ResolvedDependency};
 
-    fn dep(project_id: Option<&str>, dependency_type: &str) -> ModrinthVersionDependency {
-        ModrinthVersionDependency {
-            project_id: project_id.map(str::to_string),
-            dependency_type: dependency_type.to_string(),
-            file_name: None,
-        }
-    }
-
-    fn version_with(dependencies: Vec<ModrinthVersionDependency>) -> ModrinthVersion {
-        ModrinthVersion {
-            id: "v".to_string(),
-            name: String::new(),
-            version_number: String::new(),
-            date_published: "2026-01-01T00:00:00Z".to_string(),
-            changelog: None,
-            downloads: 0,
-            game_versions: Vec::new(),
-            loaders: Vec::new(),
-            dependencies,
-            files: Vec::new(),
-            project_id: String::new(),
-            version_type: String::new(),
-        }
+    fn fixture() -> ModrinthVersion {
+        serde_json::from_value(serde_json::json!({
+            "id": "chosen", "project_id": "parent", "name": "Chosen",
+            "version_number": "1.0", "date_published": "2026-01-01T00:00:00Z",
+            "game_versions": ["1.21.1"], "loaders": ["fabric"],
+            "files": [{"url": "https://cdn.modrinth.com/chosen.jar", "filename": "chosen.jar", "primary": true}],
+            "dependencies": [
+                {"project_id": "library", "version_id": "exact-old-beta", "dependency_type": "required"},
+                {"project_id": null, "version_id": "version-only", "dependency_type": "required"},
+                {"project_id": "library", "version_id": "exact-old-beta", "dependency_type": "required"},
+                {"project_id": "library", "version_id": "another-pin", "dependency_type": "required"},
+                {"project_id": "optional", "version_id": "optional-pin", "dependency_type": "optional"},
+                {"project_id": "bad", "dependency_type": "incompatible"},
+                {"file_name": "external.jar", "dependency_type": "required"}
+            ]
+        })).unwrap()
     }
 
     #[test]
-    fn keeps_only_required_dependencies() {
-        // Installing an `incompatible` entry would actively break the
-        // instance, and `optional` is the user's call to make — auto-pulling
-        // either turns a convenience into a surprise.
-        let version = version_with(vec![
-            dep(Some("REQUIRED1"), "required"),
-            dep(Some("OPTIONAL1"), "optional"),
-            dep(Some("INCOMPAT1"), "incompatible"),
-            dep(Some("EMBEDDED1"), "embedded"),
-            dep(Some("REQUIRED2"), "required"),
-        ]);
-
-        assert_eq!(
-            required_dependency_ids_of(&version),
-            vec!["REQUIRED1".to_string(), "REQUIRED2".to_string()],
-        );
+    fn resolved_download_preserves_exact_and_version_only_requirements() {
+        let version = fixture();
+        let expected = vec![
+            ResolvedDependency::Modrinth { project_id: Some("library".into()), version_id: Some("exact-old-beta".into()) },
+            ResolvedDependency::Modrinth { project_id: None, version_id: Some("version-only".into()) },
+            ResolvedDependency::Modrinth { project_id: Some("library".into()), version_id: Some("another-pin".into()) },
+        ];
+        assert_eq!(required_dependencies_of(&version), expected);
+        assert_eq!(version_to_download(&version).unwrap().dependencies, expected);
+        assert_eq!(resolve_version_detail(&version, "1.21.1", ModLoader::Fabric, ContentType::Mod)
+            .unwrap().dependencies, expected);
     }
 
     #[test]
-    fn skips_dependencies_that_name_no_project() {
-        // Modrinth allows a dependency on a bare filename with no project
-        // behind it; there is nothing resolvable to install for those.
-        let version = version_with(vec![
-            dep(None, "required"),
-            dep(Some(""), "required"),
-            dep(Some("REAL"), "required"),
-        ]);
-
-        assert_eq!(required_dependency_ids_of(&version), vec!["REAL".to_string()]);
+    fn pinned_mods_reject_wrong_or_missing_loader() {
+        let mut version = fixture();
+        assert!(ensure_version_matches(&version, "1.21.1", ModLoader::Forge, ContentType::Mod).is_err());
+        assert!(resolve_version_detail(&version, "1.21.1", ModLoader::Forge, ContentType::Mod).is_err());
+        version.loaders.clear();
+        assert!(ensure_version_matches(&version, "1.21.1", ModLoader::Fabric, ContentType::Mod).is_err());
+        version.loaders.push("minecraft".into());
+        assert!(ensure_version_matches(&version, "1.21.1", ModLoader::Fabric, ContentType::Resourcepack).is_ok());
+        assert!(ensure_version_matches(&version, "1.20.1", ModLoader::Fabric, ContentType::Resourcepack).is_err());
+        version.game_versions.clear();
+        assert!(ensure_version_matches(&version, "1.21.1", ModLoader::Fabric, ContentType::Resourcepack).is_err());
+        version.game_versions.push("1.21.1".into());
+        version.loaders = vec!["fabric".into()];
+        assert!(ensure_version_matches(&version, "1.21.1", ModLoader::Vanilla, ContentType::Mod).is_err());
     }
 
     #[test]
-    fn deduplicates_repeated_project_ids() {
-        let version = version_with(vec![
-            dep(Some("SAME"), "required"),
-            dep(Some("SAME"), "required"),
-        ]);
-
-        assert_eq!(required_dependency_ids_of(&version), vec!["SAME".to_string()]);
+    fn resourcepack_project_type_needs_no_category_hint() {
+        assert_eq!(ContentType::from_modrinth_categories("resourcepack", &[]), ContentType::Resourcepack);
     }
 
     #[test]
-    fn a_version_with_no_dependencies_yields_none() {
-        assert!(required_dependency_ids_of(&version_with(Vec::new())).is_empty());
+    fn unpinned_compatibility_is_checked_locally_before_stable_preference() {
+        let mut wrong_loader = fixture();
+        wrong_loader.loaders = vec!["forge".into()];
+        wrong_loader.files[0].filename = "wrong-loader.jar".into();
+        let mut beta = fixture();
+        beta.version_type = "beta".into();
+        beta.files[0].filename = "beta.jar".into();
+        let mut stable = fixture();
+        stable.files[0].filename = "stable.jar".into();
+        let versions = [wrong_loader, beta, stable];
+        let download = pick_compatible_version(&versions, Some("1.21.1"), Some("fabric")).unwrap();
+        assert_eq!(download.filename, "stable.jar");
+        assert_eq!(download.dependencies, required_dependencies_of(&versions[2]));
+        assert!(pick_compatible_version(&versions, Some("1.20.1"), Some("fabric")).is_none());
+        assert!(pick_compatible_version(&versions, Some("1.21.1"), Some("minecraft")).is_none());
+        // A specific beta pin is not silently replaced with the stable release.
+        assert!(ensure_version_matches(&versions[1], "1.21.1", ModLoader::Fabric, ContentType::Mod).is_ok());
+        assert_eq!(resolve_version_detail(&versions[1], "1.21.1", ModLoader::Fabric, ContentType::Mod)
+            .unwrap().filename, "beta.jar");
     }
 }
 
@@ -1119,7 +1058,7 @@ mod version_files_lookup_tests {
 
 #[cfg(test)]
 mod channel_tests {
-    use super::{is_stable_channel, pick_newest_stable, ModrinthVersion};
+    use super::{is_stable_channel, pick_compatible_version, ModrinthVersion, ModrinthVersionFile};
 
     fn version(id: &str, version_type: &str) -> ModrinthVersion {
         ModrinthVersion {
@@ -1132,7 +1071,12 @@ mod channel_tests {
             game_versions: Vec::new(),
             loaders: Vec::new(),
             dependencies: Vec::new(),
-            files: Vec::new(),
+            files: vec![ModrinthVersionFile {
+                url: format!("https://example.com/{id}.jar"),
+                filename: format!("{id}.jar"),
+                primary: true,
+                hashes: Default::default(),
+            }],
             project_id: String::new(),
             version_type: version_type.to_string(),
         }
@@ -1142,11 +1086,11 @@ mod channel_tests {
     fn stable_wins_over_newer_prerelease_but_prerelease_still_resolves() {
         // Newest-first input with a beta on top: the release still wins.
         let versions = vec![version("beta", "beta"), version("release", "release")];
-        assert_eq!(pick_newest_stable(&versions).unwrap().id, "release");
+        assert_eq!(pick_compatible_version(&versions, None, None).unwrap().filename, "release.jar");
         // Beta-only project: resolves rather than erroring.
         let versions = vec![version("beta", "beta")];
-        assert_eq!(pick_newest_stable(&versions).unwrap().id, "beta");
-        assert!(pick_newest_stable(&[]).is_none());
+        assert_eq!(pick_compatible_version(&versions, None, None).unwrap().filename, "beta.jar");
+        assert!(pick_compatible_version(&[], None, None).is_none());
     }
 
     #[test]
