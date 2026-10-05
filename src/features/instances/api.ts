@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { InstallModResult } from "../browse/detailTypes";
+import type { ModSummary } from "../browse/types";
 import type {
   CreateInstanceInput,
   DetectedLauncher,
@@ -48,6 +50,7 @@ export async function duplicateInstance(instanceId: string): Promise<InstanceSum
 export type ContentCategory = "mod" | "resourcepack" | "shaderpack";
 
 export interface ContentEntry {
+  /** Exact physical basename, including `.disabled`; also identifies cache/config lookups. */
   fileName: string;
   /** The mod's own declared display name, when readable from its jar. */
   name?: string;
@@ -116,7 +119,7 @@ export async function updateModInInstance(
   fileName: string,
   installId: string,
   versionId?: string,
-): Promise<import("../browse/detailTypes").InstallModResult> {
+): Promise<InstallModResult> {
   return invoke("update_mod_in_instance", { instanceId, fileName, installId, versionId });
 }
 
@@ -126,21 +129,21 @@ export async function updateModInInstance(
 export async function fetchModSummaryForContent(
   instanceId: string,
   fileName: string,
-): Promise<import("../browse/types").ModSummary> {
+): Promise<ModSummary> {
   return invoke("get_mod_summary_for_content", { instanceId, fileName });
 }
 
 export interface IdentifiedMod {
   fileName: string;
-  summary: import("../browse/types").ModSummary;
+  summary: ModSummary;
   versionId: string;
   versionNumber: string;
   matchedFileName?: string;
 }
 
-/** Identifies an on-disk jar by content hash (Modrinth, then CurseForge
- * fingerprints) — the fallback for files `fetchModSummaryForContent`
- * rejects. Returns the project plus the exact matched version. */
+/** Identifies exact file bytes on their known original source, or tries both
+ * sources for untracked bytes. Records that physical file before returning,
+ * so version changes share atomic tracked updates and preserve disabled state. */
 export async function identifyModFile(
   instanceId: string,
   fileName: string,
@@ -164,6 +167,11 @@ export async function listModConfigs(
   return invoke("list_mod_configs", { instanceId, fileName });
 }
 
+/** All editable files under the instance's config/ folder. */
+export async function listInstanceConfigs(instanceId: string): Promise<ConfigFileEntry[]> {
+  return invoke("list_instance_configs", { instanceId });
+}
+
 export async function readConfigFile(
   instanceId: string,
   relativePath: string,
@@ -175,8 +183,9 @@ export async function writeConfigFile(
   instanceId: string,
   relativePath: string,
   contents: string,
+  expectedContents: string,
 ): Promise<void> {
-  await invoke("write_config_file", { instanceId, relativePath, contents });
+  await invoke("write_config_file", { instanceId, relativePath, contents, expectedContents });
 }
 
 export async function setInstanceIcon(
@@ -244,6 +253,34 @@ export interface ServerEntry {
 /** Singleplayer worlds from `saves/` — read-only list, no launching. */
 export async function fetchInstanceWorlds(instanceId: string): Promise<WorldEntry[]> {
   return invoke<WorldEntry[]>("list_instance_worlds", { instanceId });
+}
+
+/** Text-editable files inside one world folder, paths relative to the
+ * world folder — pass straight back to readWorldFile/writeWorldFile.
+ * Empty (not an error) when the world has none editable in-app. */
+export async function listWorldFiles(
+  instanceId: string,
+  worldFolder: string,
+): Promise<ConfigFileEntry[]> {
+  return invoke("list_world_files", { instanceId, worldFolder });
+}
+
+export async function readWorldFile(
+  instanceId: string,
+  worldFolder: string,
+  relativePath: string,
+): Promise<string> {
+  return invoke("read_world_file", { instanceId, worldFolder, relativePath });
+}
+
+export async function writeWorldFile(
+  instanceId: string,
+  worldFolder: string,
+  relativePath: string,
+  contents: string,
+  expectedContents: string,
+): Promise<void> {
+  await invoke("write_world_file", { instanceId, worldFolder, relativePath, contents, expectedContents });
 }
 
 /** Saved multiplayer servers from `servers.dat` — read-only list. */

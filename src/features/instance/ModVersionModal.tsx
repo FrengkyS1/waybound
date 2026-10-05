@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchModDetails, installMod } from "../browse/api";
+import { fetchModDetails } from "../browse/api";
 import {
   fetchModSummaryForContent,
   identifyModFile,
-  removeContentFile,
   updateModInInstance,
   type IdentifiedMod,
 } from "../instances/api";
 import type { ModLoader } from "../instances/types";
 import type { ModVersionSummary } from "../browse/detailTypes";
+import { useInstallStore } from "../install/installStore";
 import { useEscapeKey } from "../../hooks/useEscapeKey";
 import { useModalFocus } from "../../hooks/useModalFocus";
 import styles from "./ModVersionModal.module.css";
@@ -17,8 +17,8 @@ interface ModVersionModalProps {
   instanceId: string;
   minecraftVersion: string;
   loader: ModLoader;
-  /** The installed jar's filename — exact-matched against each version's
-   * file to highlight what's on disk right now. */
+  /** Exact physical filename, including `.disabled`; upstream version
+   * comparisons use the unsuffixed logical filename. */
   fileName: string;
   modLabel: string;
   onClose: () => void;
@@ -48,41 +48,51 @@ export function ModVersionModal({
   onInstalled,
 }: ModVersionModalProps) {
   const [state, setState] = useState<LoadState>({ stage: "loading" });
-  // Set when the file has no tracking row and was identified by content
-  // hash instead — install then goes through the normal install path (plus
-  // old-file cleanup) rather than the tracked update path.
+  // Hash identification records the exact file before version updates use
+  // the same atomic tracked path, including disabled-state preservation.
   const [identified, setIdentified] = useState<IdentifiedMod | null>(null);
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
-  const cancelled = useRef(false);
+  const generation = useRef(0);
+  const runInstall = useInstallStore((s) => s.runInstall);
   const modalRef = useModalFocus();
   useEscapeKey(onClose);
 
   useEffect(() => {
-    cancelled.current = false;
+    let active = true;
+    generation.current++;
     setState({ stage: "loading" });
     setIdentified(null);
+    setInstallingId(null);
+    setInstallError(null);
     void fetchModSummaryForContent(instanceId, fileName)
-      .catch(() => identifyModFile(instanceId, fileName).then((found) => {
+      .catch((err) => {
+        if (!active) throw err;
+        return identifyModFile(instanceId, fileName).then((found) => {
         // Untracked file, identified by content hash — same versions list,
         // installed through the normal path below.
-        setIdentified(found);
+        if (active) setIdentified(found);
         return found.summary;
-      }))
-      .then((summary) => fetchModDetails(summary))
+        });
+      })
+      .then((summary) => {
+        if (!active) throw new Error("Versions request superseded");
+        return fetchModDetails(summary);
+      })
       .then((detail) => {
-        if (cancelled.current) return;
+        if (!active) return;
         setState({ stage: "ready", versions: detail.versions });
       })
       .catch((err) => {
-        if (cancelled.current) return;
+        if (!active) return;
         setState({
           stage: "error",
           message: err instanceof Error ? err.message : String(err),
         });
       });
     return () => {
-      cancelled.current = true;
+      active = false;
+      generation.current++;
     };
   }, [instanceId, fileName]);
 
@@ -90,38 +100,16 @@ export function ModVersionModal({
     if (installingId) return;
     setInstallError(null);
     setInstallingId(versionId);
-    const installId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-    try {
-      if (identified) {
-        // Untracked file: install the picked version normally, then drop
-        // the old jar when the new one lands under a different name (same
-        // cleanup the tracked update path does backend-side).
-        const result = await installMod(
-          {
-            modSummary: identified.summary,
-            source: identified.summary.sources[0] ?? null,
-            versionId,
-            instanceId,
-          },
-          installId,
-        );
-        const landed = result.installed?.fileName;
-        if (landed && landed !== fileName) {
-          await removeContentFile(instanceId, "mod", fileName);
-        }
-        onInstalled(result.message);
-      } else {
-        const result = await updateModInInstance(instanceId, fileName, installId, versionId);
-        onInstalled(result.message);
-      }
+    const request = generation.current;
+    const result = await runInstall(modLabel,
+      (installId) => updateModInInstance(instanceId, fileName, installId, versionId), instanceId);
+    if (request !== generation.current) return;
+    setInstallingId(null);
+    if (result) {
+      onInstalled(result.message);
       onClose();
-    } catch (err) {
-      setInstallError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInstallingId(null);
+    } else {
+      setInstallError("Install did not finish. See the background notification for details, then retry.");
     }
   }
 
@@ -166,7 +154,7 @@ export function ModVersionModal({
                 // file may have been renamed since).
                 const installed = identified
                   ? v.id === identified.versionId
-                  : v.fileName === fileName;
+                  : v.fileName === fileName.replace(/\.disabled$/, "");
                 const compatible =
                   v.gameVersions.includes(minecraftVersion) && v.loaders.includes(loader);
                 const busy = installingId === v.id;

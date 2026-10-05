@@ -1,10 +1,11 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import type { ModDetail, ModVersionSummary } from "../detailTypes";
 import type { InstanceSummary, ModLoader } from "../../instances/types";
 import type { ModSummary } from "../types";
+import type { VersionPrefill } from "../../settings/types";
 
 /**
  * `compatibleInstances` is module-private, so it is exercised through what
@@ -13,15 +14,18 @@ import type { ModSummary } from "../types";
  * module scope, so it has to be imported after the IPC mock exists — hence
  * the dynamic import inside each test.
  */
-async function renderDialog(instances: InstanceSummary[], detail: ModDetail) {
+async function renderDialog(instances: InstanceSummary[], detail: ModDetail, versionPrefill?: VersionPrefill, fixedInstanceId?: string) {
   mockIPC((cmd) => {
     if (cmd === "list_instances") return instances;
+    if (cmd === "list_pending_missing_mods") return [];
     return undefined;
   });
   const { InstallTargetDialog } = await import("./InstallTargetDialog");
   render(
     <InstallTargetDialog
       detail={detail}
+      versionPrefill={versionPrefill}
+      fixedInstanceId={fixedInstanceId}
       onClose={() => {}}
       onSuccess={() => {}}
     />,
@@ -55,7 +59,7 @@ function version(loaders: ModLoader[], gameVersions: string[]): ModVersionSummar
 
 function detailWith(versions: ModVersionSummary[]): ModDetail {
   const summary: ModSummary = {
-    uid: "mod:slug:sodium",
+    uid: "modrinth:sodium",
     slug: "sodium",
     name: "Sodium",
     description: "",
@@ -177,5 +181,48 @@ describe("InstallTargetDialog instance compatibility filter", () => {
 
     expect(await screen.findByLabelText(/Instance name/)).toBeInTheDocument();
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  });
+
+  it("uses the exact selected version instead of another compatible release", async () => {
+    const pinned = version(["fabric"], ["1.20.1"]);
+    await renderDialog(
+      [instance("forge", "forge", "1.21"), instance("fabric", "fabric", "1.20.1")],
+      detailWith([version(["forge"], ["1.21"]), pinned]),
+      { versionId: pinned.id, minecraftVersion: "1.20.1", loader: "fabric" },
+    );
+    await waitFor(async () => expect(await optionLabels()).toEqual(["fabric"]));
+    expect(screen.getByRole("button", { name: "Install" })).toBeEnabled();
+  });
+
+  it("blocks a locked instance when only another project version supports it", async () => {
+    const pinned = version(["fabric"], ["1.20.1"]);
+    await renderDialog(
+      [instance("forge", "forge", "1.21")],
+      detailWith([version(["forge"], ["1.21"]), pinned]),
+      { versionId: pinned.id, minecraftVersion: "1.20.1", loader: "fabric" },
+      "forge",
+    );
+    expect(await screen.findByText(/incompatible with the selected version/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install" })).toBeDisabled();
+  });
+
+  it("disables all unmatched existing targets and incompatible new target selections", async () => {
+    await renderDialog(
+      [instance("forge", "forge", "1.20.1")],
+      detailWith([version(["fabric"], ["1.20.1"])]),
+    );
+    const option = await screen.findByRole("option");
+    expect(option).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Install" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Create new instance" }));
+    expect(screen.getByRole("button", { name: "Install" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "forge" }));
+    expect(screen.getByRole("button", { name: "Install" })).toBeDisabled();
+  });
+
+  it("does not treat missing Minecraft metadata as compatibility", async () => {
+    await renderDialog([instance("fabric", "fabric", "1.20.1")], detailWith([version(["fabric"], [])]));
+    expect(await screen.findByRole("option")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Install" })).toBeDisabled();
   });
 });

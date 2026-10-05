@@ -4,12 +4,14 @@ import { create } from "zustand";
 import {
   addPlayTime,
   cancelLaunch,
+  cancelMicrosoftLogin,
   getAccount,
   getRunningInstances,
   launchInstance,
   logout,
   microsoftLogin,
   readLaunchLog,
+  stopGame,
   type AccountPublic,
   type DeviceCodePrompt,
   type LaunchExitedEvent,
@@ -61,12 +63,18 @@ interface PlayStore {
   init: () => Promise<void>;
   signIn: () => Promise<AccountPublic | null>;
   signOut: () => Promise<void>;
+  cancelSignIn: () => Promise<void>;
   refreshAccount: () => Promise<void>;
   play: (instanceId: string, instanceName: string) => Promise<void>;
   /** Signals the backend to stop an in-flight prepare/download at its next await point. */
   cancelLaunch: (instanceId: string) => void;
+  /** Force-kills a running game. The backend reports the exit as
+   * user-stopped rather than crashed. No-op when nothing is running. */
+  stopGame: (instanceId: string) => void;
+  /** Collapses the bottom-right launch dock to a peek tab (session-only). */
+  launchDockMinimized: boolean;
+  setLaunchDockMinimized: (minimized: boolean) => void;
   dismissLaunch: (instanceId: string) => void;
-  clearDevicePrompt: () => void;
   clearLogs: (instanceId: string) => void;
   /** Fills the Logs tab from the instance's persisted log file when this
    * session has nothing in memory for it — a crash from before the app was
@@ -79,6 +87,8 @@ const LOG_FLUSH_MS = 150;
 let listenersReady = false;
 /** Instances whose on-disk log has already been offered to this session. */
 const restoredFromDisk = new Set<string>();
+let activeLoginId: string | null = null;
+let loginCancelled = false;
 
 // A chatty modpack can emit hundreds of log lines per second. Applying each
 // one as its own store update floods React with re-renders (the always-mounted
@@ -95,6 +105,9 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
   launches: {},
   logsByInstance: {},
   refreshTick: 0,
+  launchDockMinimized: false,
+
+  setLaunchDockMinimized: (minimized) => set({ launchDockMinimized: minimized }),
 
   init: async () => {
     if (!listenersReady) {
@@ -142,15 +155,30 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
   },
 
   signIn: async () => {
+    if (get().signingIn) return null;
+    const loginId = crypto.randomUUID();
+    activeLoginId = loginId;
+    loginCancelled = false;
     set({ signingIn: true, devicePrompt: null });
     try {
-      const account = await microsoftLogin();
-      set({ account, signingIn: false, devicePrompt: null });
+      const account = await microsoftLogin(loginId);
+      if (activeLoginId !== loginId || loginCancelled) return null;
+      set({ account });
       return account;
-    } catch (err) {
-      set({ signingIn: false });
-      throw err;
+    } finally {
+      if (activeLoginId === loginId) {
+        activeLoginId = null;
+        set({ signingIn: false, devicePrompt: null });
+      }
     }
+  },
+
+  cancelSignIn: async () => {
+    const loginId = activeLoginId;
+    if (!loginId) return;
+    loginCancelled = true;
+    set({ devicePrompt: null });
+    await cancelMicrosoftLogin(loginId);
   },
 
   signOut: async () => {
@@ -208,12 +236,13 @@ export const usePlayStore = create<PlayStore>((set, get) => ({
 
   cancelLaunch: (instanceId) => void cancelLaunch(instanceId).catch(() => {}),
 
+  stopGame: (instanceId) => void stopGame(instanceId).catch(() => {}),
+
   dismissLaunch: (instanceId) =>
     set((state) => {
       const { [instanceId]: _removed, ...rest } = state.launches;
       return { launches: rest };
     }),
-  clearDevicePrompt: () => set({ devicePrompt: null }),
 
   loadStoredLogs: async (instanceId) => {
     // Once per instance per session: "Clear" must stay cleared, and a live
@@ -257,8 +286,10 @@ async function registerListeners(
   const unlisten: UnlistenFn[] = [];
 
   unlisten.push(
-    await listen<DeviceCodePrompt>("auth://device-code", (event) => {
-      set({ devicePrompt: event.payload });
+    await listen<{ loginId: string; prompt: DeviceCodePrompt }>("auth://device-code", (event) => {
+      if (get().signingIn && !loginCancelled && event.payload.loginId === activeLoginId) {
+        set({ devicePrompt: event.payload.prompt });
+      }
     }),
   );
 
@@ -328,16 +359,19 @@ async function registerListeners(
         const seconds = Math.round((Date.now() - launch.startedAtMs) / 1000);
         if (seconds > 0) void addPlayTime(launch.instanceId, seconds);
       }
+      // A deliberate stop lands on the existing cancelled phase (same as
+      // cancelling a prepare) rather than inventing a new one.
+      const stopped = event.payload.stoppedByUser === true;
       set({
         launches: {
           ...launches,
           [event.payload.instanceId]: {
             ...launch,
-            phase: "exited",
-            stage: event.payload.crashed ? "Crashed" : "Closed",
+            phase: stopped ? "cancelled" : "exited",
+            stage: stopped ? "Stopped" : event.payload.crashed ? "Crashed" : "Closed",
             exitCode: event.payload.code,
-            crashed: event.payload.crashed,
-            crashReason: event.payload.crashReason,
+            crashed: stopped ? false : event.payload.crashed,
+            crashReason: stopped ? null : event.payload.crashReason,
           },
         },
         refreshTick: refreshTick + 1,

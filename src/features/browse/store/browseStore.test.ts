@@ -6,7 +6,7 @@ import type { ModSearchQuery, ModSearchResult, ModSummary } from "../types";
 
 function hit(name: string): ModSummary {
   return {
-    uid: `mod:slug:${name}`,
+    uid: `modrinth:${name}`,
     slug: name,
     name,
     description: "",
@@ -126,61 +126,42 @@ describe("search", () => {
   });
 });
 
-describe("totalHits clamp", () => {
-  it("clamps an inflated total down to the offset when a later page comes back empty", async () => {
-    // The backend's totalHits is the pre-dedupe, pre-loader-filter sum, so it
-    // can promise pages that don't exist. Landing on an empty one is the
-    // only reliable signal of where the real end is.
-    serve(result({ hits: [], offset: 100, limit: 50, totalHits: 500 }));
-
-    await useBrowseStore.getState().search(false);
-
-    expect(useBrowseStore.getState().totalHits).toBe(100);
-    expect(useBrowseStore.getState().results).toEqual([]);
-  });
-
-  it("stops offering a Next page once the total has been clamped", async () => {
-    const queries = serve(result({ hits: [], offset: 100, limit: 50, totalHits: 500 }));
-    await useBrowseStore.getState().search(false);
-    expect(queries).toHaveLength(1);
-
-    await useBrowseStore.getState().nextPage();
-
-    // Without the clamp, totalHits would still be 500 and this would fire a
-    // second request for another guaranteed-empty page.
-    expect(queries).toHaveLength(1);
-    expect(useBrowseStore.getState().offset).toBe(100);
-  });
-
-  it("does not clamp an empty first page, which just means no results at all", async () => {
-    // offset 0 with no hits is an honest "nothing matched", not a paging
-    // overshoot — clamping here would be indistinguishable but pointless,
-    // and must not corrupt a total the backend still stands behind.
-    serve(result({ hits: [], offset: 0, limit: 50, totalHits: 42 }));
-
-    await useBrowseStore.getState().search();
-
-    expect(useBrowseStore.getState().totalHits).toBe(42);
-  });
-
-  it("does not clamp a non-empty page deep in the results", async () => {
-    serve(result({ hits: [hit("a")], offset: 100, limit: 50, totalHits: 500 }));
-
-    await useBrowseStore.getState().search(false);
-
-    expect(useBrowseStore.getState().totalHits).toBe(500);
-  });
-
-  it("un-clamps when a fresh search finds a real total again", async () => {
-    serve(
+describe("authoritative pagination totals", () => {
+  it("keeps backend total when an empty later page still reports more results", async () => {
+    const queries = serve(
       result({ hits: [], offset: 100, limit: 50, totalHits: 500 }),
-      result({ hits: [hit("a")], offset: 0, limit: 50, totalHits: 500 }),
+      result({ hits: [hit("later")], offset: 150, limit: 50, totalHits: 500 }),
     );
-
     await useBrowseStore.getState().search(false);
-    expect(useBrowseStore.getState().totalHits).toBe(100);
+    expect(useBrowseStore.getState().totalHits).toBe(500);
+    await useBrowseStore.getState().nextPage();
+    expect(queries).toHaveLength(2);
+    expect(queries[1].offset).toBe(150);
+    expect(useBrowseStore.getState().results.map((item) => item.name)).toEqual(["later"]);
+  });
 
+  it("uses exact backend end while still allowing Previous from an empty later page", async () => {
+    const queries = serve(
+      result({ hits: [], offset: 50, totalHits: 20 }),
+      result({ hits: [hit("earlier")], offset: 0, totalHits: 20 }),
+    );
+    await useBrowseStore.getState().search(false);
+    await useBrowseStore.getState().nextPage();
+    expect(queries).toHaveLength(1);
+    expect(useBrowseStore.getState().totalHits).toBe(20);
+    await useBrowseStore.getState().prevPage();
+    expect(queries[1].offset).toBe(0);
+    expect(useBrowseStore.getState().results[0].name).toBe("earlier");
+  });
+
+  it("preserves backend totals for empty first pages and nonempty deep pages", async () => {
+    serve(
+      result({ hits: [], offset: 0, totalHits: 42 }),
+      result({ hits: [hit("a")], offset: 100, totalHits: 500 }),
+    );
     await useBrowseStore.getState().search();
+    expect(useBrowseStore.getState().totalHits).toBe(42);
+    await useBrowseStore.getState().search(false);
     expect(useBrowseStore.getState().totalHits).toBe(500);
   });
 });

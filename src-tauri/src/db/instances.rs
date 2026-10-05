@@ -163,16 +163,46 @@ impl Database {
         Ok(())
     }
 
-    /// One-time-ish backfill for the `origin` column: rows whose file is
-    /// listed in the instance's pack sidecar (`.curseforge-pack-manifest.json`
-    /// filenames, or `.modrinth-pack-manifest.json` `mods/` paths) become
-    /// `pack`. Only touches rows still marked `user` (the migration
-    /// default), so re-running never clobbers an explicit value — after the
-    /// first pass the UPDATEs match nothing and cost a couple of indexed
-    /// reads. Best-effort throughout: an unreadable sidecar just skips that
-    /// instance, leaving its rows as `user` (the safe direction — a pack
-    /// file misread as user-added is cosmetic, the reverse would hide real
-    /// user mods).
+    pub fn publish_instance_pack(
+        &self,
+        id: &str,
+        loader: ModLoader,
+        loader_version: Option<&str>,
+        version_label: &str,
+        project_uid: &str,
+        project_name: &str,
+        source: ModSource,
+        archive_filename: &str,
+        root_path: &str,
+        icon: Option<&str>,
+    ) -> Result<InstalledMod, DbError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE instances SET loader = ?2, loader_version = ?3,
+             modpack_version_label = ?4, modpack_project_uid = ?5 WHERE id = ?1",
+            params![id, loader_to_str(loader), loader_version, version_label, project_uid],
+        )?;
+        tx.execute(
+            "INSERT INTO instance_mods (instance_id, mod_uid, mod_name, source, file_name,
+             file_path, installed_at, icon_url, origin) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pack')
+             ON CONFLICT(instance_id, mod_uid) DO UPDATE SET mod_name=excluded.mod_name,
+             source=excluded.source, file_name=excluded.file_name, file_path=excluded.file_path,
+             installed_at=excluded.installed_at, icon_url=COALESCE(excluded.icon_url, instance_mods.icon_url)",
+            params![id, project_uid, project_name, source_to_str(source), archive_filename,
+                root_path, super::now_unix() as i64, icon],
+        )?;
+        let installed = tx.query_row(
+            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url, origin
+             FROM instance_mods WHERE instance_id=?1 AND mod_uid=?2",
+            params![id, project_uid], map_installed_mod_row,
+        )?;
+        tx.commit()?;
+        Ok(installed)
+    }
+
+    /// Backfill only when upgrading a schema that did not have origins.
+    /// Never run on subsequent starts: `user` can be an explicit choice.
     pub fn backfill_mod_origins(&self) {
         let pairs: Vec<(String, String)> = (|| {
             let conn = self.conn().ok()?;
@@ -188,14 +218,21 @@ impl Database {
             if pack_files.is_empty() {
                 continue;
             }
-            let placeholders = pack_files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            // Match both spellings: rows may store the `.disabled`-suffixed
+            // name while sidecars record the base filename.
+            let mut names: Vec<String> = pack_files.iter().cloned().collect();
+            names.extend(
+                pack_files
+                    .iter()
+                    .map(|n| format!("{n}.disabled")),
+            );
+            let placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE instance_mods SET origin = 'pack' WHERE instance_id = ?1 AND origin = 'user' AND file_name IN ({placeholders})"
             );
             if let Ok(conn) = self.conn() {
                 let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
-                let owned: Vec<String> = pack_files.into_iter().collect();
-                params.extend(owned.iter().map(|s| s as &dyn rusqlite::ToSql));
+                params.extend(names.iter().map(|s| s as &dyn rusqlite::ToSql));
                 let _ = conn.execute(&sql, params.as_slice());
             }
         }
@@ -386,8 +423,7 @@ impl Database {
                    file_name = excluded.file_name,
                    file_path = excluded.file_path,
                    installed_at = excluded.installed_at,
-                   icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url),
-                   origin = excluded.origin",
+                   icon_url = COALESCE(excluded.icon_url, instance_mods.icon_url)",
                 params![
                     instance_id,
                     mod_uid,
@@ -399,6 +435,62 @@ impl Database {
                     icon_url,
                     origin_to_str(origin),
                 ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Publish a physical filename change without altering source, UID, origin or install time.
+    pub(crate) fn rename_instance_content(
+        &self, instance_id: &str, category: &str, old_name: &str, new_name: &str, new_path: &str,
+    ) -> Result<(), DbError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        if category == "mod" {
+            tx.execute(
+                "UPDATE instance_mods SET file_name=?3, file_path=?4,
+                 mod_uid=CASE WHEN mod_uid=?5 THEN ?6 ELSE mod_uid END
+                 WHERE instance_id=?1 AND file_name=?2",
+                params![instance_id, old_name, new_name, new_path, format!("file:{old_name}"), format!("file:{new_name}")],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM content_meta_cache WHERE instance_id=?1 AND category=?2 AND file_name IN (?3,?4)",
+            params![instance_id, category, old_name, new_name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind identified bytes to their exact physical file, preserving provenance.
+    pub(crate) fn record_content_identity(
+        &self, instance_id: &str, file_name: &str, file_path: &str,
+        summary: &crate::dto::ModSummary, origin: ModOrigin,
+    ) -> Result<(), DbError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instance_mods
+             WHERE instance_id=?1 AND mod_uid=?2 AND file_name<>?3)",
+            params![instance_id, summary.uid, file_name], |row| row.get(0),
+        )?;
+        if conflict {
+            return Err(DbError::Sqlite(rusqlite::Error::InvalidParameterName(
+                "This project is already tracked at another file; neither file was changed".into()
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE instance_mods SET mod_uid=?3, mod_name=?4, source=?5, file_path=?6
+             WHERE instance_id=?1 AND file_name=?2",
+            params![instance_id, file_name, summary.uid, summary.name, source_to_str(summary.sources[0]), file_path],
+        )?;
+        if changed == 0 {
+            tx.execute(
+                "INSERT INTO instance_mods (instance_id,mod_uid,mod_name,source,file_name,file_path,installed_at,origin)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![instance_id, summary.uid, summary.name, source_to_str(summary.sources[0]),
+                    file_name, file_path, super::now_unix() as i64, origin_to_str(origin)],
             )?;
         }
         tx.commit()?;
@@ -480,14 +572,14 @@ impl Database {
     pub fn get_instance_mod(&self, instance_id: &str, mod_uid: &str) -> Result<Option<(InstalledMod, String)>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url, file_path
+            "SELECT id, instance_id, mod_uid, mod_name, source, file_name, installed_at, icon_url, origin, file_path
              FROM instance_mods
              WHERE instance_id = ?1 AND mod_uid = ?2",
         )?;
 
         let mut rows = stmt.query(params![instance_id, mod_uid])?;
         if let Some(row) = rows.next()? {
-            let file_path: String = row.get(8)?;
+            let file_path: String = row.get(9)?;
             return Ok(Some((map_installed_mod_row_full(row)?, file_path)));
         }
         Ok(None)
@@ -623,34 +715,50 @@ pub struct LoaderMetaRow {
     pub fetched_at: u64,
 }
 
-/// Filenames the instance's pack sidecars claim (CF manifest entries'
-/// `filename`, mrpack `mods/` paths reduced to file names). Shared by
-/// the origin backfill and the Content tab's untracked-file marking.
-/// Best-effort: unreadable sidecars contribute nothing.
-pub(crate) fn pack_filenames(root: &std::path::Path) -> std::collections::HashSet<String> {
-    let mut pack_files = std::collections::HashSet::new();
-    if let Ok(text) = std::fs::read_to_string(root.join(".curseforge-pack-manifest.json")) {
-        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
-            for entry in &entries {
-                if let Some(name) = entry.get("filename").and_then(|v| v.as_str()) {
-                    pack_files.insert(name.to_string());
+    /// Filenames the instance's pack sidecars claim: CF manifest entries'
+    /// `filename`, mrpack `mods/` paths reduced to file names, plus
+    /// override files recorded at import time (resource packs, configs,
+    /// extra jars — none of which the manifests list). Shared by the
+    /// origin backfill and the Content tab's untracked-file marking.
+    /// Best-effort: unreadable sidecars contribute nothing.
+    pub(crate) fn pack_filenames(root: &std::path::Path) -> std::collections::HashSet<String> {
+        fn insert_basename(set: &mut std::collections::HashSet<String>, path: &str) {
+            if let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() {
+                    set.insert(name.to_string());
                 }
             }
         }
-    }
-    if let Ok(text) = std::fs::read_to_string(root.join(".modrinth-pack-manifest.json")) {
-        if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
-            for entry in &entries {
-                if let Some(path) = entry.as_str() {
-                    if let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) {
+        let mut pack_files = std::collections::HashSet::new();
+        if let Ok(text) = std::fs::read_to_string(root.join(".curseforge-pack-manifest.json")) {
+            if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+                for entry in &entries {
+                    if let Some(name) = entry.get("filename").and_then(|v| v.as_str()) {
                         pack_files.insert(name.to_string());
+                    }
+                    if let Some(retained) = entry.get("retained_files").and_then(|value| value.as_array()) {
+                        for file in retained {
+                            if let Some(name) = file.get("filename").and_then(|value| value.as_str()) {
+                                pack_files.insert(name.to_string());
+                            }
+                        }
                     }
                 }
             }
         }
+        for manifest in [".modrinth-pack-manifest.json", ".pack-overrides-manifest.json"] {
+            if let Ok(text) = std::fs::read_to_string(root.join(manifest)) {
+                if let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for entry in &entries {
+                        if let Some(path) = entry.as_str() {
+                            insert_basename(&mut pack_files, path);
+                        }
+                    }
+                }
+            }
+        }
+        pack_files
     }
-    pack_files
-}
 
 fn map_instance_row(row: &Row<'_>) -> Result<InstanceSummary, rusqlite::Error> {
     let loader_raw: String = row.get(3)?;
@@ -760,6 +868,84 @@ fn parse_origin(raw: &str) -> ModOrigin {
 mod instance_db_tests {
     use super::*;
 
+    #[test]
+    fn fused_legacy_identity_uses_namespace_not_download_source() {
+        let temp = TempDb::new("uid-fused-source");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        temp.db.insert_instance_mod("a", "mod:MRabc123", "Mixed", ModSource::Curseforge,
+            "mixed.jar", "mixed.jar", None, ModOrigin::User).unwrap();
+        temp.db.insert_instance_mod("a", "mod:MRdef456", "Mapped", ModSource::Curseforge,
+            "mapped.jar", "mapped.jar", None, ModOrigin::Pack).unwrap();
+        temp.db.insert_instance_mod("a", "mod:123456", "Numeric", ModSource::Curseforge,
+            "numeric.jar.disabled", "numeric.jar.disabled", None, ModOrigin::Pack).unwrap();
+        temp.db.conn().unwrap().execute(
+            "INSERT INTO mod_identity (mod_uid,slug,name,curseforge_id,modrinth_id,updated_at)
+             VALUES ('mod:MRdef456','mapped','Mapped',987,'MRdef456','now')", [],
+        ).unwrap();
+        temp.db.conn().unwrap().execute(
+            "INSERT INTO mod_identity (mod_uid,slug,name,curseforge_id,modrinth_id,updated_at)
+             VALUES ('mod:123456','numeric','Numeric',456789,'123456','now')", [],
+        ).unwrap();
+        super::super::migrate_project_uids(&mut temp.db.conn().unwrap()).unwrap();
+        let (row, _) = temp.db.get_instance_mod("a", "modrinth:MRabc123").unwrap().unwrap();
+        assert_eq!(row.source, ModSource::Curseforge);
+        assert_eq!(row.origin, ModOrigin::User);
+        assert!(crate::commands::instances::mod_summary_from_row(&row, "not tracked").is_err(),
+            "unknown original CurseForge ID must never route to Modrinth");
+        for (uid, cf_id) in [("curseforge:987", 987), ("curseforge:456789", 456789)] {
+            let (row, _) = temp.db.get_instance_mod("a", uid).unwrap().unwrap();
+            let summary = crate::commands::instances::mod_summary_from_row(&row, "not tracked").unwrap();
+            assert_eq!(summary.uid, uid);
+            assert_eq!(summary.curseforge_id, Some(cf_id));
+            assert_eq!(summary.modrinth_id, None);
+            assert_eq!(summary.sources, vec![ModSource::Curseforge]);
+        }
+        assert!(temp.db.get_instance_mod("a", "curseforge:MRabc123").unwrap().is_none());
+        assert_eq!(temp.db.list_instance_mods("a").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn physical_filename_migration_preserves_disabled_state_and_genuine_twins() {
+        let temp = TempDb::new("physical-filename");
+        let root = temp.dir.join("instance");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let mut instance = sample_instance("a", "Alpha", 1);
+        instance.root_path = root.display().to_string();
+        temp.db.insert_instance(&instance).unwrap();
+        for (uid, logical, physical, bytes) in [
+            ("modrinth:old", "old.jar", "old.jar.disabled", b"old".as_slice()),
+            ("modrinth:enabled", "twin.jar", "twin.jar", b"enabled".as_slice()),
+            ("modrinth:disabled", "twin.jar", "twin.jar.disabled", b"disabled".as_slice()),
+        ] {
+            std::fs::write(mods.join(physical), bytes).unwrap();
+            let stored_path = if logical == "old.jar" { mods.join(logical) } else { mods.join(physical) };
+            temp.db.insert_instance_mod("a", uid, logical, ModSource::Modrinth,
+                logical, &stored_path.display().to_string(), None, ModOrigin::User).unwrap();
+        }
+        super::super::migrate_content_filenames(&mut temp.db.conn().unwrap()).unwrap();
+        let (row, path) = temp.db.get_instance_mod("a", "modrinth:old").unwrap().unwrap();
+        assert_eq!(row.file_name, "old.jar.disabled");
+        assert_eq!(path, mods.join("old.jar.disabled").display().to_string());
+        assert_eq!(temp.db.get_instance_mod("a", "modrinth:disabled").unwrap().unwrap().0.file_name, "twin.jar.disabled");
+        assert_eq!(temp.db.get_instance_mod("a", "modrinth:enabled").unwrap().unwrap().0.file_name, "twin.jar");
+        assert_eq!(std::fs::read(mods.join("twin.jar")).unwrap(), b"enabled");
+        assert_eq!(std::fs::read(mods.join("twin.jar.disabled")).unwrap(), b"disabled");
+        assert_eq!(temp.db.list_instance_mods("a").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pack_origins_include_retained_pending_versions_not_user_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".curseforge-pack-manifest.json"),
+            r#"[{"filename":"replacement.jar","pending":true,"retained_files":[{"filename":"working.jar","sha1":"old"}]}]"#).unwrap();
+        std::fs::write(root.path().join("user-added.jar"), b"user").unwrap();
+        let claimed = pack_filenames(root.path());
+        assert!(claimed.contains("replacement.jar"));
+        assert!(claimed.contains("working.jar"));
+        assert!(!claimed.contains("user-added.jar"));
+    }
+
     /// A throwaway database file in the temp dir, removed when the test ends.
     /// Never the real `library.db` — `Database::open()` resolves the user's
     /// app-data path, so these go through `open_at` instead.
@@ -806,6 +992,135 @@ mod instance_db_tests {
             modpack_version_label: None,
             modpack_project_uid: None,
         }
+    }
+
+    #[test]
+    fn pack_sync_never_overwrites_explicit_user_origin() {
+        let temp = TempDb::new("origin-sync");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        temp.db.insert_instance_mod("a", "modrinth:42", "Mod", ModSource::Modrinth,
+            "mod.jar", "mod.jar", None, ModOrigin::User).unwrap();
+        temp.db.insert_instance_mods_batch("a", &[("modrinth:42".into(), "Mod".into(),
+            ModSource::Modrinth, "mod.jar".into(), "mod.jar".into(), None)], ModOrigin::Pack).unwrap();
+        assert_eq!(temp.db.get_instance_mod("a", "modrinth:42").unwrap().unwrap().0.origin, ModOrigin::User);
+    }
+
+    #[test]
+    fn pack_publication_rolls_back_metadata_when_archive_tracking_fails() {
+        let temp = TempDb::new("pack-publish");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        temp.db.conn().unwrap().execute_batch(
+            "CREATE TRIGGER reject_pack BEFORE INSERT ON instance_mods
+             BEGIN SELECT RAISE(ABORT, 'fixture insert failure'); END;",
+        ).unwrap();
+        assert!(temp.db.publish_instance_pack("a", ModLoader::Fabric, Some("0.16"),
+            "v2", "modrinth:pack", "Pack", ModSource::Modrinth, "pack.mrpack", "root", None).is_err());
+        let instance = temp.db.get_instance("a").unwrap().unwrap();
+        assert_eq!(instance.loader, ModLoader::Forge);
+        assert_eq!(instance.modpack_project_uid, None);
+        assert_eq!(instance.modpack_version_label, None);
+    }
+
+    #[test]
+    fn canonical_collision_preserves_duplicate_files_and_user_origin() {
+        let temp = TempDb::new("uid-collision");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        for (uid, name, origin) in [
+            ("modrinth:42", "current.jar", ModOrigin::Pack),
+            ("mod:42", "old.jar", ModOrigin::User),
+        ] {
+            temp.db.insert_instance_mod("a", uid, name, ModSource::Modrinth,
+                name, name, None, origin).unwrap();
+        }
+        super::super::migrate_project_uids(&mut temp.db.conn().unwrap()).unwrap();
+        assert!(temp.db.get_instance_mod("a", "modrinth:42").unwrap().is_some());
+        let old = temp.db.get_instance_mod("a", "file:old.jar").unwrap().unwrap();
+        assert_eq!(old.0.origin, ModOrigin::User);
+        assert_eq!(old.1, "old.jar");
+        assert_eq!(temp.db.list_instance_mods("a").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn same_file_collision_merges_without_losing_explicit_origin() {
+        let temp = TempDb::new("uid-same-file");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        for (uid, origin) in [("modrinth:42", ModOrigin::Pack), ("mod:42", ModOrigin::User)] {
+            temp.db.insert_instance_mod("a", uid, "Mod", ModSource::Modrinth,
+                "mod.jar", "mod.jar.disabled", None, origin).unwrap();
+        }
+        super::super::migrate_project_uids(&mut temp.db.conn().unwrap()).unwrap();
+        let (row, path) = temp.db.get_instance_mod("a", "modrinth:42").unwrap().unwrap();
+        assert_eq!(row.origin, ModOrigin::User);
+        assert_eq!(path, "mod.jar.disabled");
+        assert_eq!(temp.db.list_instance_mods("a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn origin_backfill_applies_only_to_schema_without_origin_column() {
+        let temp = TempDb::new("origin-schema");
+        let root = temp.dir.join("instance");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".curseforge-pack-manifest.json"),
+            r#"[{"filename":"mod.jar"}]"#).unwrap();
+        let mut instance = sample_instance("a", "Alpha", 1);
+        instance.root_path = root.to_string_lossy().into_owned();
+        temp.db.insert_instance(&instance).unwrap();
+        temp.db.insert_instance_mod("a", "modrinth:42", "Mod", ModSource::Modrinth,
+            "mod.jar", "mod.jar", None, ModOrigin::User).unwrap();
+        temp.db.conn().unwrap().execute("ALTER TABLE instance_mods DROP COLUMN origin", []).unwrap();
+        let reopened = Database::open_at(&temp.dir.join("library.db")).unwrap();
+        assert_eq!(reopened.get_instance_mod("a", "modrinth:42").unwrap().unwrap().0.origin, ModOrigin::Pack);
+    }
+
+    #[test]
+    fn tracked_mod_mapper_preserves_origin_and_disabled_path() {
+        let temp = TempDb::new("disabled-map");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        temp.db.insert_instance_mod("a", "modrinth:42", "Mod", ModSource::Modrinth,
+            "mod.jar", "C:/mods/mod.jar.disabled", None, ModOrigin::Pack).unwrap();
+        let (row, path) = temp.db.get_instance_mod("a", "modrinth:42").unwrap().unwrap();
+        assert_eq!(row.origin, ModOrigin::Pack);
+        assert_eq!(path, "C:/mods/mod.jar.disabled");
+    }
+
+    #[test]
+    fn legacy_uids_keep_equal_ids_from_distinct_sources() {
+        let temp = TempDb::new("uid-migration");
+        temp.db.insert_instance(&sample_instance("a", "Alpha", 1)).unwrap();
+        for (uid, source, name) in [
+            ("mod:42", ModSource::Modrinth, "mr.jar"),
+            ("mod:cf:42", ModSource::Curseforge, "cf.jar"),
+        ] {
+            temp.db.insert_instance_mod("a", uid, name, source, name, name, None, ModOrigin::User).unwrap();
+        }
+        temp.db.set_modpack_project_uid("a", Some("mod:cf:42")).unwrap();
+        temp.db.conn().unwrap().execute(
+            "INSERT INTO mod_identity VALUES ('mod:42','slug','Mod',42,'42','now')", [],
+        ).unwrap();
+        super::super::migrate_project_uids(&mut temp.db.conn().unwrap()).unwrap();
+        assert!(temp.db.get_instance_mod("a", "modrinth:42").unwrap().is_some());
+        assert!(temp.db.get_instance_mod("a", "curseforge:42").unwrap().is_some());
+        assert_eq!(temp.db.get_instance("a").unwrap().unwrap().modpack_project_uid.as_deref(), Some("curseforge:42"));
+        let count: i64 = temp.db.conn().unwrap().query_row(
+            "SELECT count(*) FROM mod_identity WHERE mod_uid IN ('modrinth:42','curseforge:42')", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn explicit_user_origin_survives_reopening_with_pack_sidecar() {
+        let temp = TempDb::new("origin-reopen");
+        let root = temp.dir.join("instance");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".curseforge-pack-manifest.json"),
+            r#"[{"filename":"mod.jar"}]"#).unwrap();
+        let mut instance = sample_instance("a", "Alpha", 1);
+        instance.root_path = root.to_string_lossy().into_owned();
+        temp.db.insert_instance(&instance).unwrap();
+        temp.db.insert_instance_mod("a", "modrinth:42", "Mod", ModSource::Modrinth,
+            "mod.jar", "mod.jar", None, ModOrigin::User).unwrap();
+        let reopened = Database::open_at(&temp.dir.join("library.db")).unwrap();
+        assert_eq!(reopened.get_instance_mod("a", "modrinth:42").unwrap().unwrap().0.origin, ModOrigin::User);
     }
 
     #[test]

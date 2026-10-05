@@ -42,10 +42,15 @@ export function InstallOverlay() {
   const dismissMissingMod = useInstallStore((s) => s.dismissMissingMod);
   const dockMinimized = useInstallStore((s) => s.dockMinimized);
   const setDockMinimized = useInstallStore((s) => s.setDockMinimized);
+  const retryMissingModsBrowser = useInstallStore((s) => s.retryMissingModsBrowser);
+  const retryMissingModsWatch = useInstallStore((s) => s.retryMissingModsWatch);
+  const pendingMissingModsError = useInstallStore((s) => s.pendingMissingModsError);
+  const pendingMissingModsLoading = useInstallStore((s) => s.pendingMissingModsLoading);
+  const reloadPendingMissingMods = useInstallStore((s) => s.reloadPendingMissingMods);
 
-  if (installs.length === 0 && notifications.length === 0) return null;
+  if (installs.length === 0 && notifications.length === 0 && !pendingMissingModsError && !pendingMissingModsLoading) return null;
 
-  const total = installs.length + notifications.length;
+  const total = installs.length + notifications.length + (pendingMissingModsError || pendingMissingModsLoading ? 1 : 0);
 
   // Minimized: just a peek tab on the bottom-right edge — the dock's
   // presence stays discoverable without covering anything. Clicking it
@@ -86,6 +91,17 @@ export function InstallOverlay() {
           ▾
         </button>
       </div>
+      {(pendingMissingModsError || pendingMissingModsLoading) && (
+        <div className={styles.card}>
+          <div className={styles.body}>
+            <span className={styles.name}>Pending manual downloads</span>
+            {pendingMissingModsError && <span className={styles.status} role="alert">{pendingMissingModsError}</span>}
+            <button type="button" className={styles.missingModsButton} disabled={pendingMissingModsLoading} onClick={reloadPendingMissingMods}>
+              {pendingMissingModsLoading ? "Restoring…" : "Retry manual downloads"}
+            </button>
+          </div>
+        </div>
+      )}
       {notifications.map((n) => (
         <button
           key={n.id}
@@ -138,13 +154,31 @@ export function InstallOverlay() {
                 <span className={styles.status}>About {entry.etaSeconds < 60 ? `${entry.etaSeconds}s` : `${Math.ceil(entry.etaSeconds / 60)} min`} remaining (file-count estimate)</span>
               )}
               {entry.controlError && <span role="alert" className={styles.status}>{entry.controlError}</span>}
+              {entry.missingModsBrowserError && (
+                <div className={styles.missingModsActions}>
+                  <span role="alert" className={styles.status}>{entry.missingModsBrowserError}</span>
+                  <button type="button" className={styles.missingModsButton} disabled={entry.missingModsBrowserPending} onClick={() => retryMissingModsBrowser(entry.id)}>
+                    {entry.missingModsBrowserPending ? "Opening…" : entry.missingModsOpenAll ? "Retry open all" : "Retry download page"}
+                  </button>
+                </div>
+              )}
+              {entry.missingModsWatchError && (
+                <div className={styles.missingModsActions}>
+                  <span role="alert" className={styles.status}>{entry.missingModsWatchError}</span>
+                  <button type="button" className={styles.missingModsButton} disabled={entry.missingModsWatching} onClick={() => retryMissingModsWatch(entry.id)}>
+                    Retry watching Downloads
+                  </button>
+                </div>
+              )}
+              {entry.missingModsDismissError && <span role="alert" className={styles.status}>{entry.missingModsDismissError}</span>}
+              {entry.missingModsWatching && remainingMissingMods.length > 0 && <span className={styles.status}>Watching Downloads — downloaded files are placed automatically.</span>}
               {entry.status === "installing" && (
                 <button type="button" className={styles.missingModsButton} disabled={entry.controlPending}
                   onClick={() => setPaused(entry.id, !entry.paused)}>
                   {entry.controlPending ? "Updating…" : entry.paused ? "Resume" : "Pause"}
                 </button>
               )}
-              {entry.status === "done" && entry.missingMods && remainingMissingMods.length > 0 && (
+              {entry.status !== "installing" && entry.missingMods && remainingMissingMods.length > 0 && (
                 entry.missingModsIndex === undefined ? (
                   <div className={styles.missingModsActions}>
                     {remainingMissingMods.length === 1 && (
@@ -153,6 +187,7 @@ export function InstallOverlay() {
                     <button
                       type="button"
                       className={styles.missingModsButton}
+                      disabled={entry.missingModsBrowserPending || entry.missingModsDismissPending}
                       onClick={() => startMissingModsDownload(entry.id)}
                     >
                       Download missing mods ({remainingMissingMods.length})
@@ -162,6 +197,7 @@ export function InstallOverlay() {
                         type="button"
                         className={styles.missingModsButton}
                         onClick={() => openAllMissingMods(entry.id)}
+                        disabled={entry.missingModsBrowserPending || entry.missingModsDismissPending}
                       >
                         Open all ({remainingMissingMods.length})
                       </button>
@@ -171,6 +207,7 @@ export function InstallOverlay() {
                         type="button"
                         className={styles.missingModsDismiss}
                         onClick={() => dismissMissingMod(entry.id, remainingMissingMods[0].projectId)}
+                        disabled={entry.missingModsBrowserPending || entry.missingModsDismissPending}
                       >
                         Not installing this
                       </button>
@@ -181,7 +218,7 @@ export function InstallOverlay() {
                     <button
                       type="button"
                       className={styles.stepButton}
-                      disabled={entry.missingModsIndex === 0}
+                      disabled={entry.missingModsIndex === 0 || entry.missingModsBrowserPending || entry.missingModsDismissPending}
                       onClick={() => stepMissingMods(entry.id, -1)}
                       aria-label="Previous mod"
                     >
@@ -189,12 +226,12 @@ export function InstallOverlay() {
                     </button>
                     <span className={styles.missingModsLabel}>
                       {entry.missingModsPlaced?.length ?? 0}/{entry.missingMods.length} placed —{" "}
-                      {entry.missingMods[entry.missingModsIndex].name}
+                      {entry.missingMods[entry.missingModsIndex]?.name}
                     </span>
                     <button
                       type="button"
                       className={styles.stepButton}
-                      disabled={entry.missingModsIndex >= entry.missingMods.length - 1}
+                      disabled={entry.missingModsIndex >= entry.missingMods.length - 1 || entry.missingModsBrowserPending || entry.missingModsDismissPending}
                       onClick={() => stepMissingMods(entry.id, 1)}
                       aria-label="Next mod"
                     >
@@ -204,6 +241,7 @@ export function InstallOverlay() {
                       type="button"
                       className={styles.missingModsDismiss}
                       onClick={() => dismissMissingMod(entry.id, entry.missingMods![entry.missingModsIndex!].projectId)}
+                      disabled={entry.missingModsBrowserPending || entry.missingModsDismissPending}
                     >
                       Not installing this
                     </button>
@@ -226,6 +264,7 @@ export function InstallOverlay() {
                 type="button"
                 className={styles.close}
                 aria-label="Dismiss"
+                disabled={entry.missingModsDismissPending}
                 onClick={() => dismiss(entry.id)}
               >
                 ×

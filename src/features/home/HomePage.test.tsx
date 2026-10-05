@@ -1,7 +1,8 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { HomePage as HomePageComponent } from "./HomePage";
+import { useState } from "react";
 
 const saved = {
   id: "saved-world", name: "Offline survival", minecraftVersion: "1.20.1",
@@ -13,7 +14,7 @@ let library: () => Promise<unknown>;
 let HomePage: typeof HomePageComponent;
 
 let createdInputs: unknown[];
-beforeEach(() => {
+beforeEach(async () => {
   // HomePage reads the dismiss flag at mount; keep storage local to the test run.
   const storage: Record<string, string> = {};
   vi.stubGlobal("localStorage", {
@@ -35,9 +36,15 @@ beforeEach(() => {
     if (command === "list_instances") return library();
     if (command === "list_minecraft_versions") return discover();
     if (command === "get_curseforge_status") return { configured: false };
+    if (command === "list_pending_missing_mods") return [];
     if (command === "plugin:event|listen") return 1;
     return null;
   });
+  // Module-scope IPC listeners require the mock before loading these stores.
+  const { useInstallStore } = await import("../install/installStore");
+  const { usePlayStore } = await import("../play/store");
+  useInstallStore.setState({ refreshTick: 0, instanceRefreshTicks: {} });
+  usePlayStore.setState({ refreshTick: 0 });
 });
 
 async function showLibrary() {
@@ -104,5 +111,50 @@ describe("local library without version discovery", () => {
     expect(await screen.findByRole("menuitem", { name: "Open" })).toHaveFocus();
     fireEvent.keyDown(document.activeElement!, { key: "End" });
     expect(screen.getByRole("menuitem", { name: "Delete instance" })).toHaveFocus();
+  });
+});
+
+describe("background library refresh races", () => {
+  async function renderSelection(initialId: string | null = null) {
+    if (!HomePage) ({ HomePage } = await import("./HomePage"));
+    const select = vi.fn();
+    function Library() {
+      const [selectedId, setSelectedId] = useState(initialId);
+      return <HomePage onAddMods={() => {}} onOpenMod={() => {}} onOpenSettings={() => {}}
+        selectedId={selectedId} onSelectId={(id) => { select(id); setSelectedId(id); }}
+        instanceTab="overview" onInstanceTabChange={() => {}} />;
+    }
+    render(<Library />);
+    return select;
+  }
+
+  it("does not reopen an instance when an install refresh finishes after Back", async () => {
+    const select = await renderSelection(saved.id);
+    await screen.findByRole("button", { name: /My Instances/ });
+    let finish!: (value: unknown) => void;
+    library = () => new Promise((resolve) => { finish = resolve; });
+    const { useInstallStore } = await import("../install/installStore");
+    await act(async () => { useInstallStore.setState((s) => ({ refreshTick: s.refreshTick + 1 })); });
+    fireEvent.click(screen.getByRole("button", { name: /My Instances/ }));
+    await act(async () => { finish([saved]); });
+    expect(screen.getByLabelText("Search instances")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /My Instances/ })).not.toBeInTheDocument();
+    expect(select).toHaveBeenCalledExactlyOnceWith(null);
+  });
+
+  it("discards an older list response after a newer refresh", async () => {
+    await renderSelection();
+    await screen.findByText(saved.name);
+    const requests: ((value: unknown) => void)[] = [];
+    library = () => new Promise((resolve) => { requests.push(resolve); });
+    const { useInstallStore } = await import("../install/installStore");
+    await act(async () => { useInstallStore.setState((s) => ({ refreshTick: s.refreshTick + 1 })); });
+    await act(async () => { useInstallStore.setState((s) => ({ refreshTick: s.refreshTick + 1 })); });
+    expect(requests).toHaveLength(2);
+    await act(async () => { requests[1]([{ ...saved, name: "Latest list" }]); });
+    await screen.findByText("Latest list");
+    await act(async () => { requests[0]([]); });
+    expect(screen.getByText("Latest list")).toBeInTheDocument();
+    expect(screen.queryByText("No instances yet")).not.toBeInTheDocument();
   });
 });

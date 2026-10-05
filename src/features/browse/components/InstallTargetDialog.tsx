@@ -27,13 +27,15 @@ interface InstallTargetDialogProps {
 /// read as compatible with forge+1.20. Without this, the "Use existing"
 /// dropdown listed every instance regardless of loader/version, and picking
 /// a mismatched one silently dropped a dead jar into its mods folder.
-function compatibleInstances(list: InstanceSummary[], detail: ModDetail): InstanceSummary[] {
-  return list.filter((instance) =>
-    detail.versions.some(
-      (v) =>
-        v.loaders.includes(instance.loader) &&
-        v.gameVersions.includes(instance.minecraftVersion),
-    ),
+function compatibleInstances(list: InstanceSummary[], detail: ModDetail, versionId?: string): InstanceSummary[] {
+  return list.filter((instance) => compatibleTarget(detail, instance.minecraftVersion, instance.loader, versionId));
+}
+
+function compatibleTarget(detail: ModDetail, minecraftVersion: string, loader: ModLoader, versionId?: string) {
+  return detail.versions.some((v) =>
+    (versionId === undefined || v.id === versionId) &&
+    v.gameVersions.includes(minecraftVersion) &&
+    (detail.summary.projectType !== "mod" || v.loaders.includes(loader)),
   );
 }
 
@@ -59,6 +61,9 @@ export function InstallTargetDialog({
   const [name, setName] = useState(detail.suggestedInstance.name);
   const [mcVersion, setMcVersion] = useState(suggestedMc);
   const [loader, setLoader] = useState<ModLoader>(suggestedLoader);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const startInstall = useInstallStore((s) => s.startInstall);
 
   useEscapeKey(onClose);
@@ -68,17 +73,20 @@ export function InstallTargetDialog({
     detail.gameVersions.length > 0 ? detail.gameVersions : [suggestedMc];
 
   useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(null);
+    setExistingId(fixedInstanceId ?? "");
     void fetchInstances()
       .then((list) => {
+        if (!active) return;
         setInstances(list);
         if (fixedInstanceId) {
           setExistingId(fixedInstanceId);
           setMode("existing");
         } else {
-          // Prefer a compatible instance as the default pick; fall back to
-          // any instance (rather than an empty dropdown) only when none
-          // match at all.
-          const preferred = compatibleInstances(list, detail)[0] ?? list[0];
+          // A pinned version must match itself, not another project release.
+          const preferred = compatibleInstances(list, detail, versionPrefill?.versionId)[0] ?? list[0];
           if (preferred) {
             setExistingId(preferred.id);
           } else {
@@ -89,8 +97,10 @@ export function InstallTargetDialog({
           }
         }
       })
-      .catch(() => setInstances([]));
-  }, [fixedInstanceId, detail]);
+      .catch((err) => { if (active) setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [fixedInstanceId, detail, versionPrefill?.versionId, attempt]);
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -111,20 +121,23 @@ export function InstallTargetDialog({
               loader: isModpack ? suggestedLoader : loader,
             }
           : undefined,
+      // A Browse mod install is a deliberate add — always yours. (Packs
+      // ignore this; their rows are pack by construction.)
+      origin: isModpack ? undefined : "user",
     });
     onSuccess(`Installing ${detail.summary.name}…`);
     onClose();
   }
 
-  const canSubmit =
-    (mode === "create" && name.trim().length >= 2) ||
-    (mode === "existing" && (fixedInstanceId ?? existingId).length > 0);
-
   const selectedInstance =
-    instances.find((item) => item.id === (fixedInstanceId ?? existingId)) ??
-    null;
-
-  const compatible = compatibleInstances(instances, detail);
+    instances.find((item) => item.id === (fixedInstanceId ?? existingId)) ?? null;
+  const canSubmit = !loading && (
+    (mode === "create" && !lockedToInstance && name.trim().length >= 2 &&
+      compatibleTarget(detail, mcVersion, isModpack ? suggestedLoader : loader, versionPrefill?.versionId)) ||
+    (mode === "existing" && selectedInstance !== null &&
+      compatibleTarget(detail, selectedInstance.minecraftVersion, selectedInstance.loader, versionPrefill?.versionId))
+  );
+  const compatible = compatibleInstances(instances, detail, versionPrefill?.versionId);
   const selectableInstances = compatible.length > 0 ? compatible : instances;
 
   return (
@@ -171,6 +184,11 @@ export function InstallTargetDialog({
         </div>
 
         <form className={styles.form} onSubmit={(e) => void handleSubmit(e)}>
+          {loading && <p className={styles.versionHint}>Loading instances…</p>}
+          {error && <p className={styles.versionHint} role="alert">{error} <button type="button" onClick={() => setAttempt((v) => v + 1)}>Retry instances</button></p>}
+          {mode === "existing" && selectedInstance && !compatible.some((item) => item.id === selectedInstance.id) && (
+            <p className={styles.versionHint} role="alert">This instance is incompatible with {versionPrefill ? "the selected version" : "this project"}. Choose a compatible instance or create one.</p>
+          )}
           {mode === "create" && !lockedToInstance ? (
             <>
               <label className={styles.field}>
@@ -247,7 +265,7 @@ export function InstallTargetDialog({
                     onChange={(e) => setExistingId(e.target.value)}
                   >
                     {selectableInstances.map((instance) => (
-                      <option key={instance.id} value={instance.id}>
+                      <option key={instance.id} value={instance.id} disabled={!compatible.some((item) => item.id === instance.id)}>
                         {instance.name} ({instance.minecraftVersion} ·{" "}
                         {instance.loader})
                       </option>
@@ -255,7 +273,7 @@ export function InstallTargetDialog({
                   </select>
                   {compatible.length === 0 && instances.length > 0 && (
                     <p className={styles.versionHint}>
-                      No instance matches this {isModpack ? "modpack's" : "mod's"} loader/version — showing all instances anyway.
+                      No instance matches this {isModpack ? "modpack's" : "mod's"} loader/version{versionPrefill ? " for the selected version" : ""}. Create a compatible instance instead.
                     </p>
                   )}
                 </label>

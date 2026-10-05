@@ -14,7 +14,9 @@ export interface ModVersionSummary {
   name: string;
   versionNumber: string;
   publishedAt: string;
+  /** Minecraft versions only, excluding CurseForge loader/side tags. */
   gameVersions: string[];
+  /** This version's loader declarations, not project-wide categories. */
   loaders: ModLoader[];
   downloads: number;
   changelog?: string;
@@ -92,6 +94,10 @@ export interface InstallModInput {
     minecraftVersion: string;
     loader: ModLoader;
   };
+  /** Explicit origin. Browse passes "user" (a deliberate add is always
+   * yours); flows without that context omit it and let the backend derive
+   * pack-vs-user from the pack sidecars. */
+  origin?: "user" | "pack";
 }
 
 export interface InstallModResult {

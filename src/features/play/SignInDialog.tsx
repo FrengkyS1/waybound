@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { usePlayStore } from "./store";
@@ -15,13 +15,31 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
   const signingIn = usePlayStore((s) => s.signingIn);
   const devicePrompt = usePlayStore((s) => s.devicePrompt);
   const signIn = usePlayStore((s) => s.signIn);
-  const clearDevicePrompt = usePlayStore((s) => s.clearDevicePrompt);
+  const cancelSignIn = usePlayStore((s) => s.cancelSignIn);
 
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => () => clearDevicePrompt(), [clearDevicePrompt]);
-  useEscapeKey(onClose, !signingIn);
+  const active = useRef(true);
+  const closing = useRef(false);
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+      void cancelSignIn().catch(() => {});
+    };
+  }, [cancelSignIn]);
+  async function close() {
+    closing.current = true;
+    try {
+      await cancelSignIn();
+      if (active.current) onClose();
+    } catch (err) {
+      closing.current = false;
+      if (active.current) setError(String(err));
+    }
+  }
+  useEscapeKey(() => void close());
   const modalRef = useModalFocus();
 
   // Once a code arrives, open the Microsoft sign-in page automatically.
@@ -31,12 +49,17 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
 
   async function handleSignIn() {
     setError(null);
+    setCopied(false);
+    closing.current = false;
     try {
-      await signIn();
+      const account = await signIn();
+      if (!active.current || closing.current || !account) return;
       onSignedIn?.();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (active.current && !closing.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -55,7 +78,7 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
     <div
       className={styles.backdrop}
       role="presentation"
-      onClick={signingIn ? undefined : onClose}
+      onClick={() => void close()}
     >
       <div
         className={styles.dialog}
@@ -70,16 +93,14 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
           <h2 id="signin-title" className={styles.title}>
             Sign in to Minecraft
           </h2>
-          {!signingIn && (
-            <button
-              type="button"
-              className={styles.close}
-              onClick={onClose}
-              aria-label="Close"
-            >
-              ×
-            </button>
-          )}
+          <button
+            type="button"
+            className={styles.close}
+            onClick={() => void close()}
+            aria-label={signingIn ? "Cancel sign-in" : "Close"}
+          >
+            ×
+          </button>
         </header>
 
         {devicePrompt ? (
@@ -125,12 +146,12 @@ export function SignInDialog({ onClose, onSignedIn }: SignInDialogProps) {
             >
               {signingIn
                 ? "Contacting Microsoft…"
-                : "Get device code & sign in"}
+                : error ? "Retry sign-in" : "Get device code & sign in"}
             </button>
           </div>
         )}
 
-        {error && <p className={styles.error}>{error}</p>}
+        {error && <p className={styles.error} role="alert">{error}</p>}
       </div>
     </div>
   );

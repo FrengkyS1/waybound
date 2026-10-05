@@ -9,11 +9,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 
-use super::manifest::{
-    natives_classifier_key, rules_allow, Artifact, VersionJson, RESOURCES_BASE_URL,
-};
-use super::{LaunchError, ProgressUpdate};
-use crate::download::DOWNLOAD_CONCURRENCY;
+use super::manifest::{rules_allow, Artifact, VersionJson, RESOURCES_BASE_URL};
+use super::{cancellable, check_cancelled, LaunchError, ProgressUpdate};
+use crate::download::{CancelToken, DOWNLOAD_CONCURRENCY};
 
 const MAX_ATTEMPTS: usize = 4;
 
@@ -84,17 +82,11 @@ impl GamePaths {
     pub fn client_jar(&self, id: &str) -> PathBuf {
         self.version_dir(id).join(format!("{id}.jar"))
     }
-    pub fn natives_dir(&self, id: &str) -> PathBuf {
-        self.version_dir(id).join("natives")
-    }
 }
 
 /// Compute the SHA-1 of a file, if it exists.
 pub(crate) fn file_sha1(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut hasher = Sha1::new();
-    hasher.update(&bytes);
-    Some(hex::encode(hasher.finalize()))
+    crate::download::file_sha1(path).ok()
 }
 
 /// Download `url` to `dest`, skipping the transfer entirely if the file
@@ -190,18 +182,18 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
             continue;
         }
 
-        // Legacy natives: a `natives` map points at a classifier to extract.
+        // Legacy libraries require both their normal jar and an OS-specific
+        // native classifier. A map without this OS does not apply here.
         if let Some(natives_map) = &lib.natives {
-            let key = natives_map
-                .get(super::manifest::current_os_name())
-                .cloned()
-                // Some entries key by classifier directly.
-                .or_else(|| Some(natives_classifier_key().to_string()));
-            if let (Some(key), Some(downloads_block)) = (key, &lib.downloads) {
+            if let (Some(key), Some(downloads_block)) = (
+                natives_map.get(super::manifest::current_os_name()),
+                &lib.downloads,
+            ) {
                 let key = key.replace("${arch}", if cfg!(target_pointer_width = "64") { "64" } else { "32" });
                 if let Some(classifiers) = &downloads_block.classifiers {
                     if let Some(artifact) = classifiers.get(&key) {
-                        if let Some(dest) = artifact_dest(&libs_root, &lib.name, artifact) {
+                        let coordinate = native_coordinate(&lib.name, &key);
+                        if let Some(dest) = artifact_dest(&libs_root, &coordinate, artifact) {
                             natives.push(PendingDownload {
                                 url: artifact.url.clone(),
                                 sha1: artifact.sha1.clone(),
@@ -216,7 +208,6 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
                     }
                 }
             }
-            continue;
         }
 
         // Modern natives arrive as ordinary artifacts whose maven classifier
@@ -244,9 +235,7 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
                         classpath.push(dest);
                         // Forge/NeoForge bundle some artifacts inside their
                         // installer (empty url); those are already on disk.
-                        if !artifact.url.is_empty() {
-                            natives.push(pending);
-                        }
+                        natives.push(pending);
                     } else {
                         classpath.push(dest);
                         if !artifact.url.is_empty() {
@@ -290,6 +279,12 @@ pub fn resolve_libraries(version: &VersionJson, paths: &GamePaths) -> ResolvedLi
     }
 }
 
+fn native_coordinate(name: &str, classifier: &str) -> String {
+    let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
+    let base = coordinate.split(':').take(3).collect::<Vec<_>>().join(":");
+    format!("{base}:{classifier}@{extension}")
+}
+
 fn artifact_dest(libs_root: &Path, name: &str, artifact: &Artifact) -> Option<PathBuf> {
     if let Some(path) = &artifact.path {
         Some(libs_root.join(path))
@@ -327,17 +322,20 @@ pub async fn fetch_libraries<F>(
     version: &VersionJson,
     resolved: &ResolvedLibraries,
     paths: &GamePaths,
+    natives_dir: &Path,
+    cancel: &CancelToken,
     report: &F,
 ) -> Result<(), LaunchError>
 where
     F: Fn(ProgressUpdate),
 {
+    check_cancelled(cancel)?;
     // Client jar.
     if let Some(downloads) = &version.downloads {
         if let Some(client_dl) = &downloads.client {
             let dest = paths.client_jar(&version.id);
             report(ProgressUpdate::stage("Downloading client", 0, 1));
-            download_verified(client, &client_dl.url, &dest, client_dl.sha1.as_deref(), false).await?;
+            cancellable(cancel, download_verified(client, &client_dl.url, &dest, client_dl.sha1.as_deref(), false)).await?;
             report(ProgressUpdate::stage("Downloading client", 1, 1));
         }
     }
@@ -352,7 +350,7 @@ where
     let total = jobs.len() as u64;
     let mut done = 0u64;
     let mut stream = futures::stream::iter(jobs.into_iter().map(|(url, sha1, dest)| async move {
-        download_verified(client, &url, &dest, sha1.as_deref(), false).await
+        cancellable(cancel, download_verified(client, &url, &dest, sha1.as_deref(), false)).await
     }))
     .buffer_unordered(DOWNLOAD_CONCURRENCY);
     while let Some(result) = stream.next().await {
@@ -361,13 +359,16 @@ where
         report(ProgressUpdate::stage("Downloading libraries", done, total));
     }
 
-    // Natives: download then extract into the version's natives dir.
-    let natives_dir = paths.natives_dir(&version.id);
-    std::fs::create_dir_all(&natives_dir)?;
+    // Each preparation owns a fresh instance-local extraction directory.
+    std::fs::create_dir_all(natives_dir)?;
     let native_total = resolved.natives.len() as u64;
     for (i, pending) in resolved.natives.iter().enumerate() {
-        download_verified(client, &pending.url, &pending.dest, pending.sha1.as_deref(), false).await?;
-        extract_native(&pending.dest, &natives_dir, &pending.extract_exclude)?;
+        check_cancelled(cancel)?;
+        if !pending.url.is_empty() {
+            cancellable(cancel, download_verified(client, &pending.url, &pending.dest, pending.sha1.as_deref(), false)).await?;
+        }
+        extract_native(&pending.dest, natives_dir, &pending.extract_exclude, cancel)?;
+        tokio::task::yield_now().await;
         report(ProgressUpdate::stage(
             "Preparing natives",
             (i + 1) as u64,
@@ -381,11 +382,12 @@ where
 /// Extract the platform libraries (.dll/.so/.dylib) from a native jar,
 /// skipping metadata files plus any per-library `extract.exclude` prefixes
 /// from the version JSON.
-fn extract_native(jar: &Path, dest_dir: &Path, exclude: &[String]) -> Result<(), LaunchError> {
+fn extract_native(jar: &Path, dest_dir: &Path, exclude: &[String], cancel: &CancelToken) -> Result<(), LaunchError> {
     let file = std::fs::File::open(jar)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LaunchError::Extract(format!("{}: {e}", jar.display())))?;
     for i in 0..archive.len() {
+        check_cancelled(cancel)?;
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LaunchError::Extract(e.to_string()))?;
@@ -542,6 +544,7 @@ where
         done += 1;
         if done % 25 == 0 || done == total {
             report(ProgressUpdate::stage("Downloading assets", done, total));
+            tokio::task::yield_now().await;
         }
     }
 
@@ -563,6 +566,106 @@ fn copy_if_absent(src: &Path, dest: &Path) -> Result<(), LaunchError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn legacy_library_resolves_normal_jar_and_os_native_without_path_collision() {
+        let os = super::super::manifest::current_os_name();
+        let classifier = format!("natives-{os}");
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "libraries": [{
+                "name": "example:native-api:1",
+                "natives": {(os): classifier.clone()},
+                "downloads": {
+                    "artifact": {"url": "https://example.invalid/normal"},
+                    "classifiers": {(classifier.clone()): {"url": "https://example.invalid/native"}}
+                }
+            }]
+        })).unwrap();
+        let paths = GamePaths::new(PathBuf::from("game"));
+        let resolved = resolve_libraries(&version, &paths);
+        assert_eq!(resolved.classpath, vec![paths.libraries().join("example/native-api/1/native-api-1.jar")]);
+        assert_eq!(resolved.downloads.len(), 1);
+        assert_eq!(resolved.natives.len(), 1);
+        assert_eq!(resolved.natives[0].dest, paths.libraries().join(format!("example/native-api/1/native-api-1-{classifier}.jar")));
+        assert_ne!(resolved.downloads[0].dest, resolved.natives[0].dest);
+    }
+
+    #[test]
+    fn legacy_natives_for_another_os_do_not_fall_back_to_this_os() {
+        let classifier = super::super::manifest::natives_classifier_key();
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "libraries": [{
+                "name": "example:native-api:1",
+                "natives": {"unsupported-platform": classifier},
+                "downloads": {
+                    "artifact": {"url": "https://example.invalid/normal"},
+                    "classifiers": {(classifier): {"url": "https://example.invalid/native"}}
+                }
+            }]
+        })).unwrap();
+        let resolved = resolve_libraries(&version, &GamePaths::new(PathBuf::from("game")));
+        assert_eq!(resolved.classpath.len(), 1);
+        assert_eq!(resolved.downloads.len(), 1);
+        assert!(resolved.natives.is_empty());
+    }
+
+    fn native_jar(path: &Path, contents: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        writer.start_file("platform/native.dll", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(contents).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_extraction_is_immutable_across_runs_and_instances() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = GamePaths::new(scratch.path().join("game"));
+        let first_instance = scratch.path().join("first");
+        let second_instance = scratch.path().join("second");
+        std::fs::create_dir_all(&first_instance).unwrap();
+        std::fs::create_dir_all(&second_instance).unwrap();
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "same-version",
+            "libraries": [{
+                "name": "example:platform:1:natives-fixture",
+                "downloads": {"artifact": {"url": ""}}
+            }]
+        })).unwrap();
+        let resolved = resolve_libraries(&version, &paths);
+        native_jar(&resolved.natives[0].dest, b"first native");
+        let first = tempfile::Builder::new().prefix(".waybound-natives-").tempdir_in(&first_instance).unwrap();
+        let rerun = tempfile::Builder::new().prefix(".waybound-natives-").tempdir_in(&first_instance).unwrap();
+        let second = tempfile::Builder::new().prefix(".waybound-natives-").tempdir_in(&second_instance).unwrap();
+        let cancel = CancelToken::new();
+        let client = Client::new();
+        fetch_libraries(&client, &version, &resolved, &paths, first.path(), &cancel, &|_| {}).await.unwrap();
+        native_jar(&resolved.natives[0].dest, b"later native");
+        for directory in [&rerun, &second] {
+            fetch_libraries(&client, &version, &resolved, &paths, directory.path(), &cancel, &|_| {}).await.unwrap();
+            assert_eq!(std::fs::read(directory.path().join("native.dll")).unwrap(), b"later native");
+        }
+        assert_ne!(first.path(), rerun.path());
+        assert_ne!(first.path(), second.path());
+        assert_eq!(std::fs::read(first.path().join("native.dll")).unwrap(), b"first native");
+        assert!(!paths.version_dir("same-version").join("natives").exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_preparation_writes_no_extraction() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = GamePaths::new(scratch.path().join("game"));
+        let version: VersionJson = serde_json::from_value(serde_json::json!({"id": "fixture"})).unwrap();
+        let resolved = resolve_libraries(&version, &paths);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let native_dir = scratch.path().join("not-created");
+        let result = fetch_libraries(&Client::new(), &version, &resolved, &paths, &native_dir, &cancel, &|_| {}).await;
+        assert!(matches!(result, Err(LaunchError::Cancelled)));
+        assert!(!native_dir.exists());
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("waybound-test-{}-{label}", std::process::id()));
@@ -591,7 +694,7 @@ mod tests {
         }
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        extract_native(&jar_path, &out, &["excluded/".to_string()]).unwrap();
+        extract_native(&jar_path, &out, &["excluded/".to_string()], &CancelToken::new()).unwrap();
         assert!(out.join("native.dll").is_file());
         assert!(!out.join("MANIFEST.MF").exists());
         assert!(!out.join("skipme.dll").exists());

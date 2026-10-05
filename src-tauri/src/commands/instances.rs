@@ -3,7 +3,6 @@ use crate::dto::instance::{
     InstanceSummary, MissingMod,
 };
 use crate::dto::{ContentType, ModSource, ModSummary};
-use crate::download::safe_join;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -81,7 +80,7 @@ pub fn list_pending_missing_mods(state: State<'_, AppState>) -> Result<Vec<Pendi
 pub fn dismiss_missing_mod(instance_id: String, project_id: u32) -> Result<(), String> {
     let _operation = acquire(&instance_id)?;
     let root = crate::instances::paths::instance_root(&instance_id).map_err(|e| e.to_string())?;
-    remove_pack_manifest_entry(&root, project_id);
+    remove_pack_manifest_entry(&root, project_id).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -191,6 +190,9 @@ pub fn set_instance_loader_version(
     loader_version: Option<String>,
 ) -> Result<(), String> {
     let _operation = acquire(&instance_id)?;
+    // If DB publication fails afterward, missing provenance conservatively
+    // preserves the old pin as explicit on the next pack update.
+    InstanceService::clear_pack_loader_pin(&instance_id).map_err(map_error)?;
     state
         .db
         .set_instance_loader_version(&instance_id, loader_version.as_deref())
@@ -330,6 +332,7 @@ pub async fn install_mod_to_instance(
         input.source,
         input.version_id.as_deref(),
         false,
+        input.origin,
         &cancel,
         &report,
     )
@@ -369,10 +372,14 @@ pub async fn install_mod_to_instance(
 /// project behind it (an internal `file:<name>` record — a modpack-dropped
 /// or manually-added file Waybound never resolved to a CurseForge/Modrinth
 /// project).
-fn mod_summary_from_row(row: &InstalledMod, not_tracked_msg: &str) -> Result<ModSummary, String> {
+pub(crate) fn mod_summary_from_row(row: &InstalledMod, not_tracked_msg: &str) -> Result<ModSummary, String> {
     let Some((source_str, id_str)) = row.mod_uid.split_once(':') else {
         return Err(not_tracked_msg.to_string());
     };
+    if (source_str == "modrinth" && row.source == ModSource::Curseforge)
+        || (source_str == "curseforge" && row.source == ModSource::Modrinth) {
+        return Err("Original install source needs hash identification before opening or updating this project.".into());
+    }
 
     let mut summary = ModSummary {
         uid: row.mod_uid.clone(),
@@ -411,7 +418,7 @@ fn mod_summary_from_row(row: &InstalledMod, not_tracked_msg: &str) -> Result<Mod
 /// as `update_mod_in_instance`, for the same reason (a `file:` record has no
 /// real project to open a page for).
 #[tauri::command]
-pub fn get_mod_summary_for_content(
+pub async fn get_mod_summary_for_content(
     state: State<'_, AppState>,
     instance_id: String,
     file_name: String,
@@ -421,32 +428,57 @@ pub fn get_mod_summary_for_content(
         .into_iter()
         .find(|m| m.file_name == file_name)
         .ok_or_else(|| format!("'{file_name}' is not tracked in this instance."))?;
-    mod_summary_from_row(
-        &row,
-        "This file isn't tracked from Browse, so there's no project page to open.",
-    )
+    summary_for_tracked_row(&state, &instance_id, &row,
+        "This file isn't tracked from Browse, so there's no project page to open.").await
 }
 
-/// Identifies an on-disk jar by content hash (Modrinth `version_files`, then
-/// CurseForge fingerprints) — the fallback for files with no DB tracking
-/// row (modpack drops, manual adds, renames), which
-/// `get_mod_summary_for_content` rejects. Returns a real project summary
-/// plus the exact matched version, so the frontend can offer the same
-/// versions/update flow.
+/// Identifies exact file bytes, constrained to a known original source.
+/// Records the physical filename and preserves existing provenance before
+/// returning, so subsequent versions use the same atomic tracked update.
 #[tauri::command]
 pub async fn identify_mod_file(
     state: State<'_, AppState>,
     instance_id: String,
     file_name: String,
 ) -> Result<crate::identify::IdentifiedMod, String> {
-    crate::identify::identify_mod_file(
-        &state.modrinth,
-        &state.curseforge,
-        &state.config,
-        &instance_id,
-        &file_name,
-    )
-    .await
+    let _operation = acquire(&instance_id)?;
+    identify_and_track(&state, &instance_id, &file_name).await
+}
+
+async fn identify_and_track(
+    state: &AppState, instance_id: &str, file_name: &str,
+) -> Result<crate::identify::IdentifiedMod, String> {
+    let existing = state.db.list_instance_mods(instance_id).map_err(|error| error.to_string())?
+        .into_iter().find(|row| row.file_name == file_name);
+    let source = existing.as_ref().filter(|row| row.mod_uid.starts_with("curseforge:")
+        || row.mod_uid.starts_with("modrinth:")).map(|row| row.source);
+    let identified = crate::identify::identify_mod_file(
+        &state.modrinth, &state.curseforge, &state.config, instance_id, file_name, source,
+    ).await?;
+    let root = crate::instances::paths::instance_root(instance_id).map_err(|error| error.to_string())?;
+    let path = crate::download::contained_join(&root.join("mods"), file_name).map_err(|error| error.to_string())?;
+    let logical = file_name.strip_suffix(crate::commands::content::DISABLED_SUFFIX).unwrap_or(file_name);
+    let origin = existing.as_ref().map_or_else(|| {
+        if crate::db::pack_filenames(&root).contains(logical) { crate::dto::ModOrigin::Pack }
+        else { crate::dto::ModOrigin::User }
+    }, |row| row.origin);
+    state.db.record_content_identity(instance_id, file_name, &path.display().to_string(),
+        &identified.summary, origin).map_err(|error| error.to_string())?;
+    Ok(identified)
+}
+
+async fn summary_for_tracked_row(
+    state: &AppState, instance_id: &str, row: &InstalledMod, not_tracked: &str,
+) -> Result<ModSummary, String> {
+    let mismatched_source = (row.mod_uid.starts_with("modrinth:") && row.source == ModSource::Curseforge)
+        || (row.mod_uid.starts_with("curseforge:") && row.source == ModSource::Modrinth);
+    if mismatched_source {
+        let _operation = acquire(instance_id)?;
+        // Historical fused IDs retained bytes from the other distributor.
+        // Recover from those bytes on that source only, never substitute.
+        return identify_and_track(state, instance_id, &row.file_name).await.map(|identified| identified.summary);
+    }
+    mod_summary_from_row(row, not_tracked)
 }
 
 /// Re-resolves a Content-tab mod against its own project and installs
@@ -472,10 +504,14 @@ pub async fn update_mod_in_instance(
         .find(|m| m.file_name == file_name)
         .ok_or_else(|| format!("'{file_name}' is not tracked in this instance."))?;
 
-    let summary = mod_summary_from_row(
-        &row,
-        "This file isn't tracked from Browse, so there's nothing to check for updates against.",
-    )?;
+    let summary = if (row.mod_uid.starts_with("modrinth:") && row.source == ModSource::Curseforge)
+        || (row.mod_uid.starts_with("curseforge:") && row.source == ModSource::Modrinth) {
+        let identified = identify_and_track(&state, &instance_id, &file_name).await?;
+        identified.summary
+    } else {
+        mod_summary_from_row(&row,
+            "This file isn't tracked from Browse, so there's nothing to check for updates against.")?
+    };
     let preferred_source = summary.sources[0];
 
 
@@ -524,6 +560,8 @@ pub async fn update_mod_in_instance(
         Some(preferred_source),
         version_id.as_deref(),
         true,
+        // Maintenance preserves explicit pack/user ownership.
+        Some(row.origin),
         &cancel,
         &report,
     )
@@ -532,18 +570,6 @@ pub async fn update_mod_in_instance(
     let mut result = install_result.map_err(map_error)?;
     if result.installed.is_some() {
         let _ = state.db.delete_content_meta_cache(&instance_id, "mod", &file_name);
-    }
-    if result.installed.is_some() {
-        // The replacement is verified on disk and tracked; only now is the
-        // superseded file deleted. Same filename means install_mod overwrote
-        // it in place, so there is nothing to remove.
-        if result.installed.as_ref().map(|m| m.file_name.as_str()) != Some(file_name.as_str()) {
-            if let Ok(root) = crate::instances::paths::instance_root(&instance_id) {
-                if let Ok(old_path) = safe_join(&root.join("mods"), &file_name) {
-                    let _ = std::fs::remove_file(old_path);
-                }
-            }
-        }
     }
     result.instance = state.db.get_instance(&instance_id)
         .map_err(|e| e.to_string())?
@@ -715,7 +741,7 @@ mod mod_summary_from_row_tests {
             instance_id: "inst".to_string(),
             mod_uid: mod_uid.to_string(),
             mod_name: "Some Mod".to_string(),
-            source: ModSource::Curseforge,
+            source: if mod_uid.starts_with("modrinth:") { ModSource::Modrinth } else { ModSource::Curseforge },
             file_name: "somemod.jar".to_string(),
             installed_at: 0,
             icon_url: Some("https://example.invalid/icon.png".to_string()),

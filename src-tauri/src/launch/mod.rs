@@ -12,6 +12,7 @@ pub mod java_runtime;
 pub mod manifest;
 pub mod offline;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 
 use reqwest::Client;
@@ -20,15 +21,37 @@ use thiserror::Error;
 
 use crate::auth::Account;
 use crate::dto::ModLoader;
+use crate::download::CancelToken;
 
 use files::GamePaths;
-use manifest::{rules_allow, ArgValue, Argument, VersionJson};
+use manifest::{rules_allow, ArgValue, Argument};
+#[cfg(test)]
+use manifest::VersionJson;
 
 const LAUNCHER_NAME: &str = "Waybound";
 const LAUNCHER_VERSION: &str = "0.1.0";
 
+// Forge processors and all native extractions consume/write shared library
+// paths. Serialize complete preparations, not just downloads: a second loader
+// repair must never replace an input while another preparation extracts it.
+static PREPARATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn acquire_preparation(cancel: &CancelToken) -> Result<tokio::sync::MutexGuard<'static, ()>, LaunchError> {
+    check_cancelled(cancel)?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(LaunchError::Cancelled),
+        guard = PREPARATION.lock() => {
+            check_cancelled(cancel)?;
+            Ok(guard)
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum LaunchError {
+    #[error("launch cancelled")]
+    Cancelled,
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
     #[error("io error: {0}")]
@@ -72,6 +95,26 @@ impl ProgressUpdate {
     }
 }
 
+pub(crate) fn check_cancelled(cancel: &CancelToken) -> Result<(), LaunchError> {
+    if cancel.is_cancelled() { Err(LaunchError::Cancelled) } else { Ok(()) }
+}
+
+/// Drop only cancellation-safe futures, never a running loader processor.
+pub(crate) async fn cancellable<T>(
+    cancel: &CancelToken,
+    work: impl Future<Output = Result<T, LaunchError>>,
+) -> Result<T, LaunchError> {
+    check_cancelled(cancel)?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(LaunchError::Cancelled),
+        result = work => {
+            check_cancelled(cancel)?;
+            result
+        }
+    }
+}
+
 /// Everything needed to spawn the game, produced by [`prepare_launch`].
 #[derive(Debug, Clone)]
 pub struct PreparedLaunch {
@@ -80,6 +123,8 @@ pub struct PreparedLaunch {
     pub working_dir: PathBuf,
     /// Java major version chosen, for diagnostics.
     pub java_major: u32,
+    /// Keep native files alive until the game child has exited.
+    pub natives: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// Resolve, download, and assemble the launch command for an instance.
@@ -94,17 +139,20 @@ pub async fn prepare_launch<F>(
     java_override: Option<String>,
     max_memory_mb: u32,
     extra_jvm_args: Vec<String>,
+    cancel: &CancelToken,
     report: &F,
 ) -> Result<PreparedLaunch, LaunchError>
 where
     F: Fn(ProgressUpdate),
 {
+    check_cancelled(cancel)?;
+    let _preparation = acquire_preparation(cancel).await?;
     let paths = GamePaths::new(game_root.clone());
     std::fs::create_dir_all(&instance_dir)?;
 
     report(ProgressUpdate::stage("Resolving version", 0, 1));
 
-    let vanilla = offline::vanilla_version(client, &game_root, game_version).await?;
+    let vanilla = cancellable(cancel, offline::vanilla_version(client, &game_root, game_version)).await?;
 
     // Resolve Java up front: loaders inherit vanilla's Java requirement, and
     // Forge/NeoForge processors need a JVM to run during install.
@@ -124,25 +172,27 @@ where
         game_version,
         &paths,
         client,
+        cancel,
         report,
     )
     .await?;
+    check_cancelled(cancel)?;
 
     // Layer the loader on top when requested.
     let version = match loader {
         ModLoader::Vanilla => vanilla,
         ModLoader::Fabric | ModLoader::Quilt => {
             report(ProgressUpdate::stage("Resolving loader", 0, 1));
-            let profile = fabric::cached_profile(client, &game_root, game_version, loader_version, loader == ModLoader::Quilt).await?;
+            let profile = cancellable(cancel, fabric::cached_profile(client, &game_root, game_version, loader_version, loader == ModLoader::Quilt)).await?;
             let mut merged = fabric::merge_onto_parent(profile, vanilla);
             // Keep vanilla's id so client jar / natives / assets paths line up.
             merged.id = game_version.to_string();
             merged
         }
         ModLoader::Forge | ModLoader::NeoForge => {
-            let lv = forge::resolve_cached_version(client, &paths, loader, game_version, loader_version).await?;
+            let lv = cancellable(cancel, forge::resolve_cached_version(client, &paths, loader, game_version, loader_version)).await?;
             let mut merged = forge::prepare(
-                client, &paths, loader, game_version, &lv, &vanilla, &java_path, report,
+                client, &paths, loader, game_version, &lv, &vanilla, &java_path, cancel, report,
             )
             .await?;
             merged.id = game_version.to_string();
@@ -152,10 +202,11 @@ where
 
     // Download client jar, libraries, natives.
     let resolved = files::resolve_libraries(&version, &paths);
-    files::fetch_libraries(client, &version, &resolved, &paths, report).await?;
+    let natives = std::sync::Arc::new(tempfile::Builder::new().prefix(".waybound-natives-").tempdir_in(&instance_dir)?);
+    files::fetch_libraries(client, &version, &resolved, &paths, natives.path(), cancel, report).await?;
 
     // Download assets (handles legacy/virtual layouts).
-    let asset_layout = files::fetch_assets(client, &version, &paths, &instance_dir, report).await?;
+    let asset_layout = cancellable(cancel, files::fetch_assets(client, &version, &paths, &instance_dir, report)).await?;
 
     // Build the classpath: libraries first, then the client jar.
     let mut classpath = resolved.classpath.clone();
@@ -167,7 +218,7 @@ where
         .collect::<Vec<_>>()
         .join(cp_sep);
 
-    let natives_dir = paths.natives_dir(&version.id);
+    let natives_dir = natives.path();
 
     // Placeholder table shared by JVM and game arguments.
     let mut vars: HashMap<&str, String> = HashMap::new();
@@ -264,6 +315,7 @@ where
         }
     }
 
+    check_cancelled(cancel)?;
     report(ProgressUpdate::stage("Ready", 1, 1));
 
     Ok(PreparedLaunch {
@@ -271,6 +323,7 @@ where
         args,
         working_dir: instance_dir,
         java_major,
+        natives,
     })
 }
 
@@ -283,6 +336,7 @@ async fn resolve_java<F>(
     game_version: &str,
     paths: &GamePaths,
     client: &Client,
+    cancel: &CancelToken,
     report: &F,
 ) -> Result<(String, u32), LaunchError>
 where
@@ -301,29 +355,14 @@ where
             .await
             .ok()
             .flatten();
-        match major {
-            // An explicit override that probes older than required used to
-            // be trusted blindly and die in the game with no useful error —
-            // fail here instead, naming the fix.
-            Some(found) if found < required_major => {
-                return Err(LaunchError::JavaTooOld {
-                    path: explicit,
-                    version: game_version.to_string(),
-                    found,
-                    required: required_major,
-                })
-            }
-            Some(found) => return Ok((explicit, found)),
-            // Unprobable override (deleted JDK, typo): fall back to the
-            // requirement so auto-resolution still finds something, rather
-            // than launching a broken path.
-            None => return Ok((explicit, required_major)),
-        }
+        check_cancelled(cancel)?;
+        return check_override_major(&explicit, game_version, major, required_major);
     }
 
     let runtimes = tokio::task::spawn_blocking(java::detect_java_runtimes)
         .await
         .unwrap_or_default();
+    check_cancelled(cancel)?;
     if let Some(rt) = java::select_at_least(&runtimes, required_major) {
         return Ok((rt.path, rt.major_version));
     }
@@ -336,7 +375,7 @@ where
 
     if let Some(component) = component {
         let path =
-            java_runtime::ensure_component(client, &paths.runtimes(), &component, report).await?;
+            java_runtime::ensure_component(client, &paths.runtimes(), &component, cancel, report).await?;
         return Ok((path.to_string_lossy().to_string(), required_major));
     }
 
@@ -344,6 +383,29 @@ where
         version: game_version.to_string(),
         required: required_major,
     })
+}
+
+/// Decides what an explicit Java override resolves to, factored out of
+/// `resolve_java` so the rules are unit-testable without spawning
+/// processes: too-old-but-probed fails fast naming the fix; matching
+/// passes through; unprobable (deleted JDK, typo) falls back to the
+/// requirement so auto-resolution still finds something.
+fn check_override_major(
+    explicit: &str,
+    game_version: &str,
+    probed: Option<u32>,
+    required_major: u32,
+) -> Result<(String, u32), LaunchError> {
+    match probed {
+        Some(found) if found < required_major => Err(LaunchError::JavaTooOld {
+            path: explicit.to_string(),
+            version: game_version.to_string(),
+            found,
+            required: required_major,
+        }),
+        Some(found) => Ok((explicit.to_string(), found)),
+        None => Ok((explicit.to_string(), required_major)),
+    }
 }
 
 /// Map a required Java major to the Mojang runtime component that provides it,
@@ -452,6 +514,25 @@ mod tests {
     use super::*;
     use manifest::{VersionManifest, VERSION_MANIFEST_URL};
 
+    #[tokio::test]
+    async fn preparations_are_exclusive_and_waiters_cancel_without_releasing_owner() {
+        let cancel = CancelToken::new();
+        let owner = acquire_preparation(&cancel).await.unwrap();
+        let waiting = CancelToken::new();
+        let task = acquire_preparation(&waiting);
+        tokio::pin!(task);
+        tokio::select! {
+            _ = &mut task => panic!("second preparation acquired shared outputs"),
+            _ = tokio::task::yield_now() => {},
+        }
+        waiting.cancel();
+        assert!(matches!(task.await, Err(LaunchError::Cancelled)));
+        assert!(PREPARATION.try_lock().is_err());
+        drop(owner);
+        let next = acquire_preparation(&CancelToken::new()).await.unwrap();
+        drop(next);
+    }
+
     #[test]
     fn substitutes_known_tokens() {
         let mut vars = HashMap::new();
@@ -477,6 +558,7 @@ mod tests {
         })).unwrap();
         let metadata = serde_json::json!({
             "id": "cached", "mainClass": "net.minecraft.client.main.Main",
+            "javaVersion": {"majorVersion": 17},
             "downloads": {"client": {"url": "https://example.invalid/client", "sha1": hex::encode(Sha1::digest(client_bytes))}},
             "assetIndex": {"id": "cached", "url": "https://example.invalid/index", "sha1": hex::encode(Sha1::digest(&index))},
             "libraries": [],
@@ -496,12 +578,25 @@ mod tests {
         let account = Account { uuid: "00000000000000000000000000000000".into(), username: "Fixture".into(),
             minecraft_token: "synthetic".into(), msa_refresh_token: String::new(), expires_at: 0 };
         let prepared = prepare_launch(&client, root, instance.clone(), "cached", ModLoader::Vanilla,
-            None, &account, Some("java".into()), 1024, vec![], &|_| {}).await.unwrap();
+            None, &account, Some("java".into()), 1024, vec![], &CancelToken::new(), &|_| {}).await.unwrap();
         assert_eq!(prepared.working_dir, instance);
         assert!(prepared.args.iter().any(|arg| arg == "net.minecraft.client.main.Main"));
         assert!(prepared.args.windows(2).any(|args| args == ["--username", "Fixture"]));
         assert_eq!(std::fs::read(instance.join("resources/example.txt")).unwrap(), asset_bytes);
         // Preparation only: fixture client bytes are intentionally not runnable.
+    }
+
+    #[test]
+    fn explicit_java_override_older_than_required_fails_fast() {
+        let err = super::check_override_major("C:/jdk17", "1.21.1", Some(17), 21).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs Java 21"),
+            "override rejection must name the requirement, got: {msg}"
+        );
+        // Matching and unprobable (deleted JDK, typo) overrides pass through.
+        assert!(super::check_override_major("C:/jdk21", "1.21.1", Some(21), 21).is_ok());
+        assert!(super::check_override_major("C:/gone", "1.21.1", None, 21).is_ok());
     }
 
     /// Network test: parse real Mojang JSON for a modern (structured arguments)

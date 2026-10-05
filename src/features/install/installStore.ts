@@ -12,7 +12,7 @@ import {
   openMissingModsBrowser,
   watchForMissingMods,
 } from "../browse/api";
-import type { InstallModInput, MissingMod } from "../browse/detailTypes";
+import type { InstallModInput, InstallModResult, MissingMod } from "../browse/detailTypes";
 
 export type InstallStatus = "installing" | "done" | "error" | "cancelled";
 
@@ -54,6 +54,12 @@ export interface InstallEntry {
   missingModsWatching?: boolean;
   /** Names placed into the instance so far by the watcher. */
   missingModsPlaced?: string[];
+  missingModsBrowserPending?: boolean;
+  missingModsBrowserError?: string;
+  missingModsWatchError?: string;
+  missingModsDismissError?: string;
+  missingModsDismissPending?: boolean;
+  missingModsOpenAll?: boolean;
 }
 
 interface InstallProgressEvent {
@@ -89,12 +95,22 @@ interface InstallStore {
   notifications: ModNotification[];
   /** Bumped when an install finishes, so the instance list can refresh. */
   refreshTick: number;
+  instanceRefreshTicks: Record<string, number>;
+  pendingMissingModsError?: string;
+  pendingMissingModsLoading: boolean;
+  reloadPendingMissingMods: () => void;
   /** Collapses the bottom-right dock to a peek tab (session-only). */
   dockMinimized: boolean;
   setDockMinimized: (minimized: boolean) => void;
   dismissNotification: (id: string) => void;
   /** Start an install in the background — the UI is never blocked. */
   startInstall: (name: string, input: InstallModInput) => void;
+  /** Track every install/update result, including manual-download outcomes. */
+  runInstall: (
+    name: string,
+    operation: (installId: string) => Promise<InstallModResult>,
+    instanceId?: string,
+  ) => Promise<InstallModResult | null>;
   /** Signals the backend to stop at its next chunk/file boundary. */
   cancel: (id: string) => void;
   setPaused: (id: string, paused: boolean) => void;
@@ -110,12 +126,18 @@ interface InstallStore {
   /** Marks one missing mod as "not getting this" — removed from the list for
    * good (persisted backend-side), not just hidden until the next restart. */
   dismissMissingMod: (id: string, projectId: number) => void;
+  retryMissingModsBrowser: (id: string) => void;
+  retryMissingModsWatch: (id: string) => void;
 }
+
+let pendingMissingModsReloadQueued = false;
 
 export const useInstallStore = create<InstallStore>((set, get) => ({
   installs: [],
   notifications: [],
   refreshTick: 0,
+  instanceRefreshTicks: {},
+  pendingMissingModsLoading: false,
   dockMinimized: false,
 
   setDockMinimized: (minimized) => set({ dockMinimized: minimized }),
@@ -124,48 +146,53 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
     set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
 
   startInstall: (name, input) => {
-    const id =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-    set((s) => ({ installs: [...s.installs, { id, name, status: "installing" }] }));
+    void get().runInstall(name, (id) => installMod(input, id), input.instanceId);
+  },
 
-    void (async () => {
-      try {
-        const result = await installMod(input, id);
-        set((s) => ({
-          installs: s.installs.map((e) =>
-            e.id === id
-              ? {
-                  ...e,
-                  status: "done",
-                  message: result.message,
-                  instanceId: result.instance.id,
-                  missingMods: result.missingMods.length > 0 ? result.missingMods : undefined,
-                }
-              : e,
-          ),
-          refreshTick: s.refreshTick + 1,
-        }));
-        // Auto-dismiss successful installs after a few seconds — but not
-        // when some files need a manual download, since that's an action
-        // item the user still needs to read and act on.
-        if (!result.hasSkipped) {
-          setTimeout(() => get().dismiss(id), 7000);
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const cancelled = message === CANCELLED_MESSAGE;
-        set((s) => ({
-          installs: s.installs.map((e) =>
-            e.id === id
-              ? { ...e, status: cancelled ? "cancelled" : "error", error: message }
-              : e,
-          ),
-        }));
-        if (cancelled) setTimeout(() => get().dismiss(id), 4000);
+  runInstall: async (name, operation, instanceId) => {
+    const id = crypto.randomUUID();
+    set((s) => ({ installs: [...s.installs, { id, name, instanceId, status: "installing" }] }));
+    try {
+      const result = await operation(id);
+      set((s) => ({
+        installs: s.installs.map((e) => e.id === id ? {
+          ...e,
+          status: "done",
+          message: result.message,
+          instanceId: result.instance.id,
+          missingMods: result.missingMods.length ? result.missingMods : undefined,
+        } : e),
+        refreshTick: s.refreshTick + 1,
+        instanceRefreshTicks: {
+          ...s.instanceRefreshTicks,
+          [result.instance.id]: (s.instanceRefreshTicks[result.instance.id] ?? 0) + 1,
+        },
+      }));
+      if (result.missingMods.length && get().installs.some((e) =>
+        e.instanceId === result.instance.id && e.missingModsWatching)) {
+        syncMissingModsWatch(result.instance.id);
       }
-    })();
+      if (!result.hasSkipped && result.missingMods.length === 0) {
+        setTimeout(() => get().dismiss(id), 7000);
+      }
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const cancelled = message === CANCELLED_MESSAGE;
+      set((s) => ({
+        installs: s.installs.map((e) => e.id === id
+          ? { ...e, status: cancelled ? "cancelled" : "error", error: message } : e),
+        refreshTick: s.refreshTick + 1,
+        instanceRefreshTicks: instanceId ? {
+          ...s.instanceRefreshTicks,
+          [instanceId]: (s.instanceRefreshTicks[instanceId] ?? 0) + 1,
+        } : s.instanceRefreshTicks,
+      }));
+      // Failed installs may still have durable manual-download work.
+      get().reloadPendingMissingMods();
+      if (cancelled) setTimeout(() => get().dismiss(id), 4000);
+      return null;
+    }
   },
 
   cancel: (id) => {
@@ -187,88 +214,209 @@ export const useInstallStore = create<InstallStore>((set, get) => ({
     });
   },
 
-  // Closing an entry that's still nagging about missing mods must persist
-  // that the same way "Not installing this" does — otherwise the card is
-  // only gone until the next restart, when list_pending_missing_mods
-  // recomputes straight from the on-disk manifest (which this action never
-  // touched) and re-adds an identical entry. Regular install toasts have no
-  // missingMods, so this is a no-op for them.
   dismiss: (id) => {
     const entry = get().installs.find((e) => e.id === id);
-    if (entry?.missingMods?.length && entry.instanceId) {
-      const placedNames = new Set(entry.missingModsPlaced ?? []);
-      for (const m of entry.missingMods) {
-        if (placedNames.has(m.name)) continue; // already resolved on disk, nothing to dismiss
-        void dismissMissingModApi(entry.instanceId, m.projectId).catch(() => {});
-      }
+    if (!entry || entry.missingModsDismissPending) return;
+    const remaining = unresolvedMods(entry);
+    if (!remaining.length || !entry.instanceId) {
+      set((s) => ({ installs: s.installs.filter((e) => e.id !== id) }));
+      if (entry.instanceId && entry.missingModsWatching) syncMissingModsWatch(entry.instanceId);
+      return;
     }
-    set((s) => ({ installs: s.installs.filter((e) => e.id !== id) }));
+    updateEntry(id, { missingModsDismissPending: true, missingModsDismissError: undefined });
+    void Promise.allSettled(remaining.map((m) => dismissMissingModApi(entry.instanceId!, m.projectId)))
+      .then((results) => {
+        const failed = remaining.filter((_, index) => results[index].status === "rejected");
+        if (!failed.length) {
+          set((s) => ({ installs: s.installs.filter((e) => e.id !== id) }));
+        } else {
+          const failure = results.find((r) => r.status === "rejected");
+          updateEntry(id, {
+            missingMods: failed,
+            missingModsIndex: entry.missingModsIndex === undefined ? undefined : 0,
+            missingModsDismissPending: false,
+            missingModsDismissError: `Could not dismiss missing mods: ${failure?.status === "rejected" ? String(failure.reason) : "unknown error"}. Retry dismissing.`,
+          });
+          if (entry.missingModsIndex !== undefined) get().retryMissingModsBrowser(id);
+        }
+        if (get().installs.some((e) => e.instanceId === entry.instanceId && e.missingModsWatching) || entry.missingModsWatching) {
+          syncMissingModsWatch(entry.instanceId!);
+        }
+      });
   },
 
   startMissingModsDownload: (id) => {
     const entry = get().installs.find((e) => e.id === id);
     if (!entry?.missingMods?.length || !entry.instanceId) return;
-
-    set((s) => ({
-      installs: s.installs.map((e) =>
-        e.id === id ? { ...e, missingModsIndex: 0, missingModsWatching: true, missingModsPlaced: [] } : e,
-      ),
-    }));
-    void openMissingModsBrowser(entry.missingMods[0].url).catch(() => {});
-    void watchForMissingMods(entry.instanceId, entry.missingMods).catch(() => {});
+    const first = entry.missingMods.findIndex((m) => !(entry.missingModsPlaced ?? []).includes(m.name));
+    if (first < 0) return;
+    updateEntry(id, { missingModsIndex: first, missingModsOpenAll: false });
+    get().retryMissingModsBrowser(id);
+    get().retryMissingModsWatch(id);
   },
 
   stepMissingMods: (id, direction) => {
     const entry = get().installs.find((e) => e.id === id);
-    if (!entry?.missingMods?.length) return;
-    const nextIndex = (entry.missingModsIndex ?? 0) + direction;
+    if (!entry?.missingMods?.length || entry.missingModsBrowserPending || entry.missingModsDismissPending) return;
+    const placed = new Set(entry.missingModsPlaced ?? []);
+    let nextIndex = (entry.missingModsIndex ?? 0) + direction;
+    while (nextIndex >= 0 && nextIndex < entry.missingMods.length && placed.has(entry.missingMods[nextIndex].name)) {
+      nextIndex += direction;
+    }
     if (nextIndex < 0 || nextIndex >= entry.missingMods.length) return;
-
-    set((s) => ({
-      installs: s.installs.map((e) => (e.id === id ? { ...e, missingModsIndex: nextIndex } : e)),
-    }));
-    void openMissingModsBrowser(entry.missingMods[nextIndex].url).catch(() => {});
+    updateEntry(id, { missingModsIndex: nextIndex, missingModsOpenAll: false });
+    get().retryMissingModsBrowser(id);
   },
 
   openAllMissingMods: (id) => {
     const entry = get().installs.find((e) => e.id === id);
-    if (!entry?.missingMods?.length || !entry.instanceId) return;
+    if (!entry?.missingMods?.length || !entry.instanceId || entry.missingModsBrowserPending) return;
+    updateEntry(id, { missingModsOpenAll: true });
+    get().retryMissingModsBrowser(id);
+    get().retryMissingModsWatch(id);
+  },
 
-    set((s) => ({
-      installs: s.installs.map((e) =>
-        e.id === id ? { ...e, missingModsWatching: true, missingModsPlaced: [] } : e,
-      ),
-    }));
-    void openAllMissingModsBrowsers(entry.missingMods.map((m) => m.url)).catch(() => {});
-    void watchForMissingMods(entry.instanceId, entry.missingMods).catch(() => {});
+  retryMissingModsBrowser: (id) => {
+    const entry = get().installs.find((e) => e.id === id);
+    if (!entry?.missingMods?.length || entry.missingModsBrowserPending) return;
+    const remaining = unresolvedMods(entry);
+    if (!remaining.length) return;
+    const current = entry.missingMods[entry.missingModsIndex ?? 0];
+    if (!entry.missingModsOpenAll && (!current || !remaining.includes(current))) return;
+    updateEntry(id, { missingModsBrowserPending: true, missingModsBrowserError: undefined });
+    const opening = entry.missingModsOpenAll
+      ? openAllMissingModsBrowsers(remaining.map((m) => m.url))
+      : openMissingModsBrowser(current.url);
+    void opening.catch((err) => {
+      updateEntry(id, { missingModsBrowserError: `Could not open download page(s): ${String(err)}` });
+    }).finally(() => updateEntry(id, { missingModsBrowserPending: false }));
+  },
+
+  retryMissingModsWatch: (id) => {
+    const entry = get().installs.find((e) => e.id === id);
+    if (!entry?.instanceId || entry.missingModsWatching || !unresolvedMods(entry).length) return;
+    syncMissingModsWatch(entry.instanceId);
   },
 
   dismissMissingMod: (id, projectId) => {
     const entry = get().installs.find((e) => e.id === id);
-    if (!entry?.missingMods?.length || !entry.instanceId) return;
-    const stillHasIt = entry.missingMods.some((m) => m.projectId === projectId);
-    if (!stillHasIt) return;
-    const nextMissingMods = entry.missingMods.filter((m) => m.projectId !== projectId);
-
-    set((s) => ({
-      // Nothing left to act on for this entry once its last missing mod is
-      // dismissed — same as the watcher placing the final one.
-      installs:
-        nextMissingMods.length === 0
-          ? s.installs.filter((e) => e.id !== id)
-          : s.installs.map((e) => {
-              if (e.id !== id) return e;
-              const index = e.missingModsIndex;
-              return {
-                ...e,
-                missingMods: nextMissingMods,
-                missingModsIndex: index === undefined ? undefined : Math.min(index, nextMissingMods.length - 1),
-              };
-            }),
+    if (!entry?.missingMods?.some((m) => m.projectId === projectId) || !entry.instanceId ||
+        entry.missingModsDismissPending || entry.missingModsBrowserPending) return;
+    updateEntry(id, { missingModsDismissPending: true, missingModsDismissError: undefined });
+    void dismissMissingModApi(entry.instanceId, projectId).then(() => {
+      const current = get().installs.find((e) => e.id === id);
+      if (!current?.missingMods) return;
+      const nextMissingMods = current.missingMods.filter((m) => m.projectId !== projectId);
+      if (!nextMissingMods.length) {
+        set((s) => ({ installs: s.installs.filter((e) => e.id !== id) }));
+        if (current.missingModsWatching) syncMissingModsWatch(entry.instanceId!);
+        return;
+      }
+      const index = current.missingModsIndex;
+      const currentProject = index === undefined ? undefined : current.missingMods[index]?.projectId;
+      const placed = new Set(current.missingModsPlaced ?? []);
+      const remainingIndices = nextMissingMods.flatMap((m, i) => placed.has(m.name) ? [] : [i]);
+      const nextIndex = index === undefined || remainingIndices.length === 0 ? undefined : currentProject === projectId
+        ? remainingIndices.find((i) => i >= index) ?? remainingIndices[remainingIndices.length - 1]
+        : nextMissingMods.findIndex((m) => m.projectId === currentProject);
+      updateEntry(id, {
+        missingMods: nextMissingMods,
+        missingModsIndex: nextIndex,
+        missingModsDismissPending: false,
+      });
+      if (nextIndex !== undefined && currentProject === projectId) get().retryMissingModsBrowser(id);
+      if (current.missingModsWatching) syncMissingModsWatch(entry.instanceId!);
+    }).catch((err) => updateEntry(id, {
+      missingModsDismissPending: false,
+      missingModsDismissError: `Could not dismiss this mod: ${String(err)}. Retry “Not installing this”.`,
     }));
-    void dismissMissingModApi(entry.instanceId, projectId).catch(() => {});
+  },
+
+  reloadPendingMissingMods: () => {
+    if (get().pendingMissingModsLoading) {
+      pendingMissingModsReloadQueued = true;
+      return;
+    }
+    set({ pendingMissingModsLoading: true, pendingMissingModsError: undefined });
+    void fetchPendingMissingMods().then((pending) => {
+      set((s) => ({
+        installs: [...s.installs, ...pending.flatMap(({ instanceId, instanceName, missingMods }) => {
+          const tracked = new Set(s.installs.filter((e) => e.instanceId === instanceId)
+            .flatMap((e) => e.missingMods?.map((m) => m.projectId) ?? []));
+          const remaining = missingMods.filter((m) => !tracked.has(m.projectId));
+          return remaining.length ? [{
+            id: s.installs.some((e) => e.id === `pending-missing-mods-${instanceId}`)
+              ? `pending-missing-mods-${instanceId}-${crypto.randomUUID()}`
+              : `pending-missing-mods-${instanceId}`,
+            name: instanceName,
+            status: "done" as const,
+            message: `${remaining.length} mod(s) from a previous import still need a manual download: ${describeMissingMods(remaining)}`,
+            instanceId,
+            missingMods: remaining,
+          }] : [];
+        })],
+      }));
+      const watchingInstances = new Set(get().installs
+        .filter((e) => e.instanceId && e.missingModsWatching)
+        .map((e) => e.instanceId!));
+      for (const instanceId of watchingInstances) {
+        if (get().installs.some((e) => e.instanceId === instanceId &&
+          !e.missingModsWatching && unresolvedMods(e).length)) syncMissingModsWatch(instanceId);
+      }
+    }).catch((err) => set({ pendingMissingModsError: `Could not restore pending manual downloads: ${String(err)}` }))
+      .finally(() => {
+        set({ pendingMissingModsLoading: false });
+        if (pendingMissingModsReloadQueued) {
+          pendingMissingModsReloadQueued = false;
+          get().reloadPendingMissingMods();
+        }
+      });
   },
 }));
+
+function updateEntry(id: string, patch: Partial<InstallEntry>) {
+  useInstallStore.setState((s) => ({
+    installs: s.installs.map((e) => e.id === id ? { ...e, ...patch } : e),
+  }));
+}
+
+function unresolvedMods(entry: InstallEntry): MissingMod[] {
+  const placed = new Set(entry.missingModsPlaced ?? []);
+  return entry.missingMods?.filter((m) => !placed.has(m.name)) ?? [];
+}
+
+// One backend watcher owns an instance. Replacing it must include every active
+// manual-download card, not silently abandon another install's pending files.
+const watchRequests = new Map<string, number>();
+
+function syncMissingModsWatch(instanceId: string) {
+  const entries = useInstallStore.getState().installs.filter((e) => e.instanceId === instanceId);
+  const byProject = new Map<number, MissingMod>();
+  for (const entry of entries) {
+    for (const mod of unresolvedMods(entry)) byProject.set(mod.projectId, mod);
+  }
+  const missing = Array.from(byProject.values());
+  const request = (watchRequests.get(instanceId) ?? 0) + 1;
+  watchRequests.set(instanceId, request);
+  useInstallStore.setState((s) => ({
+    installs: s.installs.map((e) => e.instanceId === instanceId ? {
+      ...e,
+      missingModsWatching: unresolvedMods(e).length > 0,
+      missingModsWatchError: undefined,
+    } : e),
+  }));
+  // Empty lists stop the existing watch after the last item is dismissed.
+  void watchForMissingMods(instanceId, missing).catch((err) => {
+    if (watchRequests.get(instanceId) !== request) return;
+    useInstallStore.setState((s) => ({
+      installs: s.installs.map((e) => e.instanceId === instanceId && unresolvedMods(e).length ? {
+        ...e,
+        missingModsWatching: false,
+        missingModsWatchError: `Could not watch Downloads: ${String(err)}`,
+      } : e),
+    }));
+  });
+}
 
 void listen<InstallProgressEvent>("install://progress", (event) => {
   const { installId, current, total, currentName } = event.payload;
@@ -315,8 +463,8 @@ void listen<MissingModPlacedEvent>("missing-mods://placed", (event) => {
   const { instanceId, name } = event.payload;
   useInstallStore.setState((s) => ({
     installs: s.installs.map((e) =>
-      e.instanceId === instanceId && e.missingModsWatching && e.missingMods?.some((m) => m.name === name)
-        ? { ...e, missingModsPlaced: [...(e.missingModsPlaced ?? []), name] }
+      e.instanceId === instanceId && e.missingMods?.some((m) => m.name === name)
+        ? { ...e, missingModsPlaced: [...new Set([...(e.missingModsPlaced ?? []), name])] }
         : e,
     ),
     // The watcher writes straight to the instance's mods folder, bypassing
@@ -324,6 +472,10 @@ void listen<MissingModPlacedEvent>("missing-mods://placed", (event) => {
     // (which only refreshes on refreshTick) would sit stale until the user
     // navigated away and back.
     refreshTick: s.refreshTick + 1,
+    instanceRefreshTicks: {
+      ...s.instanceRefreshTicks,
+      [instanceId]: (s.instanceRefreshTicks[instanceId] ?? 0) + 1,
+    },
   }));
   // The stepper flow already shows a running "N/M placed" label, but "Open
   // all" has no such surface — a toast is the only feedback either flow
@@ -335,8 +487,19 @@ void listen<MissingModsWatchDoneEvent>("missing-mods://done", (event) => {
   const { instanceId, placed, stillMissing } = event.payload;
   useInstallStore.setState((s) => ({
     installs: s.installs.map((e) =>
-      e.instanceId === instanceId && e.missingModsWatching ? { ...e, missingModsWatching: false } : e,
+      e.instanceId === instanceId && e.missingMods?.length ? {
+        ...e,
+        missingModsWatching: false,
+        missingModsPlaced: [...new Set([...(e.missingModsPlaced ?? []), ...placed.filter((name) => e.missingMods?.some((m) => m.name === name))])],
+        missingModsWatchError: stillMissing.some((name) => e.missingMods?.some((m) => m.name === name))
+          ? e.missingModsWatchError ?? "Some mods are still missing. Retry watching Downloads." : undefined,
+      } : e,
     ),
+    refreshTick: placed.length ? s.refreshTick + 1 : s.refreshTick,
+    instanceRefreshTicks: placed.length ? {
+      ...s.instanceRefreshTicks,
+      [instanceId]: (s.instanceRefreshTicks[instanceId] ?? 0) + 1,
+    } : s.instanceRefreshTicks,
   }));
   if (placed.length === 0 && stillMissing.length === 0) return;
   pushNotification(
@@ -346,26 +509,11 @@ void listen<MissingModsWatchDoneEvent>("missing-mods://done", (event) => {
   );
 });
 
-// Re-surfaces the missing-mods flow for anything still outstanding from
-// before the app was last closed — that state otherwise only ever lived in
-// this same in-memory `installs` array, so a restart silently dropped it and
-// the user had no way back to "Download missing mods" short of re-running
-// the whole modpack import.
-void fetchPendingMissingMods()
-  .then((pending) => {
-    if (pending.length === 0) return;
-    useInstallStore.setState((s) => ({
-      installs: [
-        ...s.installs,
-        ...pending.map(({ instanceId, instanceName, missingMods }) => ({
-          id: `pending-missing-mods-${instanceId}`,
-          name: instanceName,
-          status: "done" as const,
-          message: `${missingMods.length} mod(s) from a previous import still need a manual download: ${describeMissingMods(missingMods)}`,
-          instanceId,
-          missingMods,
-        })),
-      ],
-    }));
-  })
-  .catch(() => {});
+void listen<{ instanceId: string; error: string }>("missing-mods://error", (event) => {
+  useInstallStore.setState((s) => ({
+    installs: s.installs.map((e) => e.instanceId === event.payload.instanceId && e.missingMods?.length
+      ? { ...e, missingModsWatching: false, missingModsWatchError: event.payload.error } : e),
+  }));
+});
+
+useInstallStore.getState().reloadPendingMissingMods();

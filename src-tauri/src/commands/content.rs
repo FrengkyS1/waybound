@@ -9,19 +9,46 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 
-use crate::download::safe_join;
+use crate::download::{atomic_write_checked, contained_join, ensure_contained_path};
 use crate::dto::instance::{
     ConfigFileEntry, ContentEntry, ContentMeta, InstanceContent, LaunchReadiness, MissingDep,
-    ServerEntry, WorldEntry, WrongLoaderFile,
+    ServerEntry, WorldEntry, WrongGameVersionFile, WrongLoaderFile,
 };
 use crate::dto::ModLoader;
 use crate::instances::paths::instance_root;
 use tauri::State;
 
 use super::search::AppState;
-use crate::instances::operations::acquire;
+use crate::instances::operations::{acquire, acquire_config_edit};
 
 pub(crate) const DISABLED_SUFFIX: &str = ".disabled";
+
+const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_ICON_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ICON_DIMENSION: u32 = 2048;
+const MAX_ICON_PIXELS: u64 = 4_194_304;
+const MAX_ICON_FRAMES: u32 = 64;
+const MAX_NBT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 32_768;
+const MAX_NESTED_JARS: usize = 128;
+const MAX_NESTED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Cap actual output, not only attacker-controlled advertised sizes.
+fn read_bounded(reader: impl Read, limit: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+fn read_file_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    ensure_contained_path(path.parent()?, path).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return None;
+    }
+    read_bounded(file, limit)
+}
 
 /// A mod's own declared display name, embedded icon, and modId, read from
 /// its jar metadata in one pass. Best-effort: any missing/unreadable/
@@ -110,12 +137,18 @@ fn is_pseudo_dependency(id: &str) -> bool {
 /// mod.
 fn read_mod_metadata(jar_path: &Path) -> ModMeta {
     let mut meta = ModMeta { name: None, icon: None, mod_id: None, launch: ModLaunchMeta::default(), embedded_ids: Vec::new(), all_mod_ids: Vec::new() };
+    if ensure_contained_path(jar_path.parent().unwrap_or(jar_path), jar_path).is_err() {
+        return meta;
+    }
     let Ok(file) = fs::File::open(jar_path) else {
         return meta;
     };
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return meta;
     };
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return meta;
+    }
 
     // Fabric / Quilt.
     if let Some(contents) = read_zip_entry(&mut archive, "fabric.mod.json") {
@@ -339,10 +372,14 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
 ) -> Option<String> {
-    let mut entry = archive.by_name(entry_name).ok()?;
-    let mut contents = String::new();
-    entry.read_to_string(&mut contents).ok()?;
-    Some(contents)
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return None;
+    }
+    let entry = archive.by_name(entry_name).ok()?;
+    if entry.size() > MAX_METADATA_BYTES {
+        return None;
+    }
+    String::from_utf8(read_bounded(entry, MAX_METADATA_BYTES)?).ok()
 }
 
 /// Mod ids embedded via NeoForge's Jar-in-Jar (`META-INF/jarjar/
@@ -353,47 +390,62 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
 fn embedded_jar_mod_ids<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Vec<String> {
+    let mut budget = NestedBudget { jars: 0, bytes: 0, entries: archive.len() };
     let mut ids = Vec::new();
-    let Ok(mut meta_entry) = archive.by_name("META-INF/jarjar/metadata.json") else {
-        return ids;
-    };
-    if meta_entry.size() > 1024 * 1024 {
-        return ids;
-    }
-    let mut raw = String::new();
-    if meta_entry.read_to_string(&mut raw).is_err() {
-        return ids;
-    }
-    drop(meta_entry);
-    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return ids;
-    };
-    let Some(jars) = meta.get("jars").and_then(|j| j.as_array()) else {
-        return ids;
-    };
-    for jar in jars {
-        let Some(path) = jar.get("path").and_then(|p| p.as_str()) else {
-            continue;
-        };
-        let Ok(mut nested_entry) = archive.by_name(path) else {
-            continue;
-        };
-        if nested_entry.size() > 64 * 1024 * 1024 {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        if nested_entry.read_to_end(&mut bytes).is_err() {
-            continue;
-        }
-        drop(nested_entry);
-        let Ok(mut nested) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-            continue;
-        };
-        if let Some(id) = first_mod_id(&mut nested) {
-            ids.push(id);
-        }
-    }
+    collect_embedded_ids(archive, &mut budget, 0, &mut ids);
     ids
+}
+
+struct NestedBudget {
+    jars: usize,
+    bytes: u64,
+    entries: usize,
+}
+
+fn collect_embedded_ids<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    budget: &mut NestedBudget,
+    depth: usize,
+    ids: &mut Vec<String>,
+) {
+    if depth >= 4 || budget.entries > MAX_ARCHIVE_ENTRIES {
+        return;
+    }
+    let Some(raw) = read_zip_entry(archive, "META-INF/jarjar/metadata.json") else { return };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let Some(jars) = meta.get("jars").and_then(|j| j.as_array()) else { return };
+    for jar in jars {
+        if budget.jars >= MAX_NESTED_JARS || budget.bytes >= MAX_NESTED_BYTES {
+            break;
+        }
+        let Some(path) = jar.get("path").and_then(|p| p.as_str()) else { continue };
+        let Ok(entry) = archive.by_name(path) else { continue };
+        budget.jars += 1;
+        let limit = MAX_NESTED_BYTES.saturating_sub(budget.bytes).min(64 * 1024 * 1024);
+        if entry.size() > limit { continue }
+        let Some(bytes) = read_nested_jar(entry, budget) else { continue };
+        let Ok(mut nested) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { continue };
+        budget.entries = budget.entries.saturating_add(nested.len());
+        if budget.entries > MAX_ARCHIVE_ENTRIES { break }
+        if let Some(id) = first_mod_id(&mut nested) {
+            push_mod_id(ids, Some(&id));
+        }
+        collect_embedded_ids(&mut nested, budget, depth + 1, ids);
+    }
+}
+
+fn read_nested_jar(reader: impl Read, budget: &mut NestedBudget) -> Option<Vec<u8>> {
+    let limit = MAX_NESTED_BYTES.saturating_sub(budget.bytes).min(64 * 1024 * 1024);
+    if limit == 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let result = reader.take(limit + 1).read_to_end(&mut bytes);
+    // Failed/oversized entries consumed output too; they must spend the same
+    // shared budget as valid entries rather than resetting it for every jar.
+    budget.bytes = budget.bytes.saturating_add(bytes.len() as u64);
+    result.ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
 }
 
 /// First mod id out of a jar's metadata, NeoForge-first like the loader
@@ -427,6 +479,7 @@ fn first_mod_id<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipArchive<
 
 /// Reads a resource pack's `pack.png`, the standard convention for its icon.
 fn read_resourcepack_icon(zip_path: &Path) -> Option<String> {
+    ensure_contained_path(zip_path.parent()?, zip_path).ok()?;
     let file = fs::File::open(zip_path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     read_zip_image_entry(&mut archive, "pack.png")
@@ -436,24 +489,265 @@ fn read_zip_image_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
 ) -> Option<String> {
-    let mut entry = archive.by_name(entry_name).ok()?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).ok()?;
-    if bytes.is_empty() {
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
         return None;
     }
-    let mime = match Path::new(entry_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        _ => "image/png",
-    };
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let entry = archive.by_name(entry_name).ok()?;
+    if entry.size() > MAX_ICON_BYTES {
+        return None;
+    }
+    let bytes = read_bounded(entry, MAX_ICON_BYTES)?;
+    icon_data_url(&bytes)
+}
+
+fn icon_dimensions_allowed(width: u32, height: u32) -> bool {
+    width != 0 && height != 0
+        && width <= MAX_ICON_DIMENSION && height <= MAX_ICON_DIMENSION
+        && u64::from(width) * u64::from(height) <= MAX_ICON_PIXELS
+}
+
+/// Inspect container headers without decoding pixels. Only previously supported
+/// raster formats are emitted; an extension never establishes the MIME type.
+/// SVG was previously labeled PNG, not supported as SVG. Keep vector content
+/// out of this raster-only path rather than claim to bound SVG rendering costs.
+fn icon_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() as u64 > MAX_ICON_BYTES {
+        return None;
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        png_icon_allowed(bytes).then_some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8") {
+        jpeg_icon_allowed(bytes).then_some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        gif_icon_allowed(bytes).then_some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn icon_data_url(bytes: &[u8]) -> Option<String> {
+    let mime = icon_mime(bytes)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Some(format!("data:{mime};base64,{encoded}"))
+}
+
+fn server_icon_data_url(encoded: &str) -> Option<String> {
+    if encoded.len() as u64 > MAX_ICON_BYTES.div_ceil(3) * 4 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let mime = icon_mime(&bytes)?;
+    Some(format!("data:{mime};base64,{encoded}"))
+}
+
+fn png_icon_allowed(bytes: &[u8]) -> bool {
+    let mut offset = 8;
+    let mut header = false;
+    let mut image = false;
+    while let Some(chunk_header) = bytes.get(offset..offset + 8) {
+        let length = u32::from_be_bytes(chunk_header[..4].try_into().unwrap()) as usize;
+        let kind = &chunk_header[4..];
+        let Some(end) = offset.checked_add(12).and_then(|n| n.checked_add(length)) else { return false };
+        let Some(data) = bytes.get(offset + 8..end.saturating_sub(4)) else { return false };
+        if end > bytes.len() || !kind.iter().all(u8::is_ascii_alphabetic) {
+            return false;
+        }
+        match kind {
+            b"IHDR" if !header && offset == 8 && length == 13 => {
+                let width = u32::from_be_bytes(data[..4].try_into().unwrap());
+                let height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                let depth_allowed = match data[9] {
+                    0 => matches!(data[8], 1 | 2 | 4 | 8 | 16),
+                    2 | 4 | 6 => matches!(data[8], 8 | 16),
+                    3 => matches!(data[8], 1 | 2 | 4 | 8),
+                    _ => false,
+                };
+                if !icon_dimensions_allowed(width, height) || !depth_allowed
+                    || data[10] != 0 || data[11] != 0 || data[12] > 1
+                {
+                    return false;
+                }
+                header = true;
+            }
+            b"IHDR" => return false,
+            // APNG may retain many full canvases. Do not treat it as one PNG.
+            b"acTL" | b"fcTL" | b"fdAT" => return false,
+            b"IDAT" if header => image |= !data.is_empty(),
+            b"IEND" => return header && image && length == 0 && end == bytes.len(),
+            _ if !header => return false,
+            _ => {}
+        }
+        offset = end;
+    }
+    false
+}
+
+fn jpeg_icon_allowed(bytes: &[u8]) -> bool {
+    let mut offset = 2;
+    let mut dimensions = false;
+    let mut scan = false;
+    let mut in_scan = false;
+    while offset < bytes.len() {
+        if in_scan {
+            // Skip entropy data, stuffed FF bytes, and restart markers.
+            while offset < bytes.len() && bytes[offset] != 0xff {
+                offset += 1;
+            }
+        }
+        if bytes.get(offset) != Some(&0xff) {
+            return false;
+        }
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let Some(&marker) = bytes.get(offset) else { return false };
+        offset += 1;
+        if in_scan && (marker == 0 || (0xd0..=0xd7).contains(&marker)) {
+            continue;
+        }
+        in_scan = false;
+        if marker == 0xd9 {
+            return dimensions && scan && offset == bytes.len();
+        }
+        if matches!(marker, 0 | 0x01 | 0xd0..=0xd8) {
+            return false;
+        }
+        let Some(length_bytes) = bytes.get(offset..offset + 2) else { return false };
+        let length = u16::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+        if length < 2 {
+            return false;
+        }
+        let Some(segment) = bytes.get(offset + 2..offset + length) else { return false };
+        match marker {
+            // Browser-supported sequential and progressive Huffman JPEG.
+            0xc0..=0xc2 => {
+                if dimensions || scan || segment.len() < 6 || segment[0] != 8 {
+                    return false;
+                }
+                let height = u16::from_be_bytes(segment[1..3].try_into().unwrap());
+                let width = u16::from_be_bytes(segment[3..5].try_into().unwrap());
+                let components = usize::from(segment[5]);
+                if !(1..=4).contains(&components) || segment.len() != 6 + 3 * components
+                    || !icon_dimensions_allowed(u32::from(width), u32::from(height))
+                {
+                    return false;
+                }
+                dimensions = true;
+            }
+            // Other SOFs and deferred-height DNL are not accepted.
+            0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf | 0xdc => return false,
+            0xda => {
+                if !dimensions || segment.is_empty() {
+                    return false;
+                }
+                let components = usize::from(segment[0]);
+                if !(1..=4).contains(&components) || segment.len() != 4 + 2 * components {
+                    return false;
+                }
+                scan = true;
+                in_scan = true;
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+    false
+}
+
+fn gif_sub_blocks(bytes: &[u8], offset: &mut usize) -> Option<usize> {
+    let mut total = 0;
+    loop {
+        let length = usize::from(*bytes.get(*offset)?);
+        *offset += 1;
+        if length == 0 {
+            return Some(total);
+        }
+        bytes.get(*offset..*offset + length)?;
+        *offset += length;
+        total += length;
+    }
+}
+
+fn gif_icon_allowed(bytes: &[u8]) -> bool {
+    let Some(screen) = bytes.get(6..13) else { return false };
+    let width = u32::from(u16::from_le_bytes(screen[..2].try_into().unwrap()));
+    let height = u32::from(u16::from_le_bytes(screen[2..4].try_into().unwrap()));
+    if !icon_dimensions_allowed(width, height) {
+        return false;
+    }
+    let mut offset = 13;
+    if screen[4] & 0x80 != 0 {
+        offset += 3 * (1usize << ((screen[4] & 7) + 1));
+    }
+    let mut frames = 0;
+    loop {
+        match bytes.get(offset) {
+            Some(0x3b) => return frames > 0 && offset + 1 == bytes.len(),
+            Some(0x2c) => {
+                let Some(image) = bytes.get(offset + 1..offset + 10) else { return false };
+                let left = u32::from(u16::from_le_bytes(image[..2].try_into().unwrap()));
+                let top = u32::from(u16::from_le_bytes(image[2..4].try_into().unwrap()));
+                let frame_width = u32::from(u16::from_le_bytes(image[4..6].try_into().unwrap()));
+                let frame_height = u32::from(u16::from_le_bytes(image[6..8].try_into().unwrap()));
+                frames += 1;
+                // Charge the full logical canvas per frame, not only patches.
+                if frames > MAX_ICON_FRAMES
+                    || u64::from(width) * u64::from(height) * u64::from(frames) > MAX_ICON_PIXELS
+                    || !icon_dimensions_allowed(frame_width, frame_height)
+                    || left + frame_width > width || top + frame_height > height
+                    || image[8] & 0x18 != 0
+                {
+                    return false;
+                }
+                offset += 10;
+                if image[8] & 0x80 != 0 {
+                    offset += 3 * (1usize << ((image[8] & 7) + 1));
+                }
+                if !matches!(bytes.get(offset), Some(2..=8)) {
+                    return false;
+                }
+                offset += 1;
+                if !matches!(gif_sub_blocks(bytes, &mut offset), Some(1..)) {
+                    return false;
+                }
+            }
+            Some(0x21) => {
+                let Some(&label) = bytes.get(offset + 1) else { return false };
+                offset += 2;
+                match label {
+                    0xf9 => {
+                        let Some(control) = bytes.get(offset..offset + 6) else { return false };
+                        if control[0] != 4 || control[1] & 0xe0 != 0
+                            || (control[1] >> 2) & 7 > 3 || control[5] != 0
+                        {
+                            return false;
+                        }
+                        offset += 6;
+                    }
+                    0xff => {
+                        if bytes.get(offset) != Some(&11) {
+                            return false;
+                        }
+                        if bytes.get(offset + 1..offset + 12).is_none() {
+                            return false;
+                        }
+                        offset += 12;
+                        if gif_sub_blocks(bytes, &mut offset).is_none() {
+                            return false;
+                        }
+                    }
+                    0xfe => {
+                        if gif_sub_blocks(bytes, &mut offset).is_none() {
+                            return false;
+                        }
+                    }
+                    // Plain-text and unknown rendering extensions are refused.
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -505,15 +799,13 @@ fn scan_dir(dir: &Path, expected_ext: &str) -> Vec<ScannedFile> {
         if raw.starts_with('.') {
             continue;
         }
-        let (file_name, enabled) = match raw.strip_suffix(DISABLED_SUFFIX) {
-            Some(base) => (base.to_string(), false),
-            None => (raw.clone(), true),
-        };
+        let enabled = !raw.ends_with(DISABLED_SUFFIX);
+        let logical_name = raw.strip_suffix(DISABLED_SUFFIX).unwrap_or(&raw);
         // A resource/shader pack can be an unzipped folder — that's still
         // real content, just not archived — so only files (never
         // directories) are held to the extension check.
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if !is_dir && !file_name.to_ascii_lowercase().ends_with(expected_ext) {
+        if !is_dir && !logical_name.to_ascii_lowercase().ends_with(expected_ext) {
             continue;
         }
         let metadata = entry.metadata().ok();
@@ -523,7 +815,7 @@ fn scan_dir(dir: &Path, expected_ext: &str) -> Vec<ScannedFile> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        out.push(ScannedFile { file_name, enabled, size_bytes, mtime_unix });
+        out.push(ScannedFile { file_name: raw, enabled, size_bytes, mtime_unix });
     }
     out.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
     out
@@ -582,10 +874,8 @@ fn apply_cache(
                 size_bytes: f.size_bytes,
                 meta_resolved: hit.is_some(),
                 has_config,
-                // Tracked rows carry the verdict; untracked files fall back
-                // to the sidecar check done by the caller; anything left
-                // over is user-added by elimination. Both spellings cover
-                // `.disabled`-suffixed rows, whose display name is stripped.
+                // Physical filenames identify distinct enabled/disabled files.
+                // Sidecar provenance alone uses the logical unsuffixed name.
                 added_by_you: origins
                     .get(&f.file_name)
                     .or_else(|| {
@@ -601,7 +891,7 @@ fn apply_cache(
 }
 
 fn file_stem(file_name: &str) -> String {
-    Path::new(file_name)
+    Path::new(file_name.strip_suffix(DISABLED_SUFFIX).unwrap_or(file_name))
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| file_name.to_string())
@@ -714,10 +1004,16 @@ struct ConfigTopEntry {
 
 fn scan_config_top_level(config_dir: &Path) -> Vec<ConfigTopEntry> {
     let mut out = Vec::new();
+    if ensure_contained_path(config_dir, config_dir).is_err() {
+        return out;
+    }
     let Ok(entries) = fs::read_dir(config_dir) else {
         return out;
     };
     for entry in entries.flatten() {
+        if ensure_contained_path(config_dir, &entry.path()).is_err() {
+            continue;
+        }
         let raw_name = entry.file_name().to_string_lossy().to_string();
         if raw_name.starts_with('.') {
             continue;
@@ -736,21 +1032,7 @@ fn scan_config_top_level(config_dir: &Path) -> Vec<ConfigTopEntry> {
 /// building `relative_prefix`-prefixed paths relative to `config/` itself —
 /// what the frontend passes back to `read_config_file`/`write_config_file`.
 fn collect_text_configs_recursive(dir: &Path, relative_prefix: &str, out: &mut Vec<ConfigFileEntry>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        let relative = format!("{relative_prefix}/{name}");
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            collect_text_configs_recursive(&entry.path(), &relative, out);
-        } else if is_text_config_file(&name) {
-            out.push(ConfigFileEntry { relative_path: relative.clone(), display_name: relative });
-        }
-    }
+    collect_world_text_files(dir, relative_prefix, out);
 }
 
 #[tauri::command]
@@ -845,19 +1127,11 @@ pub async fn list_instance_content(
     result
 }
 
-/// Locate a content file on disk given its display name (enabled or disabled).
-/// `file_name` is frontend-supplied, so it's resolved through `safe_join`
-/// rather than trusted as a plain path segment.
+/// Content filenames are physical basenames, including `.disabled`.
+/// Resolve only that exact file; never alias an enabled and disabled duplicate.
 fn resolve_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
-    let enabled = safe_join(dir, file_name).ok()?;
-    if enabled.exists() {
-        return Some(enabled);
-    }
-    let disabled = safe_join(dir, &format!("{file_name}{DISABLED_SUFFIX}")).ok()?;
-    if disabled.exists() {
-        return Some(disabled);
-    }
-    None
+    let path = contained_join(dir, file_name).ok()?;
+    path.exists().then_some(path)
 }
 
 /// One enabled jar's launch-relevant metadata for readiness assessment.
@@ -872,15 +1146,21 @@ pub(crate) struct FileLaunchMeta {
     pub launch: ModLaunchMeta,
 }
 
-/// Judges parsed jar metadata against the instance's loader: loader-family
-/// mismatches plus required dependency ids no installed jar provides.
+/// Judges parsed jar metadata against the instance's loader and game
+/// version: loader-family mismatches, game-version ranges the instance
+/// falls outside of, plus required dependency ids no installed jar
+/// provides.
 /// Only the metadata entry matching the instance's loader counts — a
 /// multiloader jar's Fabric deps are meaningless on a NeoForge instance
 /// (and vice versa). A jar with no matching entry is flagged wrong-loader
 /// and its deps are skipped to avoid piling noise on the real problem.
+/// File names are never consulted for versions (mod versions share the MC
+/// namespace). A jar whose entry carries no usable MC range stays silent
+/// on game version.
 /// Pure (no I/O) so the rules are unit-testable without instance fixtures.
 pub(crate) fn assess_readiness(
     instance_loader: ModLoader,
+    instance_mc_version: &str,
     files: &[FileLaunchMeta],
     embedded_ids: &[String],
 ) -> LaunchReadiness {
@@ -903,6 +1183,7 @@ pub(crate) fn assess_readiness(
     installed_ids.extend(embedded_ids.iter().map(|id| id.to_ascii_lowercase()));
     let mut wrong_loader = Vec::new();
     let mut missing_deps = Vec::new();
+    let mut wrong_game_version = Vec::new();
     for file in files {
         let matching = file
             .launch
@@ -936,12 +1217,211 @@ pub(crate) fn assess_readiness(
                 });
             }
         }
+        // Game version: the matching loader entry's metadata ranges are
+        // the only signal. File names are deliberately NOT consulted —
+        // mod versions share the MC namespace (`alexsmobs-1.22.9.jar` is
+        // Alex's Mobs' own 1.22.9 built for MC 1.20.1), so name-based
+        // flagging cried wolf on working packs. A jar with no usable range
+        // stays silent; the install-time validation guards that class.
+        let shaped: Vec<&String> = entry
+            .mc_versions
+            .iter()
+            .filter(|r| range_mentions_mc_version(r))
+            .collect();
+        let declared = if shaped.is_empty()
+            || shaped
+                .iter()
+                .any(|r| mc_range_matches(r, instance_mc_version))
+        {
+            None
+        } else {
+            Some(entry.mc_versions.join(", "))
+        };
+        if let Some(declared) = declared {
+            wrong_game_version.push(WrongGameVersionFile {
+                file_name: file.file_name.clone(),
+                mod_name: file.mod_name.clone(),
+                declared,
+                expected: instance_mc_version.to_string(),
+            });
+        }
     }
     LaunchReadiness {
         checked_files: files.len() as u32,
         wrong_loader,
         missing_deps,
+        wrong_game_version,
     }
+}
+
+/// Numeric triple for game-version ordering across both Mojang schemes:
+/// legacy `1.x.y` and year-based `26.x`. Non-numeric tails (snapshots like
+/// `26.3-snapshot-5`) parse by leading digits; missing parts are zero.
+fn mc_triplet(version: &str) -> (u32, u32, u32) {
+    let mut parts = version.split('.');
+    let num = |p: Option<&str>| {
+        p.unwrap_or("")
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    };
+    (num(parts.next()), num(parts.next()), num(parts.next()))
+}
+
+/// Exact-or-line equality: only the major.minor line must match — Mojang
+/// keeps patches wire-compatible, so a jar declaring 1.20 (or 1.20.0)
+/// runs on 1.20.1, while 1.20.x on 1.21.y genuinely breaks.
+fn mc_exact_matches(declared: &str, mc: (u32, u32, u32)) -> bool {
+    let base = declared.trim().trim_end_matches(".x").trim_end_matches('.');
+    // No digits at all ("*"-adjacent garbage): unparseable, passes.
+    if !base.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let t = mc_triplet(base);
+    t.0 == mc.0 && t.1 == mc.1
+}
+
+/// Whether an instance game version is accepted by one minecraft dependency
+/// range from jar metadata. Covers the shapes mods actually ship: "*"
+/// (anything), exact versions ("1.20.1"), maven intervals ("[1.20,1.21)"),
+/// Fabric/npm comparators (">=1.20", ">1.20 <1.21", "1.20.x") and "||"
+/// unions. Anything unparseable matches — readiness is advisory and must
+/// not cry wolf on exotic ranges.
+///
+/// Comparison is at major.minor LINE granularity with inclusive bounds:
+/// patches stay wire-compatible, and — decisively — the game loader itself
+/// accepts the MDK-boilerplate `[1.21,1.21.1)` on 1.21.1 (NeoForge's own
+/// loading screen named only the truly wrong file when a 1.20.1 jar sat
+/// next to forty such mods). A checker stricter than the loader is just
+/// another wolf cry.
+fn mc_range_matches(range: &str, mc_version: &str) -> bool {
+    let mc = mc_triplet(mc_version);
+    let mc_line = (mc.0, mc.1);
+    // Maven multi-ranges (`[1.21],[1.21.1]` — an exact-pin union) split on
+    // commas that are NOT inside brackets; interval commas are handled
+    // by the branch logic below. An empty range matches (no constraint).
+    let parts = split_top_level(range);
+    if parts.is_empty() {
+        return true;
+    }
+    parts.into_iter().any(|part| {
+        part.split("||").any(|branch| {
+            let branch = branch.trim();
+        if branch.is_empty() || branch == "*" {
+            return true;
+        }
+        // Maven interval: bounds name LINES, and both ends count as
+        // inclusive no matter the bracket flavor — see the doc comment.
+        if (branch.starts_with('[') || branch.starts_with('('))
+            && (branch.ends_with(']') || branch.ends_with(')'))
+        {
+            let inner = &branch[1..branch.len() - 1];
+            // No comma: an exact pin (`[1.20]`), matched by line.
+            if !inner.contains(',') {
+                return mc_exact_matches(inner, mc);
+            }
+            let mut bounds = inner.splitn(2, ',');
+            let lo = bounds.next().unwrap_or("").trim();
+            let hi = bounds.next().unwrap_or("").trim();
+            // Digitless bounds ("(,)") are open-ended, like empty ones.
+            if !lo.is_empty() && lo.chars().any(|c| c.is_ascii_digit()) {
+                let t = mc_triplet(lo);
+                if mc_line < (t.0, t.1) {
+                    return false;
+                }
+            }
+            if !hi.is_empty() && hi.chars().any(|c| c.is_ascii_digit()) {
+                let t = mc_triplet(hi);
+                if mc_line > (t.0, t.1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Space/comma-separated AND of comparator atoms. Comparators keep
+        // full-triplet strictness (`<1.21.2` on 1.21.1 passes, on 1.21.2
+        // fails) — only intervals and bare versions compare by line, since
+        // only those are written line-wise by authors and tooling.
+        branch
+            .split(|c| c == ' ' || c == ',')
+            .filter(|p| !p.is_empty())
+            .all(|atom| {
+                let (op, ver) = if let Some(v) = atom.strip_prefix(">=") {
+                    (">=", v)
+                } else if let Some(v) = atom.strip_prefix("<=") {
+                    ("<=", v)
+                } else if let Some(v) = atom.strip_prefix('>') {
+                    (">", v)
+                } else if let Some(v) = atom.strip_prefix('<') {
+                    ("<", v)
+                } else if let Some(v) = atom.strip_prefix('=') {
+                    ("=", v)
+                } else if let Some(v) = atom.strip_prefix('~') {
+                    // npm `~1.20` (patch-level): >=1.20.0.
+                    (">=", v)
+                } else if let Some(v) = atom.strip_prefix('^') {
+                    // npm `^1.20` (compatible-within-line): >=1.20.0.
+                    (">=", v)
+                } else {
+                    ("=", atom)
+                };
+                let ver = ver.trim();
+                if ver.is_empty() || ver == "*" {
+                    return true;
+                }
+                // Digitless comparator bounds are unparseable: pass.
+                if !ver.chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+                let t = mc_triplet(ver.trim_end_matches(".x").trim_end_matches('.'));
+                match op {
+                    ">=" => mc >= t,
+                    "<=" => mc <= t,
+                    ">" => mc > t,
+                    "<" => mc < t,
+                    _ => mc_exact_matches(ver, mc),
+                }
+            })
+        })
+    })
+}
+
+/// Splits a range on commas outside any brackets: maven multi-ranges like
+/// `[1.21],[1.21.1]` are unions, while the comma inside `[1.20,1.21)` is
+/// the interval separator the branch logic consumes.
+fn split_top_level(range: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in range.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(range[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(range[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// Whether a range string mentions any Minecraft-shaped version (a version
+/// part starting with 1 or 26). Jar metadata occasionally carries non-MC
+/// junk in version fields; without this, such junk would evaluate against
+/// the instance version and cry wolf.
+fn range_mentions_mc_version(range: &str) -> bool {
+    range
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|p| !p.is_empty())
+        .any(|p| {
+            let mut nums = p.split('.');
+            matches!(nums.next(), Some("1") | Some("26"))
+        })
 }
 
 /// Pre-launch readiness check: reads every ENABLED jar's own metadata and
@@ -993,7 +1473,7 @@ pub async fn check_launch_readiness(
     })
     .await
     .map_err(|e| e.to_string())?;
-    Ok(assess_readiness(instance.loader, &files.0, &files.1))
+    Ok(assess_readiness(instance.loader, &instance.minecraft_version, &files.0, &files.1))
 }
 
 /// Lists singleplayer worlds (`saves/*/level.dat`) oldest detail omitted:
@@ -1015,7 +1495,7 @@ pub async fn list_instance_worlds(
         let mut folders: Vec<_> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
+            .filter(|p| p.is_dir() && ensure_contained_path(&root.join("saves"), p).is_ok())
             .collect();
         folders.sort();
         for folder in folders {
@@ -1057,21 +1537,16 @@ fn read_world_entry(folder: &std::path::Path, folder_name: &str) -> WorldEntry {
         game_version: None,
         icon: None,
     };
-    if let Ok(icon_bytes) = std::fs::read(folder.join("icon.png")) {
-        if !icon_bytes.is_empty() {
-            entry.icon = Some(format!("data:image/png;base64,{}", base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                icon_bytes
-            )));
-        }
+    if let Some(icon_bytes) = read_file_bounded(&folder.join("icon.png"), MAX_ICON_BYTES) {
+        entry.icon = icon_data_url(&icon_bytes);
     }
-    let Ok(bytes) = std::fs::read(folder.join("level.dat")) else {
+    let Some(bytes) = read_file_bounded(&folder.join("level.dat"), MAX_NBT_BYTES) else {
         return entry;
     };
-    let Some(data) = nbt_root_data(&bytes).and_then(|root| match root.get("Data") {
-        Some(valence_nbt::Value::Compound(data)) => Some(data.clone()),
-        _ => None,
-    }) else {
+    let Some(root) = nbt_root_data(&bytes) else {
+        return entry;
+    };
+    let Some(valence_nbt::Value::Compound(data)) = root.get("Data") else {
         return entry;
     };
     entry.name = data.get("LevelName").and_then(|v| match v {
@@ -1097,7 +1572,7 @@ fn read_world_entry(folder: &std::path::Path, folder_name: &str) -> WorldEntry {
 }
 
 fn read_servers_file(path: &std::path::Path) -> Vec<ServerEntry> {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Some(bytes) = read_file_bounded(path, MAX_NBT_BYTES) else {
         return Vec::new();
     };
     // Vanilla writes servers.dat uncompressed; tolerate a gzipped one.
@@ -1120,9 +1595,7 @@ fn read_servers_file(path: &std::path::Path) -> Vec<ServerEntry> {
                 _ => None,
             })?;
             let icon = e.get("icon").and_then(|v| match v {
-                valence_nbt::Value::String(s) if !s.is_empty() => {
-                    Some(format!("data:image/png;base64,{s}"))
-                }
+                valence_nbt::Value::String(s) => server_icon_data_url(s),
                 _ => None,
             });
             Some(ServerEntry { name, address, icon })
@@ -1133,16 +1606,15 @@ fn read_servers_file(path: &std::path::Path) -> Vec<ServerEntry> {
 /// Decodes NBT bytes that may be gzipped (level.dat always is) or raw
 /// (servers.dat is). Returns the root compound.
 fn nbt_root_data(bytes: &[u8]) -> Option<valence_nbt::Compound> {
-    use std::io::Read;
-    let raw: Vec<u8> = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        let mut decoder = flate2::read::GzDecoder::new(bytes);
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out).ok()?;
-        out
+    if bytes.len() as u64 > MAX_NBT_BYTES {
+        return None;
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let raw = read_bounded(flate2::read::GzDecoder::new(bytes), MAX_NBT_BYTES)?;
+        valence_nbt::from_binary(&mut raw.as_slice()).ok().map(|(root, _)| root)
     } else {
-        bytes.to_vec()
-    };
-    valence_nbt::from_binary(&mut raw.as_slice()).ok().map(|(root, _)| root)
+        valence_nbt::from_binary(&mut &bytes[..]).ok().map(|(root, _)| root)
+    }
 }
 
 /// Resolves one file's display name + icon by opening just that jar/zip —
@@ -1160,8 +1632,9 @@ pub async fn get_content_meta(
     let Some(path) = resolve_file(&dir, &file_name) else {
         return Ok(ContentMeta::default());
     };
-    let is_jar = file_name.to_lowercase().ends_with(".jar");
-    let is_zip = file_name.to_lowercase().ends_with(".zip");
+    let logical_name = file_name.strip_suffix(DISABLED_SUFFIX).unwrap_or(&file_name);
+    let is_jar = logical_name.to_lowercase().ends_with(".jar");
+    let is_zip = logical_name.to_lowercase().ends_with(".zip");
 
     // Icon recorded when this mod was installed via Browse, used as a
     // fallback when the jar doesn't embed its own icon. A single-row lookup
@@ -1238,7 +1711,7 @@ pub async fn get_content_meta(
 
 #[tauri::command]
 pub fn set_content_enabled(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     instance_id: String,
     category: String,
     file_name: String,
@@ -1250,13 +1723,32 @@ pub fn set_content_enabled(
     let current = resolve_file(&dir, &file_name)
         .ok_or_else(|| format!("'{file_name}' was not found in this instance."))?;
 
-    let target = if enabled {
-        safe_join(&dir, &file_name).map_err(|e| e.to_string())?
-    } else {
-        safe_join(&dir, &format!("{file_name}{DISABLED_SUFFIX}")).map_err(|e| e.to_string())?
-    };
-    if current != target {
-        fs::rename(&current, &target).map_err(|e| e.to_string())?;
+    let logical_name = file_name.strip_suffix(DISABLED_SUFFIX).unwrap_or(&file_name);
+    let target_name = if enabled { logical_name.to_owned() } else { format!("{logical_name}{DISABLED_SUFFIX}") };
+    let target = contained_join(&dir, &target_name).map_err(|e| e.to_string())?;
+    rename_content_file(&root, &current, &target, || {
+        state.db.rename_instance_content(&instance_id, &category, &file_name, &target_name, &target.display().to_string())
+            .map_err(|e| e.to_string())
+    })?;
+    Ok(())
+}
+
+fn rename_content_file(
+    root: &Path,
+    current: &Path,
+    target: &Path,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    ensure_contained_path(root, current).map_err(|e| e.to_string())?;
+    ensure_contained_path(root, target).map_err(|e| e.to_string())?;
+    if current == target { return publish(); }
+    if target.exists() { return Err("The target filename already exists; neither file was changed.".into()); }
+    fs::rename(current, target).map_err(|e| e.to_string())?;
+    if let Err(error) = publish() {
+        if let Err(restore) = fs::rename(target, current) {
+            return Err(format!("{error}; could not restore filename: {restore}. File retained at {}", target.display()));
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -1277,12 +1769,12 @@ pub fn remove_content_file(
     if file.is_dir() {
         fs::remove_dir_all(&file).map_err(|e| e.to_string())?;
     } else {
-        fs::remove_file(&file).map_err(|e| e.to_string())?;
-    }
-
-    // Best-effort: drop any tracked mod row pointing at this file.
-    if category == "mod" {
-        let _ = state.db.delete_instance_mod_by_file(&instance_id, &file_name);
+        crate::instances::remove_tracked_file(&root, &file, || {
+            if category == "mod" {
+                state.db.delete_instance_mod_by_file(&instance_id, &file_name)?;
+            }
+            Ok(())
+        }).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1300,6 +1792,7 @@ pub fn list_mod_configs(
 ) -> Result<Vec<ConfigFileEntry>, String> {
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
     let config_dir = root.join("config");
+    ensure_contained_path(&root, &config_dir).map_err(|e| e.to_string())?;
 
     let mut terms = vec![normalize_for_match(&file_stem(&file_name))];
     if let Ok(mods) = state.db.list_instance_mods(&instance_id) {
@@ -1343,24 +1836,78 @@ pub fn list_mod_configs(
     Ok(results)
 }
 
+/// All plain-text config files, including files not matched to a mod jar.
+#[tauri::command]
+pub fn list_instance_configs(
+    state: State<'_, AppState>,
+    instance_id: String,
+) -> Result<Vec<ConfigFileEntry>, String> {
+    state.db.get_instance(&instance_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| "Instance not found.".to_string())?;
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let dir = root.join("config");
+    ensure_contained_path(&root, &dir).map_err(|e| e.to_string())?;
+    let mut files = Vec::new();
+    collect_world_text_files(&dir, "", &mut files);
+    files.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(files)
+}
+
 /// Config files are typically a few KB; this is generous headroom for a
 /// verbose one while still refusing anything a plain textarea shouldn't
 /// try to hold in memory and diff on every keystroke.
 const MAX_EDITABLE_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 
+fn editable_path(base: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    if !is_text_config_file(relative_path) {
+        return Err("This file type isn't editable in-app. Binary world files cannot be edited.".to_string());
+    }
+    contained_join(base, relative_path).map_err(|e| e.to_string())
+}
+
+fn read_editable_text(base: &Path, relative_path: &str) -> Result<String, String> {
+    let path = editable_path(base, relative_path)?;
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Choose a plain-text file, not a folder.".to_string());
+    }
+    let bytes = read_bounded(file, MAX_EDITABLE_CONFIG_BYTES)
+        .ok_or_else(|| "Couldn't read this file within the 2 MB editor limit. Use Open folder and a text editor instead.".to_string())?;
+    if bytes.contains(&0) {
+        return Err("This file contains binary data and cannot be edited in-app.".to_string());
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "Couldn't read this file as UTF-8 text. Use Open folder and a text editor instead.".to_string())
+}
+
+fn save_editable_text(
+    base: &Path,
+    relative_path: &str,
+    contents: &str,
+    expected_contents: &str,
+) -> Result<(), String> {
+    if contents.len() as u64 > MAX_EDITABLE_CONFIG_BYTES
+        || expected_contents.len() as u64 > MAX_EDITABLE_CONFIG_BYTES
+    {
+        return Err("This draft exceeds the 2 MB editor limit.".to_string());
+    }
+    if contents.contains('\0') {
+        return Err("Binary data cannot be saved with the text editor.".to_string());
+    }
+    let path = editable_path(base, relative_path)?;
+    let current = read_editable_text(base, relative_path)?;
+    if current != expected_contents {
+        return Err("This file changed on disk. Your draft is intact; copy it before reloading to review the external changes.".to_string());
+    }
+    ensure_contained_path(base, &path).map_err(|e| e.to_string())?;
+    atomic_write_checked(&path, contents.as_bytes(), expected_contents.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn read_config_file(instance_id: String, relative_path: String) -> Result<String, String> {
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
-    let path = safe_join(&root.join("config"), &relative_path).map_err(|e| e.to_string())?;
-    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
-    if metadata.len() > MAX_EDITABLE_CONFIG_BYTES {
-        return Err(format!(
-            "This file is {:.1} MB — too large to edit in-app. Use \"Open folder\" and a text editor instead.",
-            metadata.len() as f64 / (1024.0 * 1024.0)
-        ));
-    }
-    fs::read_to_string(&path)
-        .map_err(|_| "Couldn't read this file as text — it may not be a plain-text config.".to_string())
+    read_editable_text(&root.join("config"), &relative_path)
 }
 
 #[tauri::command]
@@ -1368,11 +1915,105 @@ pub fn write_config_file(
     instance_id: String,
     relative_path: String,
     contents: String,
+    expected_contents: String,
 ) -> Result<(), String> {
+    let _operation = acquire_config_edit(&instance_id)?;
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    save_editable_text(&root.join("config"), &relative_path, &contents, &expected_contents)
+}
+
+/// Recursively collects every text-editable file under one world folder,
+/// paths relative to the world folder itself — what the frontend passes
+/// back to `read_world_file`/`write_world_file`. `level.dat`/`session.lock`
+/// and friends are binary and never match the text-extension filter, so no
+/// special-casing is needed beyond the shared dotfile skip.
+fn collect_world_text_files(dir: &Path, relative_prefix: &str, out: &mut Vec<ConfigFileEntry>) {
+    if relative_prefix.split('/').count() > 32 || out.len() >= 8192
+        || ensure_contained_path(dir, dir).is_err()
+    {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= 8192 {
+            break;
+        }
+        if ensure_contained_path(dir, &entry.path()).is_err() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let relative = if relative_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative_prefix}/{name}")
+        };
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_world_text_files(&entry.path(), &relative, out);
+        } else if is_text_config_file(&name) {
+            out.push(ConfigFileEntry { relative_path: relative.clone(), display_name: relative });
+        }
+    }
+}
+
+/// Resolve `saves/<world_folder>` for frontend-supplied folder names:
+/// safe_join containment plus an is_dir check, so a stale or hostile name
+/// is an error rather than an empty list or an escape.
+fn resolve_world_dir(root: &Path, world_folder: &str) -> Result<PathBuf, String> {
+    let dir = contained_join(&root.join("saves"), world_folder).map_err(|e| e.to_string())?;
+    if dir.is_dir() {
+        Ok(dir)
+    } else {
+        Err("World not found.".to_string())
+    }
+}
+
+/// Every text-editable file inside one world folder. Empty (not an error)
+/// when the world has none editable in-app — the frontend then offers no
+/// file browser for that world.
+#[tauri::command]
+pub fn list_world_files(
+    state: State<'_, AppState>,
+    instance_id: String,
+    world_folder: String,
+) -> Result<Vec<ConfigFileEntry>, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let _ = state.db.get_instance(&instance_id).map_err(|e| e.to_string())?;
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    let mut out = Vec::new();
+    collect_world_text_files(&world_dir, "", &mut out);
+    out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn read_world_file(
+    instance_id: String,
+    world_folder: String,
+    relative_path: String,
+) -> Result<String, String> {
+    let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    read_editable_text(&world_dir, &relative_path)
+}
+
+#[tauri::command]
+pub fn write_world_file(
+    instance_id: String,
+    world_folder: String,
+    relative_path: String,
+    contents: String,
+    expected_contents: String,
+) -> Result<(), String> {
+    // World text (stats/advancements included) stays guarded while Minecraft runs.
     let _operation = acquire(&instance_id)?;
     let root = instance_root(&instance_id).map_err(|e| e.to_string())?;
-    let path = safe_join(&root.join("config"), &relative_path).map_err(|e| e.to_string())?;
-    fs::write(&path, contents).map_err(|e| e.to_string())
+    let world_dir = resolve_world_dir(&root, &world_folder)?;
+    save_editable_text(&world_dir, &relative_path, &contents, &expected_contents)
 }
 
 #[cfg(test)]
@@ -1633,7 +2274,7 @@ mod config_matching_tests {
 
 #[cfg(test)]
 mod launch_meta_tests {
-    use super::{assess_readiness, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
+    use super::{assess_readiness, mc_range_matches, range_mentions_mc_version, read_mod_metadata, FileLaunchMeta, ModLaunchMeta};
     use crate::dto::ModLoader;
     use std::io::Write;
 
@@ -1763,14 +2404,14 @@ mod launch_meta_tests {
             merged.clone(),
             file("somelib.jar", Some("somelib"), launch_meta_single("neoforge", &[])),
         ];
-        let neo_report = assess_readiness(ModLoader::NeoForge, &neo_files, &[]);
+        let neo_report = assess_readiness(ModLoader::NeoForge, "1.21.1", &neo_files, &[]);
         assert!(neo_report.wrong_loader.is_empty(), "{:?}", neo_report.wrong_loader);
         assert!(neo_report.missing_deps.is_empty(), "{:?}", neo_report.missing_deps);
         let fabric_files = vec![
             merged,
             file("fabric-api.jar", Some("fabric-api"), launch_meta_single("fabric", &[])),
         ];
-        let fabric_report = assess_readiness(ModLoader::Fabric, &fabric_files, &[]);
+        let fabric_report = assess_readiness(ModLoader::Fabric, "1.21.1", &fabric_files, &[]);
         assert!(fabric_report.wrong_loader.is_empty(), "{:?}", fabric_report.wrong_loader);
         assert!(fabric_report.missing_deps.is_empty(), "{:?}", fabric_report.missing_deps);
     }
@@ -1805,7 +2446,7 @@ mod launch_meta_tests {
     #[test]
     fn neoforge_jar_on_forge_instance_is_flagged() {
         let files = vec![file("formations.jar", Some("formations"), launch_with("neoforge", &[]))];
-        let report = assess_readiness(ModLoader::Forge, &files, &[]);
+        let report = assess_readiness(ModLoader::Forge, "1.21.1", &files, &[]);
         assert_eq!(report.checked_files, 1);
         assert_eq!(report.wrong_loader.len(), 1);
         assert_eq!(report.wrong_loader[0].detected_loader, "neoforge");
@@ -1818,7 +2459,7 @@ mod launch_meta_tests {
             file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"])),
             file("b.jar", Some("somelib"), launch_with("neoforge", &[])),
         ];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
         assert!(report.wrong_loader.is_empty());
         assert!(report.missing_deps.is_empty());
     }
@@ -1826,10 +2467,128 @@ mod launch_meta_tests {
     #[test]
     fn missing_dep_names_the_requiring_file() {
         let files = vec![file("a.jar", Some("moda"), launch_with("neoforge", &["somelib"]))];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &[]);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
         assert_eq!(report.missing_deps.len(), 1);
         assert_eq!(report.missing_deps[0].dep_mod_id, "somelib");
         assert_eq!(report.missing_deps[0].file_name, "a.jar");
+    }
+
+    fn launch_meta_mc(loader: &str, mc: &[&str]) -> ModLaunchMeta {
+        ModLaunchMeta {
+            loaders: vec![super::LoaderMetaEntry {
+                loader: loader.to_string(),
+                mc_versions: mc.iter().map(|s| s.to_string()).collect(),
+                dependencies: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn mc_range_matching_covers_shipped_shapes() {
+        // Exact versions match by major.minor line — patches stay
+        // wire-compatible, so 1.20.0 runs on 1.20.1.
+        assert!(mc_range_matches("1.21.1", "1.21.1"));
+        assert!(mc_range_matches("1.21", "1.21.1"));
+        assert!(mc_range_matches("1.20.0", "1.20.1"));
+        assert!(!mc_range_matches("1.20.1", "1.21.1"));
+        assert!(!mc_range_matches("1.20", "1.21.1"));
+        // Maven intervals are line-inclusive: the MDK-boilerplate
+        // `[1.21,1.21.1)` loads on 1.21.1 (the loader itself accepts it),
+        // while a range outside the instance's line still flags.
+        assert!(mc_range_matches("[1.20,1.21)", "1.20.4"));
+        assert!(mc_range_matches("[1.20,1.21)", "1.21.1"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.22"));
+        assert!(!mc_range_matches("[1.20,1.21)", "1.19.4"));
+        assert!(mc_range_matches("[1.21,1.21.1)", "1.21.1"));
+        assert!(mc_range_matches("[1.21,1.22)", "1.21.1"));
+        assert!(mc_range_matches("(,1.21]", "1.21"));
+        assert!(mc_range_matches("(,1.21]", "1.21.1"));
+        assert!(mc_range_matches("[1.21,)", "1.21.1"));
+        // Fabric comparators + unions + wildcards. Comparators keep
+        // full-triplet strictness: `<1.21.2` still accepts 1.21.1.
+        assert!(mc_range_matches(">=1.20", "1.21.1"));
+        assert!(!mc_range_matches(">=1.22", "1.21.1"));
+        assert!(mc_range_matches(">=1.20 <1.21", "1.20.4"));
+        assert!(!mc_range_matches(">=1.20 <1.21", "1.21.1"));
+        assert!(mc_range_matches(">=1.21.1 <1.21.2", "1.21.1"));
+        assert!(!mc_range_matches(">=1.21.1 <1.21.2", "1.21.2"));
+        assert!(mc_range_matches("~1.20", "1.20.1"));
+        assert!(mc_range_matches("^1.20", "1.21.1"));
+        assert!(mc_range_matches("1.20.x", "1.20.4"));
+        assert!(mc_range_matches(">=1.20 || >=1.21.1", "1.21.1"));
+        assert!(mc_range_matches("26.2", "26.2"));
+        // Maven multi-range unions (exact-pin lists).
+        assert!(mc_range_matches("[1.21],[1.21.1]", "1.21.1"));
+        assert!(!mc_range_matches("[1.20],[1.20.4]", "1.21.1"));
+        // Anything + garbage passes: advisory must not cry wolf.
+        assert!(mc_range_matches("*", "1.21.1"));
+        assert!(mc_range_matches("", "1.21.1"));
+        assert!(mc_range_matches("garbage", "1.21.1"));
+    }
+
+    #[test]
+    fn range_shape_guard_ignores_non_mc_junk() {
+        assert!(range_mentions_mc_version(">=1.20"));
+        assert!(range_mentions_mc_version("[1.20,1.21)"));
+        assert!(range_mentions_mc_version("1.21.1"));
+        assert!(!range_mentions_mc_version("2.64"));
+        assert!(!range_mentions_mc_version("garbage"));
+        assert!(!range_mentions_mc_version(""));
+    }
+
+    #[test]
+    fn outdated_jar_is_flagged_by_metadata_range() {
+        let files = vec![FileLaunchMeta {
+            file_name: "somemod-3.0.jar".to_string(),
+            mod_name: Some("SomeMod".to_string()),
+            mod_id: Some("somemod".to_string()),
+            all_mod_ids: vec!["somemod".to_string()],
+            launch: launch_meta_mc("neoforge", &["[1.19,1.20]"]),
+        }];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &[]);
+        assert!(report.wrong_loader.is_empty());
+        assert_eq!(report.wrong_game_version.len(), 1);
+        assert_eq!(report.wrong_game_version[0].expected, "1.21.1");
+        assert_eq!(report.wrong_game_version[0].declared, "[1.19,1.20]");
+    }
+
+    #[test]
+    fn versioned_file_name_without_metadata_stays_silent() {
+        // Incident regression test: `alexsmobs-1.22.9.jar` is Alex's Mobs'
+        // own 1.22.9 built for MC 1.20.1 — a file-name-only signal flagged
+        // it (plus ATi Structures, BetterThanMending) on a 1.20.1 instance.
+        // Names are never consulted now, so all such jars stay silent.
+        for name in [
+            "alexsmobs-1.22.9.jar",
+            "ATi Structures V1.4.6.jar",
+            "BetterThanMending-1.7.2.jar",
+            "biggerstacks-1.20.1-2026.06.17-all.jar",
+        ] {
+            let files = vec![file(name, Some("somemod"), launch_with("forge", &[]))];
+            let report = assess_readiness(ModLoader::Forge, "1.20.1", &files, &[]);
+            assert!(report.wrong_loader.is_empty(), "{name}");
+            assert!(report.wrong_game_version.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn matching_game_version_stays_silent() {
+        let ranged = vec![FileLaunchMeta {
+            file_name: "somemod-3.0.jar".to_string(),
+            mod_name: Some("SomeMod".to_string()),
+            mod_id: Some("somemod".to_string()),
+            all_mod_ids: vec!["somemod".to_string()],
+            launch: launch_meta_mc("neoforge", &["[1.21,1.22)"]),
+        }];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &ranged, &[]);
+        assert!(report.wrong_game_version.is_empty());
+        let named = vec![file(
+            "somemod-1.21.jar",
+            Some("somemod"),
+            launch_with("neoforge", &[]),
+        )];
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &named, &[]);
+        assert!(report.wrong_game_version.is_empty());
     }
 
     #[test]
@@ -1867,15 +2626,201 @@ mod launch_meta_tests {
         let meta = read_mod_metadata(&path);
         assert!(meta.embedded_ids.iter().any(|id| id == "flywheel"), "{:?}", meta.embedded_ids);
         let files = vec![file("host.jar", Some("create"), meta.launch.clone())];
-        let report = assess_readiness(ModLoader::NeoForge, &files, &meta.embedded_ids);
+        let report = assess_readiness(ModLoader::NeoForge, "1.21.1", &files, &meta.embedded_ids);
         assert!(report.missing_deps.is_empty(), "{:?}", report.missing_deps);
         let _ = std::fs::remove_file(&path);
     }
 }
 
 #[cfg(test)]
+mod icon_safety_tests {
+    use super::*;
+    use std::io::Write;
+    use valence_nbt::compound;
+
+    fn png_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = bytes.len();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(data);
+        let mut crc = u32::MAX;
+        for byte in &bytes[start..] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        bytes.extend_from_slice(&(!crc).to_be_bytes());
+    }
+
+    pub(super) fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = width.to_be_bytes().to_vec();
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_chunk(&mut bytes, b"IHDR", &header);
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        // A real one-pixel image; oversized variants mutate only its header.
+        encoder.write_all(&[0, 0, 0, 0, 255]).unwrap();
+        png_chunk(&mut bytes, b"IDAT", &encoder.finish().unwrap());
+        png_chunk(&mut bytes, b"IEND", &[]);
+        bytes
+    }
+
+    fn jpeg() -> Vec<u8> {
+        fn segment(bytes: &mut Vec<u8>, marker: u8, data: &[u8]) {
+            bytes.extend_from_slice(&[0xff, marker]);
+            bytes.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
+            bytes.extend_from_slice(data);
+        }
+        let mut bytes = vec![0xff, 0xd8];
+        let mut quantization = vec![0];
+        quantization.extend_from_slice(&[1; 64]);
+        segment(&mut bytes, 0xdb, &quantization);
+        segment(&mut bytes, 0xc0, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+        for table in [0, 0x10] {
+            let mut huffman = vec![table, 1];
+            huffman.extend_from_slice(&[0; 15]);
+            huffman.push(0);
+            segment(&mut bytes, 0xc4, &huffman);
+        }
+        segment(&mut bytes, 0xda, &[1, 1, 0, 0, 63, 0]);
+        // One grayscale 8x8 block: DC zero, AC end-of-block, padded with ones.
+        bytes.extend_from_slice(&[0x3f, 0xff, 0xd9]);
+        bytes
+    }
+
+    fn gif(width: u16, height: u16, frames: u32) -> Vec<u8> {
+        let mut bytes = b"GIF89a".to_vec();
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+        for _ in 0..frames {
+            // One-pixel patch, LZW clear + palette index zero + end.
+            bytes.extend_from_slice(&[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+        }
+        bytes.push(0x3b);
+        bytes
+    }
+
+    fn jar(icon_name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default()).unwrap();
+        write!(writer, "{{\"id\":\"safe\",\"name\":\"Keep this name\",\"icon\":\"{icon_name}\"}}").unwrap();
+        writer.start_file(icon_name, zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn detects_supported_rasters_and_rejects_unknown_signatures() {
+        for (bytes, mime) in [(png(1, 1), "image/png"), (jpeg(), "image/jpeg"), (gif(1, 1, 2), "image/gif")] {
+            assert_eq!(icon_mime(&bytes), Some(mime));
+            assert!(icon_data_url(&bytes).unwrap().starts_with(&format!("data:{mime};base64,")));
+        }
+        for bytes in [b"not an image".as_slice(), b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>", b"RIFF0000WEBP"] {
+            assert!(icon_data_url(bytes).is_none());
+        }
+        assert!(icon_dimensions_allowed(2048, 2048));
+        assert!(!icon_dimensions_allowed(0, 1));
+        assert!(!icon_dimensions_allowed(2049, 1));
+        assert!(!icon_dimensions_allowed(1, u32::MAX));
+    }
+
+    #[test]
+    fn rejects_malformed_headers_and_unbounded_animation() {
+        for length in 0..33 {
+            assert!(icon_data_url(&png(1, 1)[..length]).is_none());
+        }
+        for width in [0, 2049, u32::MAX] {
+            assert!(icon_data_url(&png(width, 1)).is_none());
+        }
+        let mut bad_png = png(1, 1);
+        bad_png[24] = 3; // Invalid IHDR bit depth.
+        assert!(icon_data_url(&bad_png).is_none());
+        let mut animated_png = png(1, 1)[..33].to_vec();
+        png_chunk(&mut animated_png, b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0]);
+        animated_png.extend_from_slice(&png(1, 1)[33..]);
+        assert!(icon_data_url(&animated_png).is_none());
+        let valid_jpeg = jpeg();
+        for length in 0..valid_jpeg.len() {
+            assert!(icon_data_url(&valid_jpeg[..length]).is_none());
+        }
+        let frame = valid_jpeg.windows(2).position(|pair| pair == [0xff, 0xc0]).unwrap();
+        for width in [0u16, 2049, u16::MAX] {
+            let mut malformed = valid_jpeg.clone();
+            malformed[frame + 7..frame + 9].copy_from_slice(&width.to_be_bytes());
+            assert!(icon_data_url(&malformed).is_none());
+        }
+        assert!(icon_data_url(&gif(1, 1, MAX_ICON_FRAMES)).is_some());
+        assert!(icon_data_url(&gif(1, 1, MAX_ICON_FRAMES + 1)).is_none());
+        assert!(icon_data_url(&gif(2048, 2048, 1)).is_some());
+        assert!(icon_data_url(&gif(2048, 2048, 2)).is_none());
+        assert!(icon_data_url(&gif(0, 1, 1)).is_none());
+        assert!(icon_data_url(&gif(2049, 1, 1)).is_none());
+        let mut bad_frame = gif(1, 1, 1);
+        bad_frame[24] = 2; // Frame extends beyond its logical canvas.
+        assert!(icon_data_url(&bad_frame).is_none());
+        let mut truncated = gif(1, 1, 1);
+        truncated.pop();
+        assert!(icon_data_url(&truncated).is_none());
+        assert!(server_icon_data_url("aGVsbG8=").is_none());
+        assert!(server_icon_data_url("not base64").is_none());
+        assert!(server_icon_data_url(&"A".repeat((MAX_ICON_BYTES.div_ceil(3) * 4 + 4) as usize)).is_none());
+    }
+
+    #[test]
+    fn zip_icons_use_signature_instead_of_extension_and_keep_metadata_on_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.jar");
+        fs::write(&path, jar("icon.png", &jpeg())).unwrap();
+        let accepted = read_mod_metadata(&path);
+        assert!(accepted.icon.unwrap().starts_with("data:image/jpeg;base64,"));
+        fs::write(&path, jar("icon.png", &png(u32::MAX, u32::MAX))).unwrap();
+        let rejected = read_mod_metadata(&path);
+        assert_eq!(rejected.name.as_deref(), Some("Keep this name"));
+        assert!(rejected.icon.is_none());
+        fs::write(&path, jar("pack.png", &png(2049, 1))).unwrap();
+        assert!(read_resourcepack_icon(&path).is_none());
+        fs::write(&path, jar("pack.png", &png(1, 1))).unwrap();
+        assert!(read_resourcepack_icon(&path).is_some());
+        fs::write(&path, jar("icon.gif", b"unknown")).unwrap();
+        assert!(read_mod_metadata(&path).icon.is_none());
+    }
+
+    #[test]
+    fn world_and_nbt_server_entries_keep_details_but_drop_pathological_icons() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("icon.png"), png(u32::MAX, u32::MAX)).unwrap();
+        let rejected = read_world_entry(dir.path(), "Keep this world");
+        assert_eq!(rejected.folder_name, "Keep this world");
+        assert!(rejected.icon.is_none());
+        fs::write(dir.path().join("icon.png"), png(1, 1)).unwrap();
+        assert!(read_world_entry(dir.path(), "Keep this world").icon.is_some());
+
+        let mut nbt = Vec::new();
+        let bad_icon = base64::engine::general_purpose::STANDARD.encode(png(2049, 1));
+        let good_icon = base64::engine::general_purpose::STANDARD.encode(png(1, 1));
+        valence_nbt::to_binary(&valence_nbt::compound! {
+            "servers" => valence_nbt::List::Compound(vec![
+                valence_nbt::compound! { "name" => "Bad icon", "ip" => "bad.example", "icon" => bad_icon },
+                valence_nbt::compound! { "name" => "Good icon", "ip" => "good.example", "icon" => good_icon },
+            ]),
+        }, &mut nbt, "").unwrap();
+        let path = dir.path().join("servers.dat");
+        fs::write(&path, nbt).unwrap();
+        let entries = read_servers_file(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Bad icon");
+        assert_eq!(entries[0].address, "bad.example");
+        assert!(entries[0].icon.is_none());
+        assert!(entries[1].icon.is_some());
+    }
+}
+
+#[cfg(test)]
 mod worlds_servers_tests {
-    use super::{read_servers_file, read_world_entry};
+    use super::{collect_world_text_files, read_servers_file, read_world_entry};
     use std::io::Write;
     use valence_nbt::compound;
 
@@ -1945,12 +2890,16 @@ mod worlds_servers_tests {
         let dir = std::env::temp_dir().join("waybound-servers-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let encoded_icon = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            super::icon_safety_tests::png(1, 1),
+        );
         let mut raw = Vec::new();
         valence_nbt::to_binary(
             &valence_nbt::compound! {
                 "servers" => valence_nbt::List::Compound(vec![
                     valence_nbt::compound! { "name" => "Home", "ip" => "play.example.com:25565" },
-                    valence_nbt::compound! { "name" => "LAN", "ip" => "192.168.1.2:25565", "icon" => "aGVsbG8=" },
+                    valence_nbt::compound! { "name" => "LAN", "ip" => "192.168.1.2:25565", "icon" => encoded_icon.clone() },
                 ]),
             },
             &mut raw,
@@ -1964,10 +2913,7 @@ mod worlds_servers_tests {
         assert_eq!(entries[0].name, "Home");
         assert_eq!(entries[0].address, "play.example.com:25565");
         assert!(entries[0].icon.is_none());
-        assert_eq!(
-            entries[1].icon.as_deref(),
-            Some("data:image/png;base64,aGVsbG8=")
-        );
+        assert_eq!(entries[1].icon, Some(format!("data:image/png;base64,{encoded_icon}")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1978,5 +2924,236 @@ mod worlds_servers_tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(read_servers_file(&dir.join("servers.dat")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn world_text_files_list_json_and_skip_binaries() {
+        let dir = std::env::temp_dir().join("waybound-world-files-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let world = dir.join("My World");
+        std::fs::create_dir_all(world.join("stats")).unwrap();
+        std::fs::create_dir_all(world.join("advancements")).unwrap();
+        std::fs::write(world.join("level.dat"), b"\x1fbeing-binary").unwrap();
+        std::fs::write(world.join("session.lock"), b"1234").unwrap();
+        std::fs::write(world.join(".hidden.json"), b"{}").unwrap();
+        std::fs::write(world.join("stats").join("uuid.json"), b"{}").unwrap();
+        std::fs::write(
+            world.join("advancements").join("done.json"),
+            b"{\"x\":1}",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        collect_world_text_files(&world, "", &mut out);
+        let mut paths: Vec<_> = out.iter().map(|e| e.relative_path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["advancements/done.json", "stats/uuid.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod editor_safety_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn saves_atomically_and_refuses_an_external_edit_without_changing_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("options.toml");
+        fs::write(&path, "enabled = true").unwrap();
+        save_editable_text(dir.path(), "options.toml", "enabled = false", "enabled = true").unwrap();
+        assert_eq!(read_editable_text(dir.path(), "options.toml").unwrap(), "enabled = false");
+        fs::write(&path, "game = changed").unwrap();
+        let error = save_editable_text(dir.path(), "options.toml", "my draft", "enabled = false").unwrap_err();
+        assert!(error.contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "game = changed");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_binary_types_binary_text_traversal_and_oversized_text() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("level.dat"), b"binary").unwrap();
+        assert!(read_editable_text(dir.path(), "level.dat").is_err());
+        assert!(save_editable_text(dir.path(), "level.dat", "text", "binary").is_err());
+        assert!(read_editable_text(dir.path(), "../outside.json").is_err());
+        fs::write(dir.path().join("binary.json"), b"a\0b").unwrap();
+        assert!(read_editable_text(dir.path(), "binary.json").is_err());
+        fs::write(dir.path().join("invalid.json"), [0xff]).unwrap();
+        assert!(read_editable_text(dir.path(), "invalid.json").is_err());
+        let path = dir.path().join("options.toml");
+        fs::write(&path, "original").unwrap();
+        assert!(save_editable_text(dir.path(), "options.toml", "a\0b", "original").is_err());
+        let oversized = "x".repeat(MAX_EDITABLE_CONFIG_BYTES as usize + 1);
+        assert!(save_editable_text(dir.path(), "options.toml", &oversized, "original").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        fs::write(&path, oversized).unwrap();
+        assert!(read_editable_text(dir.path(), "options.toml").is_err());
+    }
+
+    fn compressed_archive(name: &str, size: u64) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file(name, zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)).unwrap();
+        std::io::copy(&mut std::io::repeat(b'x').take(size), &mut writer).unwrap();
+        zip::ZipArchive::new(writer.finish().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rejects_compressed_metadata_icons_and_nbt_above_expansion_limits() {
+        let mut metadata = compressed_archive("fabric.mod.json", MAX_METADATA_BYTES + 1);
+        assert!(read_zip_entry(&mut metadata, "fabric.mod.json").is_none());
+        let mut icon = compressed_archive("pack.png", MAX_ICON_BYTES + 1);
+        assert!(read_zip_image_entry(&mut icon, "pack.png").is_none());
+        // Valid NBT compound with a byte array; removing the expansion cap
+        // would decode this successfully rather than fail on malformed NBT.
+        let mut raw = vec![10, 0, 0, 7, 0, 7];
+        raw.extend_from_slice(b"payload");
+        raw.extend_from_slice(&(MAX_NBT_BYTES as i32).to_be_bytes());
+        raw.resize(raw.len() + MAX_NBT_BYTES as usize, 0);
+        raw.push(0);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&raw).unwrap();
+        assert!(nbt_root_data(&gzip.finish().unwrap()).is_none());
+        assert!(read_bounded(std::io::repeat(b'x').take(10), 9).is_none());
+        assert_eq!(read_bounded(std::io::repeat(b'x').take(9), 9).unwrap().len(), 9);
+    }
+
+    #[test]
+    fn oversized_and_failed_nested_reads_spend_the_shared_expansion_budget() {
+        let mut budget = NestedBudget { jars: 0, bytes: MAX_NESTED_BYTES - 8, entries: 0 };
+        assert!(read_nested_jar(std::io::repeat(b'x').take(9), &mut budget).is_none());
+        assert!(budget.bytes > MAX_NESTED_BYTES);
+        assert!(read_nested_jar(std::io::repeat(b'x'), &mut budget).is_none());
+        struct FailingReader(bool);
+        impl Read for FailingReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("broken archive"));
+                }
+                self.0 = true;
+                out[..4].copy_from_slice(b"data");
+                Ok(4)
+            }
+        }
+        let mut budget = NestedBudget { jars: 0, bytes: 0, entries: 0 };
+        assert!(read_nested_jar(FailingReader(false), &mut budget).is_none());
+        assert_eq!(budget.bytes, 4);
+    }
+
+    #[test]
+    fn nested_archive_entry_and_jar_counts_limit_traversal() {
+        let mut nested = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        nested.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default()).unwrap();
+        nested.write_all(br#"{"id":"nested"}"#).unwrap();
+        let nested = nested.finish().unwrap().into_inner();
+        let mut outer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        outer.start_file("META-INF/jarjar/metadata.json", zip::write::SimpleFileOptions::default()).unwrap();
+        outer.write_all(br#"{"jars":[{"path":"nested.jar"}]}"#).unwrap();
+        outer.start_file("nested.jar", zip::write::SimpleFileOptions::default()).unwrap();
+        outer.write_all(&nested).unwrap();
+        let mut archive = zip::ZipArchive::new(outer.finish().unwrap()).unwrap();
+        assert_eq!(embedded_jar_mod_ids(&mut archive), vec!["nested"]);
+        let mut ids = Vec::new();
+        let mut budget = NestedBudget { jars: 0, bytes: 0, entries: MAX_ARCHIVE_ENTRIES };
+        collect_embedded_ids(&mut archive, &mut budget, 0, &mut ids);
+        assert!(ids.is_empty());
+        assert!(budget.entries > MAX_ARCHIVE_ENTRIES);
+        let mut budget = NestedBudget { jars: MAX_NESTED_JARS, bytes: 0, entries: 0 };
+        collect_embedded_ids(&mut archive, &mut budget, 0, &mut ids);
+        assert!(ids.is_empty());
+        assert_eq!(budget.bytes, 0);
+    }
+
+    fn assert_link_rejected(base: &Path, linked: &str, target: &Path) {
+        assert!(read_editable_text(base, linked).is_err());
+        assert!(save_editable_text(base, linked, "new", "original").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
+        let mut files = Vec::new();
+        collect_world_text_files(base, "", &mut files);
+        assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_files_and_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("options.toml");
+        fs::write(&target, "original").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.toml")).unwrap();
+        assert_link_rejected(dir.path(), "linked.toml", &target);
+        fs::remove_file(dir.path().join("linked.toml")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+        assert_link_rejected(dir.path(), "linked/options.toml", &target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_junction_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("options.toml");
+        fs::write(&target, "original").unwrap();
+        let link = dir.path().join("linked");
+        let result = std::process::Command::new("cmd").args(["/C", "mklink", "/J"])
+            .arg(&link).arg(outside.path()).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert_link_rejected(dir.path(), "linked/options.toml", &target);
+        fs::remove_dir(link).unwrap();
+    }
+
+    #[test]
+    fn physical_names_keep_enabled_disabled_twins_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("mod.jar"), b"enabled").unwrap();
+        fs::write(dir.path().join("mod.jar.disabled"), b"disabled").unwrap();
+        let files = scan_dir(dir.path(), ".jar");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| file.file_name == "mod.jar" && file.enabled));
+        assert!(files.iter().any(|file| file.file_name == "mod.jar.disabled" && !file.enabled));
+        assert_eq!(fs::read(resolve_file(dir.path(), "mod.jar.disabled").unwrap()).unwrap(), b"disabled");
+        fs::remove_file(dir.path().join("mod.jar")).unwrap();
+        assert!(resolve_file(dir.path(), "mod.jar").is_none());
+        assert_eq!(file_stem("jade-1.0.jar.disabled"), "jade-1.0");
+    }
+
+    #[test]
+    fn toggle_publication_failure_restores_disk_and_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open_at(&dir.path().join("library.db")).unwrap();
+        db.conn().unwrap().execute(
+            "INSERT INTO instances (id,name,minecraft_version,loader,root_path,created_at)
+             VALUES ('toggle','Toggle','1.20.1','fabric',?1,0)", [dir.path().display().to_string()]
+        ).unwrap();
+        let current = dir.path().join("mod.jar");
+        let target = dir.path().join("mod.jar.disabled");
+        fs::write(&current, b"original").unwrap();
+        db.insert_instance_mod("toggle", "modrinth:jade", "Jade", crate::dto::ModSource::Modrinth,
+            "mod.jar", &current.display().to_string(), None, crate::dto::ModOrigin::Pack).unwrap();
+        db.conn().unwrap().execute_batch(
+            "CREATE TRIGGER reject_toggle BEFORE UPDATE ON instance_mods
+             BEGIN SELECT RAISE(ABORT, 'fixture metadata failure'); END;"
+        ).unwrap();
+        let publish = || db.rename_instance_content("toggle", "mod", "mod.jar", "mod.jar.disabled", &target.display().to_string())
+            .map_err(|error| error.to_string());
+        assert!(rename_content_file(dir.path(), &current, &target, publish).is_err());
+        assert_eq!(fs::read(&current).unwrap(), b"original");
+        assert!(!target.exists());
+        let (row, path) = db.get_instance_mod("toggle", "modrinth:jade").unwrap().unwrap();
+        assert_eq!(row.file_name, "mod.jar");
+        assert_eq!(path, current.display().to_string());
+        db.conn().unwrap().execute_batch("DROP TRIGGER reject_toggle").unwrap();
+        rename_content_file(dir.path(), &current, &target, || db.rename_instance_content(
+            "toggle", "mod", "mod.jar", "mod.jar.disabled", &target.display().to_string()
+        ).map_err(|error| error.to_string())).unwrap();
+        let (row, path) = db.get_instance_mod("toggle", "modrinth:jade").unwrap().unwrap();
+        assert_eq!(row.file_name, "mod.jar.disabled");
+        assert_eq!(row.origin, crate::dto::ModOrigin::Pack);
+        assert_eq!(path, target.display().to_string());
+        fs::write(&current, b"duplicate").unwrap();
+        assert!(rename_content_file(dir.path(), &target, &current, || panic!("must not publish collision")).is_err());
+        assert_eq!(fs::read(&current).unwrap(), b"duplicate");
+        assert_eq!(fs::read(&target).unwrap(), b"original");
     }
 }

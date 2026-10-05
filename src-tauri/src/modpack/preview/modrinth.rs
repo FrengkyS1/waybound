@@ -333,16 +333,19 @@ mod preview_tests {
         let deps = vec![
             ModrinthVersionDependency {
                 project_id: Some("AABBCCDD".to_string()),
+                version_id: None,
                 dependency_type: "embedded".to_string(),
                 file_name: Some("sodium.jar".to_string()),
             },
             ModrinthVersionDependency {
                 project_id: Some("EEFFGGHH".to_string()),
+                version_id: None,
                 dependency_type: "required".to_string(),
                 file_name: Some("ignored.jar".to_string()),
             },
             ModrinthVersionDependency {
                 project_id: None,
+                version_id: None,
                 dependency_type: "embedded".to_string(),
                 file_name: None,
             },

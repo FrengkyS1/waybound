@@ -5,9 +5,9 @@ use std::path::Path;
 use futures::stream::StreamExt;
 use serde::Deserialize;
 
-use super::{ModpackError, ModpackImportResult};
-use super::transaction::{validate_pack_path, PackTransaction};
-use crate::download::{download_bytes_with_retry, http_client, safe_join, verify_hashes, CancelToken, DOWNLOAD_CONCURRENCY};
+use super::{ModpackError, ModpackImportResult, PreparedModpackImport};
+use super::transaction::{validate_pack_path, PackTransaction, MAX_INDEX_BYTES, MAX_PACK_BYTES, MAX_PACK_FILES, MAX_PACK_FILE_BYTES};
+use crate::download::{contained_join, download_bytes_capped_with_retry, http_client, safe_join, verify_hashes, CancelToken, DOWNLOAD_CONCURRENCY};
 use crate::sources::modrinth::ModrinthClient;
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,8 @@ pub struct ModrinthPackFile {
     pub env: Option<ModrinthPackEnv>,
     #[serde(default)]
     pub hashes: Option<HashMap<String, String>>,
+    #[serde(default, rename = "fileSize")]
+    pub file_size: Option<u64>,
 }
 
 
@@ -50,14 +52,42 @@ pub async fn import_modrinth_mrpack_bytes(
     cancel: &CancelToken,
     report: &impl Fn(u32, u32, &str),
 ) -> Result<ModpackImportResult, ModpackError> {
+    prepare_modrinth_mrpack_bytes(bytes, instance_root, modrinth, cancel, report).await?.commit(cancel).await
+}
+
+pub(crate) async fn prepare_modrinth_mrpack_bytes(
+    bytes: &[u8],
+    instance_root: &Path,
+    modrinth: &ModrinthClient,
+    cancel: &CancelToken,
+    report: &impl Fn(u32, u32, &str),
+) -> Result<PreparedModpackImport, ModpackError> {
     let index = read_index_from_mrpack(bytes)?;
+    if index.files.len() > MAX_PACK_FILES {
+        return Err(ModpackError::Other("Pack has too many files".into()));
+    }
+    let mut declared_bytes = 0u64;
+    for file in index.files.iter().filter(|file| !should_skip_file(file)) {
+        if let Some(size) = file.file_size {
+            declared_bytes = declared_bytes.checked_add(size)
+                .ok_or_else(|| ModpackError::Other("Pack declared size overflow".into()))?;
+            if size > MAX_PACK_FILE_BYTES as u64 || declared_bytes > MAX_PACK_BYTES {
+                return Err(ModpackError::Other("Pack exceeds download size limit".into()));
+            }
+        }
+    }
     let client = http_client()?;
     let client = &client;
     let mut transaction = PackTransaction::new(instance_root)?;
     let mut jobs = Vec::new();
-    for file in index.files.iter().filter(|file| !should_skip_file(file)).cloned() {
+    let mut destinations = std::collections::HashSet::new();
+    for mut file in index.files.iter().filter(|file| !should_skip_file(file)).cloned() {
         validate_pack_path(&file.path)?;
         safe_join(instance_root, &file.path)?;
+        file.path = file.path.replace('\\', "/");
+        if !destinations.insert(file.path.to_ascii_lowercase()) {
+            return Err(ModpackError::Other(format!("Pack assigns multiple files to {}", file.path)));
+        }
         jobs.push(file);
     }
     let total = jobs.len() as u32;
@@ -68,7 +98,8 @@ pub async fn import_modrinth_mrpack_bytes(
         // author-provided fallbacks. A dead or corrupt mirror must not fail
         // a file another mirror can serve — but a cancel stops everything.
         for url in &file.downloads {
-            match download_bytes_with_retry(client, url, cancel).await {
+            let max_bytes = file.file_size.map(|size| size as usize).unwrap_or(MAX_PACK_FILE_BYTES);
+            match download_bytes_capped_with_retry(client, url, cancel, max_bytes).await {
                 Err(crate::download::DownloadError::Cancelled) => {
                     return Err::<_, ModpackError>(
                         crate::download::DownloadError::Cancelled.into(),
@@ -76,6 +107,9 @@ pub async fn import_modrinth_mrpack_bytes(
                 }
                 Err(_) => continue,
                 Ok(data) => {
+                    if file.file_size.is_some_and(|size| data.len() as u64 != size) {
+                        continue;
+                    }
                     if let Some(hashes) = &file.hashes {
                         if verify_hashes(&data, hashes).is_err() {
                             continue;
@@ -91,13 +125,14 @@ pub async fn import_modrinth_mrpack_bytes(
         )))
     })).buffer_unordered(DOWNLOAD_CONCURRENCY);
     let mut downloaded = Vec::new();
+    let mut completed = 0;
     while let Some(result) = stream.next().await {
         let (file, data) = result?;
         cancel.checkpoint().await?;
-        transaction.stage(&file.path, &data)?;
-        let path = file.path.clone();
-        downloaded.push(file);
-        report(downloaded.len() as u32, total, &path);
+        let applied = transaction.stage_pack_file(&file.path, &data)?;
+        completed += 1;
+        report(completed, total, &file.path);
+        if applied { downloaded.push(file); }
     }
     let sha1_hashes: Vec<String> = downloaded.iter().filter_map(|file| file.hashes.as_ref()?.get("sha1").cloned()).collect();
     let meta_by_hash = modrinth.project_meta_by_sha1(&sha1_hashes).await;
@@ -111,30 +146,35 @@ pub async fn import_modrinth_mrpack_bytes(
         project_uids.insert(filename.to_string(), format!("modrinth:{}", meta.project_id));
         if let Some(icon) = &meta.icon { icons.insert(filename.to_string(), icon.clone()); }
     }
-    let overrides_applied = transaction.overrides(bytes, &["overrides", "client-overrides"], cancel).await?;
-    let manifest_path = instance_root.join(".modrinth-pack-manifest.json");
+    let (overrides_applied, mut override_paths) = transaction.overrides(bytes, &["overrides", "client-overrides"], cancel).await?;
+    transaction.reconcile_overrides(&mut override_paths)?;
+    let manifest_path = contained_join(instance_root, ".modrinth-pack-manifest.json")?;
     let old_paths: Vec<String> = match std::fs::read(&manifest_path) {
         Ok(data) => serde_json::from_slice(&data)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e.into()),
     };
-    let paths: Vec<&str> = downloaded.iter().map(|file| file.path.as_str()).collect();
+    let mut paths: Vec<String> = downloaded.iter().map(|file| file.path.clone()).collect();
     for old in old_paths {
-        if !paths.contains(&old.as_str()) {
+        let old = old.replace('\\', "/");
+        if !paths.contains(&old) {
             validate_pack_path(&old)?;
+            let path = contained_join(instance_root, &old)?;
             // Only tracked content is reconciled, never saves or configuration.
-            if ["mods/", "resourcepacks/", "shaderpacks/"].iter().any(|prefix| old.starts_with(prefix)) {
-                let path = safe_join(instance_root, &old)?;
+            if ["mods/", "resourcepacks/", "shaderpacks/"].iter().any(|prefix| old.to_ascii_lowercase().starts_with(prefix)) {
                 if path.exists() { transaction.remove(&path)?; }
-                let disabled = safe_join(instance_root, &format!("{old}.disabled"))?;
+                let disabled = contained_join(instance_root, &format!("{old}.disabled"))?;
                 if disabled.exists() { transaction.remove(&disabled)?; }
-            }
+            } else if path.is_file() { paths.push(old); }
         }
     }
     transaction.stage(".modrinth-pack-manifest.json", &serde_json::to_vec_pretty(&paths)?)?;
-    transaction.commit(cancel).await?;
+    transaction.stage(
+        ".pack-overrides-manifest.json",
+        &serde_json::to_vec_pretty(&override_paths)?,
+    )?;
     let label = if index.name.is_empty() { "Modrinth modpack".to_string() } else { format!("{} {}", index.name, index.version_id) };
-    Ok(ModpackImportResult {
+    Ok(PreparedModpackImport { transaction, result: ModpackImportResult {
         message: format!("Imported {label}: {total} files downloaded, {overrides_applied} override files applied."),
         has_skipped: false,
         icons,
@@ -142,7 +182,7 @@ pub async fn import_modrinth_mrpack_bytes(
         project_uids,
         missing_mods: Vec::new(),
         version_label: Some(index.version_id.clone()).filter(|v| !v.is_empty()),
-    })
+    } })
 }
 
 fn should_skip_file(file: &ModrinthPackFile) -> bool {
@@ -159,11 +199,24 @@ fn read_index_from_mrpack(bytes: &[u8]) -> Result<ModrinthPackIndex, ModpackErro
 }
 
 pub fn read_mrpack_index(bytes: &[u8]) -> Result<ModrinthPackIndex, ModpackError> {
+    if bytes.len() > MAX_PACK_FILE_BYTES {
+        return Err(crate::download::DownloadError::TooLarge(MAX_PACK_FILE_BYTES).into());
+    }
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
+    if archive.len() > MAX_PACK_FILES {
+        return Err(ModpackError::Other("Pack has too many archive entries".into()));
+    }
     let mut index_file = archive.by_name("modrinth.index.json")?;
+    if index_file.size() > MAX_INDEX_BYTES {
+        return Err(ModpackError::Other("Pack index exceeds size limit".into()));
+    }
+    let expected = index_file.size();
     let mut json = String::new();
-    index_file.read_to_string(&mut json)?;
+    index_file.by_ref().take(expected + 1).read_to_string(&mut json)?;
+    if json.len() as u64 != expected {
+        return Err(ModpackError::Other("Pack index size disagrees with archive".into()));
+    }
     Ok(serde_json::from_str(&json)?)
 }
 

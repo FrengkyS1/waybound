@@ -8,6 +8,7 @@ pub mod settings;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModSummary {
+    /// Canonical source:id; merged summaries prefer the Modrinth project id.
     pub uid: String,
     pub slug: String,
     pub name: String,

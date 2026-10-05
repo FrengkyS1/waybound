@@ -38,7 +38,8 @@ impl Database {
 
         match Self::open_at(&path) {
             Ok(db) => Ok(db),
-            Err(err) => {
+            Err(err) if matches!(&err, DbError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)) => {
                 // A corrupted library.db (crash mid-write, truncated file,
                 // disk full, ...) used to `?` straight out of here into an
                 // `.expect()` in lib.rs, panicking before any window ever
@@ -60,11 +61,17 @@ impl Database {
                 );
                 Self::open_at(&path)
             }
+            Err(err) => Err(err),
         }
     }
 
-    fn open_at(path: &Path) -> Result<Self, DbError> {
-        let conn = Connection::open(path)?;
+    pub(crate) fn open_at(path: &Path) -> Result<Self, DbError> {
+        let mut conn = Connection::open(path)?;
+        let had_origins = {
+            let mut stmt = conn.prepare("PRAGMA table_info(instance_mods)")?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            names.collect::<Result<Vec<_>, _>>()?.iter().any(|name| name == "origin")
+        };
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -168,6 +175,9 @@ impl Database {
             let _ = conn.execute(stmt, []);
         }
 
+        migrate_project_uids(&mut conn)?;
+        migrate_content_filenames(&mut conn)?;
+
         // Upstream version identifiers are not processed search results. Move
         // historical keys before pruning so upgrades retain offline choices.
         conn.execute(
@@ -194,11 +204,9 @@ impl Database {
         let db = Self {
             conn: Mutex::new(conn),
         };
-        // Backfill pack origins for rows predating the column (idempotent —
-        // only `user` rows matching a sidecar flip, so this is a no-op once
-        // caught up). Runs here with the other upgrade work rather than on
-        // any read path.
-        db.backfill_mod_origins();
+        if !had_origins {
+            db.backfill_mod_origins();
+        }
         Ok(db)
     }
 
@@ -316,6 +324,143 @@ impl Database {
             DbError::Sqlite(rusqlite::Error::InvalidParameterName("database lock poisoned".into()))
         })
     }
+}
+
+/// Source IDs never share a namespace. Run transactionally: a conflicting
+/// tracked row must not silently replace another file or destroy the library.
+fn migrate_project_uids(conn: &mut Connection) -> Result<(), DbError> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "INSERT INTO mod_identity (mod_uid, slug, name, curseforge_id, modrinth_id, updated_at)
+         SELECT 'modrinth:' || modrinth_id, slug, name, NULL, modrinth_id, updated_at
+         FROM mod_identity WHERE mod_uid LIKE 'mod:%' AND modrinth_id IS NOT NULL
+         ON CONFLICT(mod_uid) DO UPDATE SET
+           modrinth_id = COALESCE(mod_identity.modrinth_id, excluded.modrinth_id);
+         INSERT INTO mod_identity (mod_uid, slug, name, curseforge_id, modrinth_id, updated_at)
+         SELECT 'curseforge:' || curseforge_id, slug, name, curseforge_id, NULL, updated_at
+         FROM mod_identity WHERE mod_uid LIKE 'mod:%' AND curseforge_id IS NOT NULL
+         ON CONFLICT(mod_uid) DO UPDATE SET
+           curseforge_id = COALESCE(mod_identity.curseforge_id, excluded.curseforge_id);
+         UPDATE instances SET modpack_project_uid =
+           CASE
+             WHEN modpack_project_uid LIKE 'mod:cf:%' THEN 'curseforge:' || substr(modpack_project_uid, 8)
+             WHEN modpack_project_uid LIKE 'mod:%' THEN 'modrinth:' || substr(modpack_project_uid, 5)
+             WHEN modpack_project_uid LIKE 'modpack:cf:%' THEN 'curseforge:' || substr(modpack_project_uid, 12)
+             WHEN modpack_project_uid LIKE 'modpack:%' THEN 'modrinth:' || substr(modpack_project_uid, 9)
+             ELSE modpack_project_uid
+           END;",
+    )?;
+    let legacy = {
+        let mut stmt = tx.prepare(
+            "SELECT m.id, m.instance_id, m.mod_uid, m.source, m.file_name, i.curseforge_id
+             FROM instance_mods m LEFT JOIN mod_identity i ON i.mod_uid=m.mod_uid
+             WHERE m.mod_uid LIKE 'mod:%' ORDER BY m.installed_at DESC, m.id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+            row.get::<_, Option<u32>>(5)?,
+        )))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, instance, uid, source, filename, curseforge_id) in legacy {
+        let canonical = if let Some(project) = uid.strip_prefix("mod:cf:") {
+            format!("curseforge:{project}")
+        } else if let Some(project) = uid.strip_prefix("mod:slug:") {
+            // Unresolved slug identities never had a source project ID.
+            let _ = project;
+            format!("file:{filename}")
+        } else {
+            if source == "curseforge" && curseforge_id.is_some() {
+                format!("curseforge:{}", curseforge_id.unwrap())
+            } else {
+                // Historical fused identities used the Modrinth ID, regardless
+                // of which source supplied the installed bytes.
+                format!("modrinth:{}", &uid[4..])
+            }
+        };
+        let mut target = canonical;
+        let existing = {
+            let mut stmt = tx.prepare("SELECT id, file_name FROM instance_mods WHERE instance_id=?1 AND mod_uid=?2")?;
+            let mut rows = stmt.query(params![instance, target])?;
+            match rows.next()? {
+                Some(row) => Some((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                None => None,
+            }
+        };
+        if existing.as_ref().is_some_and(|(_, name)| name != &filename) {
+            // Multiple versions are real files, not duplicate project metadata.
+            target = format!("file:{filename}");
+        }
+        let existing_id = tx.query_row(
+            "SELECT id FROM instance_mods WHERE instance_id=?1 AND mod_uid=?2",
+            params![instance, target], |row| row.get::<_, i64>(0),
+        );
+        match existing_id {
+            Ok(other) => {
+                tx.execute(
+                    "UPDATE instance_mods SET
+                     mod_name=CASE WHEN installed_at < (SELECT installed_at FROM instance_mods WHERE id=?2)
+                       THEN (SELECT mod_name FROM instance_mods WHERE id=?2) ELSE mod_name END,
+                     file_path=CASE WHEN installed_at < (SELECT installed_at FROM instance_mods WHERE id=?2)
+                       THEN (SELECT file_path FROM instance_mods WHERE id=?2) ELSE file_path END,
+                     icon_url=COALESCE(icon_url,(SELECT icon_url FROM instance_mods WHERE id=?2)),
+                     installed_at=max(installed_at,(SELECT installed_at FROM instance_mods WHERE id=?2)),
+                     origin=CASE WHEN origin='user' OR (SELECT origin FROM instance_mods WHERE id=?2)='user'
+                       THEN 'user' ELSE origin END WHERE id=?1",
+                    params![other, id],
+                )?;
+                tx.execute("DELETE FROM instance_mods WHERE id=?1", params![id])?;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tx.execute("UPDATE instance_mods SET mod_uid=?2 WHERE id=?1", params![id, target])?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    tx.execute("DELETE FROM mod_identity WHERE mod_uid LIKE 'mod:%'
+        AND (curseforge_id IS NOT NULL OR modrinth_id IS NOT NULL)", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Content and tracking use exact physical basenames, including `.disabled`.
+/// Normalize metadata only; never rename/delete genuine duplicate disk files.
+fn migrate_content_filenames(conn: &mut Connection) -> Result<(), DbError> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.file_name, m.file_path, i.root_path FROM instance_mods m
+             JOIN instances i ON i.id=m.instance_id"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+        )))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let tx = conn.transaction()?;
+    for (id, filename, path, root) in rows {
+        let logical = filename.strip_suffix(crate::commands::content::DISABLED_SUFFIX).unwrap_or(&filename);
+        if !logical.to_ascii_lowercase().ends_with(".jar") { continue; }
+        let root = Path::new(&root);
+        let mut physical = PathBuf::from(&path);
+        if crate::download::ensure_contained_path(root, &physical).is_err() { continue; }
+        if !physical.exists() && !path.ends_with(crate::commands::content::DISABLED_SUFFIX) {
+            let mut disabled = physical.as_os_str().to_os_string();
+            disabled.push(crate::commands::content::DISABLED_SUFFIX);
+            let disabled = PathBuf::from(disabled);
+            if crate::download::ensure_contained_path(root, &disabled).is_ok() && disabled.is_file() {
+                physical = disabled;
+            }
+        }
+        let Some(name) = physical.file_name().and_then(|name| name.to_str()) else { continue };
+        if name != filename || physical != Path::new(&path) {
+            tx.execute("UPDATE instance_mods SET file_name=?2, file_path=?3 WHERE id=?1",
+                params![id, name, physical.display().to_string()])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub struct CachedSearch {

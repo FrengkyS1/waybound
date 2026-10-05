@@ -51,7 +51,9 @@ export function InstanceGameSettings({ instanceId, busy }: { instanceId: string;
           <McOptionsForm options={options} disabled={!options.customize || saving || busy || running}
             onChange={(patch) => setOptions((previous) => previous ? { ...previous, ...patch } : previous)} />
         </fieldset>
-        <button type="button" className={styles.primaryBtn} disabled={saving || busy || running} onClick={() => void save()}>{saving ? "Saving…" : "Save game settings"}</button>
+        <div className={styles.stickySave}>
+          <button type="button" className={styles.primaryBtn} disabled={saving || busy || running} onClick={() => void save()}>{saving ? "Saving…" : "Save game settings"}</button>
+        </div>
       </>}
     </section>
   );

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchAvailableUpdate } from "./updater";
 
 import styles from "./UpdateNotice.module.css";
@@ -12,18 +12,21 @@ import styles from "./UpdateNotice.module.css";
 export function UpdateNotice({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [version, setVersion] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  const ran = useRef(false);
 
   useEffect(() => {
-    if (ran.current) return;
-    ran.current = true;
+    let active = true;
     // Give startup (window reveal + first bundle parse) breathing room and
     // duck out of the way of whatever the user does first — a network ping
     // for an update is the least important thing on launch.
     const timer = setTimeout(() => {
-      void fetchAvailableUpdate().then(setVersion);
+      void fetchAvailableUpdate().then((available) => {
+        if (active) setVersion(available);
+      });
     }, 6000);
-    return () => clearTimeout(timer);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, []);
 
   if (dismissed || !version) return null;

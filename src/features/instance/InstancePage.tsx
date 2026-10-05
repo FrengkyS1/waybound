@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 
 import {
   fetchContentMeta,
@@ -305,10 +304,10 @@ export function InstancePage({
           />
         )}
         {tab === "content" && (
-          <ContentTab instance={instance} busy={busy} onAddMods={onAddMods} onOpenMod={onOpenMod} />
+          <ContentTab key={instance.id} instance={instance} busy={busy} onAddMods={onAddMods} onOpenMod={onOpenMod} />
         )}
-        {tab === "worlds" && <WorldsTab instanceId={instance.id} />}
-        {tab === "servers" && <ServersTab instanceId={instance.id} />}
+        {tab === "worlds" && <WorldsTab key={instance.id} instanceId={instance.id} />}
+        {tab === "servers" && <ServersTab key={instance.id} instanceId={instance.id} />}
         {tab === "logs" && (
           <LogsTab
             instanceId={instance.id}
@@ -318,6 +317,7 @@ export function InstancePage({
         )}
         {tab === "settings" && (
           <SettingsTab
+            key={instance.id}
             instance={instance}
             busy={busy}
             onDelete={confirmDelete}
@@ -413,7 +413,7 @@ function OverviewTab({
                 {instance.modpackProjectUid && (
                   <button
                     type="button"
-                    className={styles.packVersionsLink}
+                    className={styles.packVersionsBtn}
                     onClick={() => setPackVersionsOpen(true)}
                     title="Switch this instance to a different version of the modpack"
                   >
@@ -474,30 +474,42 @@ function ContentTab({
   const [addedFilter, setAddedFilter] = useState<AddedFilter>("all");
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const loadRequest = useRef(0);
+  const contentMounted = useRef(true);
+  const currentInstance = useRef(instance.id);
+  currentInstance.current = instance.id;
+  const contentTick = useInstallStore((s) => s.instanceRefreshTicks[instance.id] ?? 0);
+  const runInstall = useInstallStore((s) => s.runInstall);
 
   async function load() {
+    const request = ++loadRequest.current;
+    const instanceId = instance.id;
     try {
-      setContent(await fetchInstanceContent(instance.id));
+      const next = await fetchInstanceContent(instanceId);
+      if (!contentMounted.current || currentInstance.current !== instanceId || request !== loadRequest.current) return;
+      setContent(next);
+      setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (contentMounted.current && currentInstance.current === instanceId && request === loadRequest.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
   useEffect(() => {
+    contentMounted.current = true;
+    setContent(null);
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      contentMounted.current = false;
+      loadRequest.current++;
+    };
   }, [instance.id]);
 
-  // The manual-download watcher writes straight into this instance's
-  // mods/resourcepacks folder, bypassing the normal install flow — without
-  // this, the list would sit stale until the user left and came back.
+  // Install completion and manual placement update only their mounted instance.
   useEffect(() => {
-    const unlisten = listen<{ instanceId: string }>("missing-mods://placed", (event) => {
-      if (event.payload.instanceId === instance.id) void load();
-    });
-    return () => void unlisten.then((fn) => fn());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instance.id]);
+    if (contentTick > 0) void load();
+  }, [contentTick]);
 
   // Name + icon are resolved lazily, one file at a time, only for rows that
   // actually scroll into view — opening every jar up front is what made a
@@ -518,6 +530,7 @@ function ContentTab({
   const flushScheduledRef = useRef(false);
 
   useEffect(() => {
+    let active = true;
     fetchedRef.current = new Set();
     targetsRef.current = new Map();
     const observer = new IntersectionObserver(
@@ -533,17 +546,22 @@ function ContentTab({
           targetsRef.current.delete(e.target);
           void fetchContentMeta(instance.id, info.category, info.fileName).then(
             (meta) => {
-              if (meta.name || meta.icon) {
+              if (active && (meta.name || meta.icon)) {
                 enqueuePatch(info.category, info.fileName, meta);
               }
             },
+            () => {},
           );
         }
       },
       { rootMargin: "300px" },
     );
     observerRef.current = observer;
-    return () => observer.disconnect();
+    return () => {
+      active = false;
+      observer.disconnect();
+      pendingPatchesRef.current.clear();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instance.id]);
 
@@ -658,12 +676,15 @@ function ContentTab({
   // fails — avoids a full content re-scan after every single toggle/remove.
   async function act(optimistic: () => void, fn: () => Promise<void>) {
     setError(null);
+    const instanceId = instance.id;
     optimistic();
     try {
       await fn();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
       await load();
+      if (contentMounted.current && currentInstance.current === instanceId) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -678,23 +699,14 @@ function ContentTab({
     setError(null);
     setMessage(null);
     setUpdatingFiles((prev) => new Set(prev).add(fileName));
-    const installId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-    try {
-      const result = await updateModInInstance(instance.id, fileName, installId);
-      setMessage(result.message);
-      setTimeout(() => setMessage(null), 6000);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
+    const instanceId = instance.id;
+    await runInstall(fileName, (installId) => updateModInInstance(instanceId, fileName, installId), instanceId);
+    if (contentMounted.current && currentInstance.current === instanceId) {
       setUpdatingFiles((prev) => {
         const next = new Set(prev);
         next.delete(fileName);
         return next;
       });
-      await load();
     }
   }
 
@@ -755,6 +767,15 @@ function ContentTab({
   }
 
   const term = search.trim().toLowerCase();
+  const matchesTerm = (e: ContentEntry) => {
+    if (!term) return true;
+    // Match the resolved display name too ("FTB Ranks"), not just the
+    // filename ("ftb-ranks-...jar") which never contains spaces.
+    return (
+      e.fileName.toLowerCase().includes(term) ||
+      (e.name ?? "").toLowerCase().includes(term)
+    );
+  };
   const visible = groups
     .filter((g) => filter === "all" || g.category === filter)
     .map((g) => ({
@@ -766,7 +787,7 @@ function ContentTab({
         .filter((e) =>
           addedFilter === "all" ? true : addedFilter === "mine" ? e.addedByYou : !e.addedByYou,
         )
-        .filter((e) => (term ? e.fileName.toLowerCase().includes(term) : true)),
+        .filter(matchesTerm),
     }));
 
   if (content && total === 0) {
@@ -844,7 +865,7 @@ function ContentTab({
         />
       </div>
 
-      {error && <p className={styles.error}>{error}</p>}
+      {error && <p className={styles.error} role="alert">{error}</p>}
       {message && <p className={styles.message}>{message}</p>}
 
       {visible.map((group) =>
@@ -983,6 +1004,7 @@ function ContentTab({
                           () =>
                             patchEntry(group.category, entry.fileName, {
                               enabled: !entry.enabled,
+                              fileName: entry.enabled ? `${entry.fileName}.disabled` : entry.fileName.replace(/\.disabled$/, ""),
                             }),
                           () =>
                             setContentEnabled(
@@ -1019,8 +1041,10 @@ function ContentTab({
       {configTarget && (
         <ConfigEditorModal
           instanceId={instance.id}
+          scope="mod"
           fileName={configTarget.fileName}
-          modLabel={configTarget.label}
+          title={configTarget.label}
+          emptyHint="No config files found for this mod."
           onClose={() => setConfigTarget(null)}
         />
       )}
@@ -1059,6 +1083,7 @@ function formatSize(bytes: number): string {
 
 function humanizeFileName(fileName: string): string {
   return fileName
+    .replace(/\.disabled$/, "")
     .replace(/\.(jar|zip)$/i, "")
     // Minecraft formatting codes (§ + one char) — some shader packs bake
     // these into the zip name itself so it renders colorfully in the
@@ -1205,10 +1230,34 @@ function SettingsTab({
   onDelete: () => void;
   onLoaderVersionChange: (loaderVersion: string | null) => Promise<void>;
 }) {
+  const [configOpen, setConfigOpen] = useState(false);
+  const running = usePlayStore((s) => s.launches[instance.id]?.phase === "running");
   return (
     <div className={styles.settings}>
       <LaunchOverrides instance={instance} onLoaderVersionChange={onLoaderVersionChange} />
       <InstanceGameSettings key={instance.id} instanceId={instance.id} busy={busy} />
+
+      <section className={styles.configCard}>
+        <div>
+          <h2 className={styles.cardTitle}>Config files</h2>
+          <p className={styles.note}>
+            Search and edit this instance’s text configuration files.
+            {running ? " Minecraft is running. Saves are allowed, but the game may overwrite files; some changes require a restart." : " Some changes take effect only after restarting Minecraft."}
+          </p>
+        </div>
+        <button type="button" className={styles.configBtn} onClick={() => setConfigOpen(true)}>
+          Config files
+        </button>
+      </section>
+      {configOpen && (
+        <ConfigEditorModal
+          instanceId={instance.id}
+          scope="instance"
+          title={`${instance.name} — Config files`}
+          emptyHint="No text configuration files found in this instance."
+          onClose={() => setConfigOpen(false)}
+        />
+      )}
 
       <section className={styles.dangerCard}>
         <div>

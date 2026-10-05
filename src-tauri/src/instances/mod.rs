@@ -15,8 +15,8 @@ use crate::config::ConfigStore;
 use crate::db::Database;
 
 use crate::download::{
-    download_bytes_with_retry, download_to_file_verified, http_client, safe_join,
-    verify_hashes, CancelToken,
+    download_bytes_capped_with_retry, ensure_contained_path, http_client, safe_join,
+    verify_hashes, CancelToken, MAX_DOWNLOAD_BYTES,
 };
 use base64::Engine;
 
@@ -32,8 +32,8 @@ use crate::dto::instance::{InstallModResult, InstalledMod, InstanceSummary};
 use crate::dto::{ContentType, ModLoader, ModSource, ModSummary};
 
 use crate::modpack::{
-    curseforge_file_url, import_curseforge_modpack_zip, import_modrinth_mrpack_bytes,
-    is_curseforge_modpack_zip, is_mrpack_bytes, ModpackError,
+    curseforge_file_url, prepare_curseforge_modpack_zip, prepare_modrinth_mrpack_bytes,
+    is_curseforge_modpack_zip, is_mrpack_bytes, ModpackError, PackDeclaredLoader, PackTransaction,
 };
 
 use crate::sources::curseforge::CurseForgeClient;
@@ -44,7 +44,7 @@ use thiserror::Error;
 
 
 
-use paths::{ensure_instance_dirs, instance_root, instances_root, PathError};
+use paths::{instance_root, instances_root, PathError};
 
 
 
@@ -98,7 +98,7 @@ pub enum InstanceError {
 
     #[error("{filename} requires a manual download (author disabled third-party downloads)")]
 
-    DistributionRestricted { file_id: u32, filename: String, sha1: Option<String> },
+    DistributionRestricted { file_id: u32, filename: String, sha1: Option<String>, dependencies: Vec<ResolvedDependency> },
 
     #[error("{0}")]
 
@@ -256,12 +256,12 @@ impl InstanceService {
 
         let existing: std::collections::HashSet<String> =
             db.list_instances()?.into_iter().map(|i| i.name).collect();
-        let mut name = format!("{} (copy)", source.name);
-        let mut n = 2;
-        while existing.contains(&name) {
-            name = format!("{} (copy {n})", source.name);
+        let mut n = 1;
+        let name = loop {
+            let candidate = duplicate_name(&source.name, n);
+            if !existing.contains(&candidate) { break candidate; }
             n += 1;
-        }
+        };
 
         Self::publish_prepared(
             db,
@@ -275,24 +275,26 @@ impl InstanceService {
     }
 
     pub fn delete(db: &Database, id: &str) -> Result<(), InstanceError> {
-
-        if !db.delete_instance(id)? {
-
-            return Err(InstanceError::NotFound);
-
+        if db.get_instance(id)?.is_none() { return Err(InstanceError::NotFound); }
+        let root = instance_root(id)?;
+        ensure_contained_path(&instances_root()?, &root).map_err(map_download_error)?;
+        if root.exists() {
+            trash::delete(&root).map_err(|error| InstanceError::Other(format!(
+                "Could not move instance to Recycle Bin; instance retained: {error}"
+            )))?;
         }
-
-        if let Ok(path) = instance_root(id) {
-
-            // Recycle Bin, not a permanent wipe — a deleted instance can
-            // carry hundreds of hours of world saves, and `remove_dir_all`
-            // gave no way back from a misclick.
-            let _ = trash::delete(path);
-
-        }
-
+        if !db.delete_instance(id)? { return Err(InstanceError::NotFound); }
         Ok(())
+    }
 
+    pub fn clear_pack_loader_pin(instance_id: &str) -> Result<(), InstanceError> {
+        let root = instance_root(instance_id)?;
+        let path = crate::download::contained_join(&root, PACK_LOADER_PROVENANCE).map_err(map_download_error)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
 
@@ -326,9 +328,14 @@ impl InstanceService {
         summary: &ModSummary,
 
         preferred_source: Option<ModSource>,
-
         version_id: Option<&str>,
+
         update_existing: bool,
+
+        // Explicit origin override. When absent, a sidecar-claimed
+        // filename means pack (reinstalling or version-switching pack
+        // content); anything else is a genuine add.
+        origin: Option<crate::dto::ModOrigin>,
 
         cancel: &crate::download::CancelToken,
 
@@ -384,7 +391,10 @@ impl InstanceService {
 
 
 
-        if !update_existing && db.get_instance_mod(instance_id, &summary.uid)?.is_some() {
+        let existing = db.get_instance_mod(instance_id, &summary.uid)?;
+        let existing_pack = existing.as_ref()
+            .is_some_and(|(row, _)| row.origin == crate::dto::ModOrigin::Pack);
+        if !update_existing && existing.is_some() {
 
             return Err(InstanceError::AlreadyInstalled);
 
@@ -424,7 +434,7 @@ impl InstanceService {
             // as a modpack's per-file restriction: report it as a manual
             // download pointing at this exact file/version/loader instead of
             // failing the install outright.
-            Err(InstanceError::DistributionRestricted { file_id, filename, sha1 }) => {
+            Err(InstanceError::DistributionRestricted { file_id, filename, sha1, dependencies }) => {
 
                 // The real project URL, not a hardcoded `mc-mods` guess —
                 // that 404s for anything CurseForge categorizes outside
@@ -439,6 +449,21 @@ impl InstanceService {
                         .and_then(|(_, _, _, website_url)| website_url.clone()),
                     None => None,
                 };
+                let missing = crate::dto::instance::MissingMod {
+                    project_id, name: summary.name.clone(), filename,
+                    url: curseforge_file_url(website_url.as_deref(), &summary.slug, file_id), sha1,
+                };
+                if let Some((_, previous_path)) = existing.as_ref() {
+                    if existing_pack {
+                        let root = instance_root(instance_id)?;
+                        crate::modpack::prepare_pending_pack_update(&root, &missing, file_id, Path::new(previous_path))
+                            .map_err(map_modpack_error)?.commit(cancel).await.map_err(map_modpack_error)?;
+                    }
+                }
+                let (_, mut missing_mods) = if summary.project_type == ContentType::Mod {
+                    install_required_dependencies(db, modrinth, curseforge, config, &instance, summary, dependencies, cancel, report).await
+                } else { (Vec::new(), Vec::new()) };
+                missing_mods.insert(0, missing);
 
                 return Ok(InstallModResult {
                     message: format!(
@@ -450,13 +475,7 @@ impl InstanceService {
                     installed: None,
                     instance: instance.clone(),
                     has_skipped: true,
-                    missing_mods: vec![crate::dto::instance::MissingMod {
-                        project_id,
-                        name: summary.name.clone(),
-                        filename,
-                        url: curseforge_file_url(website_url.as_deref(), &summary.slug, file_id),
-                        sha1,
-                    }],
+                    missing_mods,
                 });
 
             }
@@ -467,15 +486,15 @@ impl InstanceService {
 
 
 
-        let dest_dir = ensure_instance_dirs(instance_id)?;
+        let root = instance_root(instance_id)?;
+        let dest_dir = root.join("mods");
 
-        let dest_path = match summary.project_type {
+        let mut dest_path = match summary.project_type {
 
             ContentType::Resourcepack => {
 
                 let dir = instance_root(instance_id)?.join("resourcepacks");
 
-                std::fs::create_dir_all(&dir)?;
 
                 safe_join(&dir, &download.filename).map_err(map_download_error)?
 
@@ -487,13 +506,43 @@ impl InstanceService {
 
 
 
+        if existing.as_ref().is_some_and(|(_, path)| path.ends_with(crate::commands::content::DISABLED_SUFFIX)) {
+            dest_path = dest_path.with_file_name(format!("{}{}", download.filename, crate::commands::content::DISABLED_SUFFIX));
+        }
+        ensure_contained_path(&root, &dest_path).map_err(map_download_error)?;
         let client = http_client().map_err(map_download_error)?;
-
-        download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
-
-            .await
-
-            .map_err(map_download_error)?;
+        let bytes = download_bytes_capped_with_retry(&client, &download.url, cancel, MAX_DOWNLOAD_BYTES)
+            .await.map_err(map_download_error)?;
+        verify_hashes(&bytes, &download.hashes).map_err(map_download_error)?;
+        let mut transaction = PackTransaction::new(&root).map_err(map_modpack_error)?;
+        let relative = dest_path.strip_prefix(&root).map_err(|_| InstanceError::Other("Install path outside instance".into()))?;
+        transaction.stage(&relative.to_string_lossy(), &bytes).map_err(map_modpack_error)?;
+        if let Some((_, previous)) = &existing {
+            let previous = Path::new(previous);
+            ensure_contained_path(&root, previous).map_err(map_download_error)?;
+            if previous != dest_path && previous.is_file() {
+                transaction.remove(previous).map_err(map_modpack_error)?;
+            }
+        }
+        // Standalone updates of pack-owned files publish the new receipt
+        // in the same rollback boundary as the replacement and DB row.
+        if source == ModSource::Curseforge && existing_pack {
+            let file_id = download.curseforge_file_id.ok_or_else(|| InstanceError::Other("Resolved CurseForge file id missing".into()))?;
+            let project_id = summary.curseforge_id.ok_or_else(|| InstanceError::Other("CurseForge project id missing".into()))?;
+            let receipt = crate::dto::instance::MissingMod {
+                project_id, name: summary.name.clone(), filename: download.filename.clone(),
+                url: curseforge_file_url(None, &summary.slug, file_id), sha1: None,
+            };
+            let actual_sha1 = match download.hashes.get("sha1") {
+                Some(hash) => hash.clone(), // Proven against these bytes above.
+                None => {
+                    use sha1::Digest;
+                    hex::encode(sha1::Sha1::digest(&bytes))
+                }
+            };
+            crate::modpack::stage_completed_pack_update(&mut transaction, &root, &receipt, file_id, actual_sha1)
+                .map_err(map_modpack_error)?;
+        }
 
 
 
@@ -509,26 +558,24 @@ impl InstanceService {
             None => None,
         };
 
-        let installed = db.insert_instance_mod(
-
-            instance_id,
-
-            &summary.uid,
-
-            &summary.name,
-
-            source,
-
-            &download.filename,
-
-            &dest_path.display().to_string(),
-
-            icon.as_deref(),
-
-            // Direct user install (Browse button / update flow) — never pack.
-            crate::dto::ModOrigin::User,
-
-        )?;
+        // Origin for the new row: explicit caller override wins, else a
+        // sidecar-claimed filename means reinstalling pack content.
+        let sidecar_claimed = instance_root(instance_id)
+            .ok()
+            .map(|root| crate::db::pack_filenames(&root).contains(&download.filename))
+            .unwrap_or(false);
+        let filename = dest_path.file_name().and_then(|name| name.to_str())
+            .ok_or_else(|| InstanceError::Other("Invalid install filename".into()))?;
+        let mut installed = None;
+        transaction.commit_with(cancel, || {
+            installed = Some(db.insert_instance_mod(
+                instance_id, &summary.uid, &summary.name, source, filename,
+                &dest_path.display().to_string(), icon.as_deref(),
+                resolve_install_origin(origin, sidecar_claimed),
+            ).map_err(|error| ModpackError::Other(format!("Could not record install: {error}")))?);
+            Ok(())
+        }).await.map_err(map_modpack_error)?;
+        let installed = installed.expect("committed install recorded");
 
 
 
@@ -545,8 +592,7 @@ impl InstanceService {
                     config,
                     &instance,
                     summary,
-                    source,
-                    version_id,
+                    download.dependencies.clone(),
                     cancel,
                     report,
                 )
@@ -589,31 +635,22 @@ impl InstanceService {
 
 
     pub fn remove_mod(
-
         db: &Database,
-
         instance_id: &str,
-
         mod_uid: &str,
-
     ) -> Result<(), InstanceError> {
-
-        let Some(file_path) = db.delete_instance_mod(instance_id, mod_uid)? else {
-
+        let Some((_, file_path)) = db.get_instance_mod(instance_id, mod_uid)? else {
             return Err(InstanceError::NotFound);
-
         };
-
+        let root = instance_root(instance_id)?;
         let path = Path::new(&file_path);
-
-        if path.exists() {
-
-            std::fs::remove_file(path)?;
-
-        }
-
-        Ok(())
-
+        ensure_contained_path(&root, path).map_err(map_download_error)?;
+        remove_tracked_file(&root, path, || {
+            if db.delete_instance_mod(instance_id, mod_uid)?.is_none() {
+                return Err(InstanceError::NotFound);
+            }
+            Ok(())
+        })
     }
 
 }
@@ -628,147 +665,83 @@ impl InstanceService {
 /// the user never asked for.
 const MAX_DEPENDENCY_INSTALLS: usize = 24;
 
-/// Installs one already-identified Modrinth dependency: resolve, download,
-/// record. Deliberately narrower than `install_mod` — a dependency is always
-/// a plain mod from Modrinth, so none of that function's modpack branch or
-/// CurseForge distribution-restriction handling can apply, and reusing it
-/// would mean recursing through dependency resolution a second time.
-async fn install_dependency(
-    db: &Database,
-    modrinth: &ModrinthClient,
-    instance: &InstanceSummary,
-    summary: &ModSummary,
-    cancel: &crate::download::CancelToken,
+fn duplicate_name(name: &str, copy: u32) -> String {
+    let suffix = if copy == 1 { " (copy)".to_string() } else { format!(" (copy {copy})") };
+    let base: String = name.chars().take(MAX_INSTANCE_NAME_LEN - suffix.chars().count()).collect();
+    format!("{base}{suffix}")
+}
+
+pub(crate) fn remove_tracked_file(
+    root: &Path,
+    path: &Path,
+    publish: impl FnOnce() -> Result<(), InstanceError>,
 ) -> Result<(), InstanceError> {
-    let download = modrinth
-        .query_versions(
-            summary.modrinth_id.as_deref().unwrap_or_default(),
-            Some(&instance.minecraft_version),
-            Some(instance.loader.as_modrinth()),
-        )
-        .await
-        .map_err(map_modrinth_install_error)?;
-
-    let dest_dir = ensure_instance_dirs(&instance.id)?;
-    let dest_path = safe_join(&dest_dir, &download.filename).map_err(map_download_error)?;
-
-    let client = http_client().map_err(map_download_error)?;
-    download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
-        .await
-        .map_err(map_download_error)?;
-
-    let icon = match summary.icon_url.as_deref() {
-        Some(icon_url) => Some(
-            download_icon_data_url(icon_url, cancel)
-                .await
-                .unwrap_or_else(|| icon_url.to_string()),
-        ),
-        None => None,
-    };
-
-    db.insert_instance_mod(
-        &instance.id,
-        &summary.uid,
-        &summary.name,
-        crate::dto::ModSource::Modrinth,
-        &download.filename,
-        &dest_path.display().to_string(),
-        icon.as_deref(),
-        // Dependency pulled in by a user install — travels with it.
-        crate::dto::ModOrigin::User,
-    )?;
-
+    ensure_contained_path(root, path).map_err(map_download_error)?;
+    if !path.exists() { return publish(); }
+    if !path.is_file() {
+        return Err(InstanceError::Other("Tracked content is not a file; no tracking was removed".into()));
+    }
+    let staging = tempfile::Builder::new().prefix(".waybound-remove-").tempdir_in(root)?;
+    let backup = staging.path().join("original");
+    std::fs::rename(path, &backup)?;
+    if let Err(error) = publish() {
+        if let Err(restore) = std::fs::rename(&backup, path) {
+            let recovery = staging.keep();
+            return Err(InstanceError::Other(format!("{error}; restore failed: {restore}. Original retained at {}", recovery.display())));
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
-/// One pending dependency, tagged by source so a single queue can carry both
-/// kinds. The tag decides how it's resolved, installed, and recorded.
-#[derive(Debug, Clone, PartialEq)]
-enum DependencyRef {
-    Modrinth(String),
-    Curseforge(u32),
-}
-
-/// The required dependencies of whichever exact version/root selection the
-/// install just used. For a user-picked version id this reads THAT version's
-/// dependency list (not whatever the auto-resolver would pick now); for
-/// auto-resolution the source-specific helper re-derives the same choice the
-/// download just made. Best-effort throughout — an empty list just means no
-/// dependency walk, never a failed install.
-async fn root_dependency_refs(
-    modrinth: &ModrinthClient,
-    curseforge: &CurseForgeClient,
-    config: &ConfigStore,
-    root: &ModSummary,
+/// Publish a verified dependency and its tracking together. Exact pins may
+/// replace an existing version, retaining its disabled state and origin.
+async fn install_dependency(
+    db: &Database,
     instance: &InstanceSummary,
+    summary: &ModSummary,
     source: ModSource,
-    version_id: Option<&str>,
-) -> Vec<DependencyRef> {
-    match source {
-        ModSource::Modrinth => {
-            let project_id = root
-                .modrinth_id
-                .clone()
-                .unwrap_or_else(|| root.slug.clone());
-            if let Some(vid) = version_id {
-                if let Ok(version) = modrinth.fetch_version_detail(vid).await {
-                    return crate::sources::modrinth::required_dependency_ids_of(&version)
-                        .into_iter()
-                        .map(DependencyRef::Modrinth)
-                        .collect();
-                }
-            }
-            modrinth
-                .required_dependency_ids(
-                    &project_id,
-                    &instance.minecraft_version,
-                    instance.loader.as_modrinth(),
-                )
-                .await
-                .into_iter()
-                .map(DependencyRef::Modrinth)
-                .collect()
-        }
-        ModSource::Curseforge => {
-            let Some(mod_id) = root.curseforge_id else {
-                return Vec::new();
-            };
-            let Some(api_key) = config.curseforge_api_key() else {
-                return Vec::new();
-            };
-            if let Some(vid) = version_id.and_then(|v| v.parse::<u32>().ok()) {
-                return curseforge
-                    .file_dependency_mod_ids(mod_id, vid, &api_key)
-                    .await
-                    .into_iter()
-                    .map(DependencyRef::Curseforge)
-                    .collect();
-            }
-            curseforge
-                .required_dependency_mod_ids(
-                    mod_id,
-                    &instance.minecraft_version,
-                    instance.loader,
-                    &api_key,
-                )
-                .await
-                .into_iter()
-                .map(DependencyRef::Curseforge)
-                .collect()
+    download: &ResolvedDownload,
+    cancel: &CancelToken,
+) -> Result<(), InstanceError> {
+    let root = instance_root(&instance.id)?;
+    let existing = db.get_instance_mod(&instance.id, &summary.uid)?;
+    let origin = existing.as_ref()
+        .map_or(crate::dto::ModOrigin::User, |(row, _)| row.origin);
+    let filename = if existing.as_ref().is_some_and(|(_, path)| path.ends_with(crate::commands::content::DISABLED_SUFFIX)) {
+        format!("{}{}", download.filename, crate::commands::content::DISABLED_SUFFIX)
+    } else {
+        download.filename.clone()
+    };
+    let dest = crate::download::contained_join(&root.join("mods"), &filename).map_err(map_download_error)?;
+    let client = http_client().map_err(map_download_error)?;
+    let bytes = download_bytes_capped_with_retry(&client, &download.url, cancel, MAX_DOWNLOAD_BYTES)
+        .await.map_err(map_download_error)?;
+    verify_hashes(&bytes, &download.hashes).map_err(map_download_error)?;
+    let mut transaction = PackTransaction::new(&root).map_err(map_modpack_error)?;
+    transaction.stage(&format!("mods/{filename}"), &bytes).map_err(map_modpack_error)?;
+    if let Some((_, previous)) = existing {
+        let previous = Path::new(&previous);
+        ensure_contained_path(&root, previous).map_err(map_download_error)?;
+        if previous != dest && previous.is_file() {
+            transaction.remove(previous).map_err(map_modpack_error)?;
         }
     }
+    let icon = match summary.icon_url.as_deref() {
+        Some(url) => Some(download_icon_data_url(url, cancel).await.unwrap_or_else(|| url.to_string())),
+        None => None,
+    };
+    transaction.commit_with(cancel, || {
+        db.insert_instance_mod(
+            &instance.id, &summary.uid, &summary.name, source, &filename,
+            &dest.display().to_string(), icon.as_deref(), origin,
+        ).map_err(|error| ModpackError::Other(format!("Could not record dependency: {error}")))?;
+        Ok(())
+    }).await.map_err(map_modpack_error)
 }
 
-/// Walks the required-dependency graph of a just-installed mod and installs
-/// whatever the instance is missing, returning the names actually added plus
-/// any dependencies that need a manual download (CurseForge authors can
-/// disable third-party distribution on individual files).
-///
-/// Breadth-first with an explicit queue rather than recursion, so the
-/// visited-set is trivially correct and there's no boxed async recursion.
-/// Every failure is swallowed on purpose: this runs *after* the mod the user
-/// asked for is already on disk, so a dependency that can't be resolved must
-/// leave them with a working install and a note, not an error that undoes it.
+/// Walk the requirements carried by each chosen file, never re-query latest
+/// merely to discover dependencies. Version-only requirements retain pins.
 async fn install_required_dependencies(
     db: &Database,
     modrinth: &ModrinthClient,
@@ -776,232 +749,99 @@ async fn install_required_dependencies(
     config: &ConfigStore,
     instance: &InstanceSummary,
     root: &ModSummary,
-    source: ModSource,
-    version_id: Option<&str>,
-    cancel: &crate::download::CancelToken,
+    dependencies: Vec<ResolvedDependency>,
+    cancel: &CancelToken,
     report: &impl Fn(u32, u32, &str),
 ) -> (Vec<String>, Vec<crate::dto::instance::MissingMod>) {
-    let mut queue: std::collections::VecDeque<DependencyRef> =
-        root_dependency_refs(modrinth, curseforge, config, root, instance, source, version_id)
-            .await
-            .into_iter()
-            .collect();
-    let mut visited: Vec<DependencyRef> = Vec::new();
-    let mut installed: Vec<String> = Vec::new();
-    let mut missing: Vec<crate::dto::instance::MissingMod> = Vec::new();
-
+    let mut queue: std::collections::VecDeque<_> = dependencies.into();
+    let mut visited = Vec::new();
+    let mut installed = Vec::new();
+    let mut missing = Vec::new();
+    let mut pinned_projects = std::collections::HashMap::<String, String>::new();
     while let Some(dep) = queue.pop_front() {
-        if cancel.is_cancelled() || installed.len() >= MAX_DEPENDENCY_INSTALLS {
-            break;
-        }
-        // Successful installs are recorded in the DB immediately (which breaks
-        // cycles on its own), but a dependency that FAILED to install leaves
-        // no DB row — without this set, two mods sharing a failing dependency
-        // would each retry it.
-        if visited.contains(&dep) {
-            continue;
-        }
+        if cancel.is_cancelled() || visited.len() >= MAX_DEPENDENCY_INSTALLS { break; }
+        if visited.contains(&dep) { continue; }
         visited.push(dep.clone());
-
-        match dep {
-            DependencyRef::Modrinth(project_id) => {
-                // Already present: its own dependencies came with it, so
-                // there's nothing further to walk down this branch.
-                if db
-                    .get_instance_mod(&instance.id, &format!("modrinth:{project_id}"))
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    continue;
+        let resolved: Result<(ModSummary, ModSource, ResolvedDownload), InstanceError> = async {
+            match dep {
+                ResolvedDependency::Modrinth { project_id, version_id } => {
+                    let exact_version = if let Some(version_id) = version_id.as_deref() {
+                        Some(modrinth.fetch_version_detail(version_id).await.map_err(map_modrinth_install_error)?)
+                    } else { None };
+                    let project_id = if let Some(version) = exact_version.as_ref() {
+                        let version_id = version_id.as_deref().expect("exact version requested");
+                        if version.project_id.is_empty() || project_id.as_deref().is_some_and(|id| id != version.project_id) {
+                            return Err(InstanceError::Other("Dependency version belongs to a different or unknown project".into()));
+                        }
+                        if let Some(previous) = pinned_projects.get(&version.project_id) {
+                            if previous != version_id {
+                                return Err(InstanceError::Other(format!("Conflicting required versions {previous} and {version_id} for {}", version.project_id)));
+                            }
+                        }
+                        pinned_projects.insert(version.project_id.clone(), version_id.to_string());
+                        version.project_id.clone()
+                    } else {
+                        project_id.ok_or_else(|| InstanceError::Other("Dependency has neither project nor version id".into()))?
+                    };
+                    let uid = format!("modrinth:{project_id}");
+                    if uid == root.uid { return Err(InstanceError::AlreadyInstalled); }
+                    if version_id.is_none() && db.get_instance_mod(&instance.id, &uid)?.is_some() {
+                        return Err(InstanceError::AlreadyInstalled);
+                    }
+                    let summary = modrinth.fetch_project_summary(&project_id).await.map_err(map_modrinth_install_error)?;
+                    let download = if let Some(version) = exact_version.as_ref() {
+                        crate::sources::modrinth::resolve_version_detail(version, &instance.minecraft_version, instance.loader, ContentType::Mod)
+                    } else {
+                        modrinth.resolve_download(&project_id, &instance.minecraft_version, instance.loader, ContentType::Mod).await
+                    }.map_err(map_modrinth_install_error)?;
+                    Ok((summary, ModSource::Modrinth, download))
                 }
-
-                let Ok(summary) = modrinth.fetch_project_summary(&project_id).await else {
-                    crate::activity::append_log(
-                        &format!("Dependency lookup failed for Modrinth project {project_id}"),
-                        "warn",
-                        None,
-                    );
-                    continue;
-                };
-
+                ResolvedDependency::Curseforge(project_id) => {
+                    let uid = format!("curseforge:{project_id}");
+                    if uid == root.uid || db.get_instance_mod(&instance.id, &uid)?.is_some() {
+                        return Err(InstanceError::AlreadyInstalled);
+                    }
+                    let api_key = config.curseforge_api_key().ok_or(InstanceError::CurseForgeNotConfigured)?;
+                    let (name, slug, icon_url, website_url) = curseforge.mods_batch(&[project_id], &api_key).await
+                        .remove(&project_id).unwrap_or((format!("CurseForge project {project_id}"), String::new(), None, None));
+                    let summary = ModSummary {
+                        uid, name, slug, icon_url, project_type: ContentType::Mod,
+                        sources: vec![ModSource::Curseforge], curseforge_id: Some(project_id),
+                        modrinth_id: None, description: String::new(), author: String::new(),
+                        downloads: 0, loaders: vec![instance.loader], updated_at: String::new(),
+                    };
+                    let download = match curseforge.resolve_download_with_key(project_id, &instance.minecraft_version, instance.loader, ContentType::Mod, &api_key).await {
+                        Ok(download) => download,
+                        Err(crate::sources::curseforge::CurseForgeError::DistributionRestricted { file_id, filename, sha1, dependencies }) => {
+                            let website = website_url.as_deref();
+                            queue.extend(dependencies);
+                            missing.push(crate::dto::instance::MissingMod {
+                                project_id, name: summary.name.clone(), filename,
+                                url: curseforge_file_url(website, &summary.slug, file_id), sha1,
+                            });
+                            return Err(InstanceError::DistributionRestricted { file_id, filename: summary.name, sha1: None, dependencies: Vec::new() });
+                        }
+                        Err(error) => return Err(map_curseforge_install_error(error)),
+                    };
+                    Ok((summary, ModSource::Curseforge, download))
+                }
+            }
+        }.await;
+        match resolved {
+            Ok((summary, source, download)) => {
                 report(installed.len() as u32, MAX_DEPENDENCY_INSTALLS as u32, &summary.name);
-
-                match install_dependency(db, modrinth, instance, &summary, cancel).await {
+                match install_dependency(db, instance, &summary, source, &download, cancel).await {
                     Ok(()) => {
-                        crate::activity::append_log(
-                            &format!(
-                                "Installed {} to {} as a required dependency of {}",
-                                summary.name, instance.name, root.name
-                            ),
-                            "info",
-                            Some(&summary.uid),
-                        );
-                        installed.push(summary.name.clone());
-                        let loader = instance.loader.as_modrinth();
-                        queue.extend(
-                            modrinth
-                                .required_dependency_ids(
-                                    &project_id,
-                                    &instance.minecraft_version,
-                                    loader,
-                                )
-                                .await
-                                .into_iter()
-                                .map(DependencyRef::Modrinth),
-                        );
+                        queue.extend(download.dependencies);
+                        installed.push(summary.name);
                     }
-                    Err(err) => {
-                        // Most commonly: the dependency has no build for this
-                        // exact MC version + loader. Worth telling the user
-                        // about, not worth failing their install over.
-                        crate::activity::append_log(
-                            &format!(
-                                "Could not install required dependency {} for {}: {err}",
-                                summary.name, root.name
-                            ),
-                            "warn",
-                            None,
-                        );
-                    }
+                    Err(error) => crate::activity::append_log(&format!("Could not install dependency of {}: {error}", root.name), "warn", None),
                 }
             }
-            DependencyRef::Curseforge(mod_id) => {
-                let uid = format!("curseforge:{mod_id}");
-                if db
-                    .get_instance_mod(&instance.id, &uid)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    continue;
-                }
-
-                let Some(api_key) = config.curseforge_api_key() else {
-                    continue;
-                };
-                let (name, slug, icon_url, website_url) = curseforge
-                    .mods_batch(&[mod_id], &api_key)
-                    .await
-                    .remove(&mod_id)
-                    .unwrap_or((
-                        format!("CurseForge project {mod_id}"),
-                        String::new(),
-                        None,
-                        None,
-                    ));
-
-                report(installed.len() as u32, MAX_DEPENDENCY_INSTALLS as u32, &name);
-
-                match curseforge
-                    .fetch_file(mod_id, &instance.minecraft_version, instance.loader, &api_key)
-                    .await
-                {
-                    Ok(download) => {
-                        let recorded: Result<(), InstanceError> = async {
-                            let dest_dir = ensure_instance_dirs(&instance.id)?;
-                            let dest_path = safe_join(&dest_dir, &download.filename)
-                                .map_err(map_download_error)?;
-                            let client = http_client().map_err(map_download_error)?;
-                            download_to_file_verified(&client, &download.url, &dest_path, cancel, &download.hashes)
-                                .await
-                                .map_err(map_download_error)?;
-
-                            let icon = match &icon_url {
-                                Some(icon_url) => Some(
-                                    download_icon_data_url(icon_url, cancel)
-                                        .await
-                                        .unwrap_or_else(|| icon_url.clone()),
-                                ),
-                                None => None,
-                            };
-
-                            db.insert_instance_mod(
-                                &instance.id,
-                                &uid,
-                                &name,
-                                crate::dto::ModSource::Curseforge,
-                                &download.filename,
-                                &dest_path.display().to_string(),
-                                icon.as_deref(),
-                                // Dependency pulled in by a user install — travels with it.
-                                crate::dto::ModOrigin::User,
-                            )?;
-                            Ok(())
-                        }
-                        .await;
-
-                        match recorded {
-                            Ok(()) => {
-                                crate::activity::append_log(
-                                    &format!(
-                                        "Installed {} to {} as a required dependency of {}",
-                                        name, instance.name, root.name
-                                    ),
-                                    "info",
-                                    Some(&uid),
-                                );
-                                installed.push(name.clone());
-                                queue.extend(
-                                    curseforge
-                                        .required_dependency_mod_ids(
-                                            mod_id,
-                                            &instance.minecraft_version,
-                                            instance.loader,
-                                            &api_key,
-                                        )
-                                        .await
-                                        .into_iter()
-                                        .map(DependencyRef::Curseforge),
-                                );
-                            }
-                            Err(err) => {
-                                crate::activity::append_log(
-                                    &format!(
-                                        "Could not install required dependency {name} for {}: {err}",
-                                        root.name
-                                    ),
-                                    "warn",
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                    Err(crate::sources::curseforge::CurseForgeError::DistributionRestricted { file_id, filename, sha1 }) => {
-                        // Same handling as a restricted direct install: hand
-                        // the user an exact manual-download link instead of
-                        // failing or silently skipping.
-                        missing.push(crate::dto::instance::MissingMod {
-                            project_id: mod_id,
-                            name: name.clone(),
-                            filename,
-                            url: curseforge_file_url(website_url.as_deref(), &slug, file_id),
-                            sha1,
-                        });
-                        crate::activity::append_log(
-                            &format!(
-                                "Required dependency {name} of {} needs a manual download",
-                                root.name
-                            ),
-                            "warn",
-                            None,
-                        );
-                    }
-                    Err(err) => {
-                        crate::activity::append_log(
-                            &format!(
-                                "Could not install required dependency {name} for {}: {err}",
-                                root.name
-                            ),
-                            "warn",
-                            None,
-                        );
-                    }
-                }
-            }
+            Err(InstanceError::AlreadyInstalled) => {}
+            Err(error) => crate::activity::append_log(&format!("Could not resolve dependency of {}: {error}", root.name), "warn", None),
         }
     }
-
     (installed, missing)
 }
 
@@ -1019,283 +859,116 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn install_modpack(
+const PACK_LOADER_PROVENANCE: &str = ".waybound-pack-loader.json";
 
-    db: &Database,
-
-    config: &ConfigStore,
-
-    modrinth: &ModrinthClient,
-
-    curseforge: &CurseForgeClient,
-
-    instance: &InstanceSummary,
-
-    summary: &ModSummary,
-
-    preferred_source: Option<ModSource>,
-
-    version_id: Option<&str>,
-
-    cancel: &crate::download::CancelToken,
-
-    report: &impl Fn(u32, u32, &str),
-
-) -> Result<InstallModResult, InstanceError> {
-
-    let source = pick_source(summary, preferred_source)?;
-
-    let download = resolve_download(
-
-        modrinth,
-
-        curseforge,
-
-        config,
-
-        summary,
-
-        source,
-
-        &instance.minecraft_version,
-
-        instance.loader,
-
-        version_id,
-
-    )
-
-    .await?;
-
-
-
-    let client = http_client().map_err(map_download_error)?;
-
-    let bytes = download_bytes_with_retry(&client, &download.url, cancel)
-        .await
-        .map_err(map_download_error)?;
-    verify_hashes(&bytes, &download.hashes).map_err(map_download_error)?;
-
-    // A pack archive declares its own loader (CurseForge `manifest.json` /
-    // the mrpack index) — the only reliable signal. The Browse suggestion
-    // that created this instance is a category guess defaulting to Forge,
-    // which is how a NeoForge pack ends up on a Forge instance: every
-    // NeoForge jar then fails to register and the game dies on "missing"
-    // mandatory dependencies that are all sitting in `mods/`. Correct the
-    // instance BEFORE importing so the launch uses the pack's real loader.
-    let mut loader_note: Option<String> = None;
-    if let Some(declared) = crate::modpack::declared_loader_from_bytes(&bytes) {
-        if declared.loader != instance.loader {
-            db.set_instance_loader(&instance.id, declared.loader)?;
-            // A pin for the old loader is meaningless under the new one.
-            db.set_instance_loader_version(&instance.id, None)?;
-        }
-        // Pin the pack's exact build when it declares one and the instance
-        // has no explicit pin — the pack was built and tested against
-        // exactly this. An existing user pin for the same loader is left
-        // alone.
-        if instance.loader_version.is_none() {
-            if let Some(build) = declared.version.as_deref() {
-                db.set_instance_loader_version(&instance.id, Some(build))?;
-            }
-        }
-        if declared.loader != instance.loader {
-            let name = match declared.loader {
-                ModLoader::Fabric => "Fabric",
-                ModLoader::Forge => "Forge",
-                ModLoader::NeoForge => "NeoForge",
-                ModLoader::Quilt => "Quilt",
-                ModLoader::Vanilla => "Vanilla",
-            };
-            loader_note = Some(format!(
-                "Instance loader set to {name}{} from the pack itself.",
-                declared
-                    .version
-                    .as_deref()
-                    .map(|b| format!(" {b}"))
-                    .unwrap_or_default()
+fn pack_loader_selection(
+    loader: ModLoader,
+    pin: Option<&str>,
+    previous: Option<&PackDeclaredLoader>,
+    declared: Option<&PackDeclaredLoader>,
+) -> Result<(ModLoader, Option<String>, Option<PackDeclaredLoader>), InstanceError> {
+    let Some(declared) = declared else { return Ok((loader, pin.map(str::to_owned), previous.cloned())); };
+    let pack_owned = previous.is_some_and(|old| old.loader == loader && old.version.as_deref() == pin);
+    if pin.is_some() && !pack_owned {
+        if declared.loader != loader {
+            return Err(InstanceError::Other(
+                "Pack declares a different loader, but this instance has an explicit loader-version pin. Clear the pin before switching loaders; instance left unchanged.".into()
             ));
         }
+        // Missing historical provenance is never proof of pack ownership.
+        return Ok((loader, pin.map(str::to_owned), None));
     }
+    Ok((declared.loader, declared.version.clone(), Some(declared.clone())))
+}
 
-    let instance_root = instance_root(&instance.id)?;
-
-    let import = if is_mrpack_bytes(&bytes) {
-
-        import_modrinth_mrpack_bytes(&bytes, &instance_root, modrinth, cancel, report)
-
-            .await
-
-            .map_err(map_modpack_error)?
-
-    } else if is_curseforge_modpack_zip(&bytes) {
-
-        let api_key = config
-
-            .curseforge_api_key()
-
-            .ok_or(InstanceError::CurseForgeNotConfigured)?;
-
-        import_curseforge_modpack_zip(
-            &bytes,
-            &instance_root,
-            &api_key,
-            cancel,
-            report,
-        )
-
-            .await
-
-            .map_err(map_modpack_error)?
-
-    } else {
-
-        let staging = safe_join(&instance_root, &download.filename).map_err(map_download_error)?;
-
-        std::fs::write(&staging, &bytes)?;
-
-        return Err(InstanceError::Other(format!(
-
-            "Downloaded modpack archive to {} but could not recognize the format. Expected .mrpack or CurseForge manifest.json.",
-
-            staging.display()
-
-        )));
-
+async fn install_modpack(
+    db: &Database,
+    config: &ConfigStore,
+    modrinth: &ModrinthClient,
+    curseforge: &CurseForgeClient,
+    instance: &InstanceSummary,
+    summary: &ModSummary,
+    preferred_source: Option<ModSource>,
+    version_id: Option<&str>,
+    cancel: &CancelToken,
+    report: &impl Fn(u32, u32, &str),
+) -> Result<InstallModResult, InstanceError> {
+    let source = pick_source(summary, preferred_source)?;
+    let download = resolve_download(modrinth, curseforge, config, summary, source,
+        &instance.minecraft_version, instance.loader, version_id).await?;
+    let client = http_client().map_err(map_download_error)?;
+    let bytes = download_bytes_capped_with_retry(&client, &download.url, cancel, crate::modpack::MAX_PACK_FILE_BYTES)
+        .await.map_err(map_download_error)?;
+    verify_hashes(&bytes, &download.hashes).map_err(map_download_error)?;
+    let root = instance_root(&instance.id)?;
+    let provenance_path = crate::download::contained_join(&root, PACK_LOADER_PROVENANCE).map_err(map_download_error)?;
+    let previous: Option<PackDeclaredLoader> = match std::fs::read(provenance_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| InstanceError::Other(format!("Invalid pack loader provenance: {error}")))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
-
-    // Only reached for a real modpack import (the plain-mod-jar path returns
-    // early above) — record the pack's own version signal for display on the
-    // Overview tab. The mrpack index's `versionId` is more reliable when
-    // present (CurseForge's manifest.json has no version field at all), so
-    // it wins; otherwise fall back to the downloaded archive's own filename.
-    let modpack_version_label = import
-        .version_label
-        .clone()
-        .unwrap_or_else(|| strip_pack_extension(&download.filename));
-    let _ = db.set_modpack_version_label(&instance.id, Some(&modpack_version_label));
-    // Remember which pack project this came from — without the uid the
-    // instance can show the pack's version label but never offer its other
-    // versions for in-place switching.
-    let _ = db.set_modpack_project_uid(&instance.id, Some(&summary.uid));
-
-
-
-    sync_mods_folder(
-        db,
-        &instance.id,
-        &instance_root.join("mods"),
-        source,
-        &import.icons,
-        &import.content_names,
-        &import.project_uids,
-    )?;
-    seed_content_meta_cache(
-        db,
-        &instance.id,
-        &instance_root.join("resourcepacks"),
-        "resourcepack",
-        &import.icons,
-        &import.content_names,
-    );
-    seed_content_meta_cache(
-        db,
-        &instance.id,
-        &instance_root.join("shaderpacks"),
-        "shaderpack",
-        &import.icons,
-        &import.content_names,
-    );
-
-
-
-    // Give the instance the modpack's own artwork. Downloaded and embedded as a
-    // data URL (matching how manually-uploaded icons are stored) so the card
-    // renders instantly instead of hotlinking the CDN and showing the loader
-    // placeholder until that request resolves. Falls back to the raw URL if
-    // the download fails, so a network hiccup here doesn't lose the icon.
-    if let Some(icon_url) = summary.icon_url.as_deref() {
-
-        let icon = download_icon_data_url(icon_url, cancel)
-            .await
-            .unwrap_or_else(|| icon_url.to_string());
-
-        let _ = db.set_instance_icon(&instance.id, Some(&icon));
-
-    }
-
-
-
-    // Auto-apply a recommended heap size sized to the pack, unless the user
-
-    // already set one for this instance.
-
-    if let Ok(mut launch_config) = db.get_instance_launch_config(&instance.id) {
-
-        if launch_config.max_memory_mb.is_none() {
-
-            let mod_count = std::fs::read_dir(instance_root.join("mods"))
-
-                .map(|entries| {
-
-                    entries
-
-                        .filter_map(|e| e.ok())
-
-                        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jar"))
-
-                        .count()
-
-                })
-
-                .unwrap_or(0) as u32;
-
-            launch_config.max_memory_mb = Some(recommended_memory_mb(mod_count));
-
-            let _ = db.set_instance_launch_config(&instance.id, &launch_config);
-
+    let declared = crate::modpack::declared_loader_from_bytes(&bytes);
+    let (loader, loader_version, provenance) = pack_loader_selection(
+        instance.loader, instance.loader_version.as_deref(), previous.as_ref(), declared.as_ref())?;
+    let prepared = if is_mrpack_bytes(&bytes) {
+        prepare_modrinth_mrpack_bytes(&bytes, &root, modrinth, cancel, report).await
+    } else if is_curseforge_modpack_zip(&bytes) {
+        let api_key = config.curseforge_api_key().ok_or(InstanceError::CurseForgeNotConfigured)?;
+        prepare_curseforge_modpack_zip(&bytes, &root, &api_key, cancel, report).await
+    } else {
+        return Err(InstanceError::Other("Unrecognized modpack format. Expected .mrpack or CurseForge manifest.json; instance left unchanged.".into()));
+    }.map_err(map_modpack_error)?;
+    let crate::modpack::PreparedModpackImport { mut transaction, result: import } = prepared;
+    for row in db.list_instance_mods(&instance.id)? {
+        if !row.file_name.ends_with(crate::commands::content::DISABLED_SUFFIX) { continue; }
+        for (filename, uid) in &import.project_uids {
+            if uid == &row.mod_uid && filename.to_ascii_lowercase().ends_with(".jar") {
+                transaction.preserve_disabled(&format!("mods/{filename}")).map_err(map_modpack_error)?;
+            }
         }
-
     }
-
-
-
-    let installed = db.insert_instance_mod(
-
-        &instance.id,
-
-        &summary.uid,
-
-        &summary.name,
-
-        source,
-
-        &download.filename,
-
-        &instance_root.display().to_string(),
-
-        summary.icon_url.as_deref(),
-
-        // The pack archive itself — definitionally pack-placed.
-        crate::dto::ModOrigin::Pack,
-
-    )?;
-
-
-
+    transaction.stage(PACK_LOADER_PROVENANCE, &serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| InstanceError::Other(error.to_string()))?).map_err(map_modpack_error)?;
+    let label = import.version_label.clone().unwrap_or_else(|| strip_pack_extension(&download.filename));
+    let icon = match summary.icon_url.as_deref() {
+        Some(url) => Some(download_icon_data_url(url, cancel).await.unwrap_or_else(|| url.to_string())),
+        None => None,
+    };
+    let mut installed = None;
+    transaction.commit_with(cancel, || {
+        installed = Some(db.publish_instance_pack(
+            &instance.id, loader, loader_version.as_deref(), &label, &summary.uid,
+            &summary.name, source, &download.filename, &root.display().to_string(), icon.as_deref(),
+        ).map_err(|error| ModpackError::Other(format!("Could not publish pack metadata: {error}")))?);
+        Ok(())
+    }).await.map_err(map_modpack_error)?;
     let mut message = import.message;
-    if let Some(note) = loader_note {
-        message = format!("{message} {note}");
+    if let Err(error) = sync_mods_folder(db, &instance.id, &root.join("mods"), source,
+        &import.icons, &import.content_names, &import.project_uids) {
+        message.push_str(&format!(" Content tracking refresh failed: {error}. Pack files and loader metadata were installed."));
     }
-
+    seed_content_meta_cache(db, &instance.id, &root.join("resourcepacks"), "resourcepack", &import.icons, &import.content_names);
+    seed_content_meta_cache(db, &instance.id, &root.join("shaderpacks"), "shaderpack", &import.icons, &import.content_names);
+    if let Some(icon) = &icon { let _ = db.set_instance_icon(&instance.id, Some(icon)); }
+    if let Ok(mut launch_config) = db.get_instance_launch_config(&instance.id) {
+        if launch_config.max_memory_mb.is_none() {
+            let count = std::fs::read_dir(root.join("mods")).map(|entries| entries.flatten()
+                .filter(|entry| entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "jar"))
+                .count()).unwrap_or(0) as u32;
+            launch_config.max_memory_mb = Some(recommended_memory_mb(count));
+            let _ = db.set_instance_launch_config(&instance.id, &launch_config);
+        }
+    }
+    let mut refreshed = instance.clone();
+    refreshed.loader = loader;
+    refreshed.loader_version = loader_version;
+    refreshed.modpack_project_uid = Some(summary.uid.clone());
+    refreshed.modpack_version_label = Some(label);
+    if let Some(icon) = icon { refreshed.icon = Some(icon); }
+    if loader != instance.loader { message.push_str(" Instance loader changed to the pack-declared loader."); }
     Ok(InstallModResult {
-        message,
-        installed: Some(installed),
-        instance: instance.clone(),
-        has_skipped: import.has_skipped,
-        missing_mods: import.missing_mods,
+        message, installed, instance: refreshed, has_skipped: import.has_skipped, missing_mods: import.missing_mods,
     })
-
 }
 
 
@@ -1325,191 +998,81 @@ fn strip_pack_extension(filename: &str) -> String {
         .to_string()
 }
 
+/// Decides the recorded origin for a fresh install row: an explicit
+/// caller override wins (Browse passes User; update passes the row's),
+/// otherwise a sidecar-claimed filename means pack content being
+/// reinstalled or version-switched, and anything else is a genuine add.
+/// Pure so the precedence is unit-testable without a database.
+fn resolve_install_origin(
+    explicit: Option<crate::dto::ModOrigin>,
+    sidecar_claimed: bool,
+) -> crate::dto::ModOrigin {
+    explicit.unwrap_or(if sidecar_claimed {
+        crate::dto::ModOrigin::Pack
+    } else {
+        crate::dto::ModOrigin::User
+    })
+}
+
 fn sync_mods_folder(
-
     db: &Database,
-
     instance_id: &str,
-
     mods_dir: &Path,
-
     source: ModSource,
-
     icons: &std::collections::HashMap<String, String>,
-
     content_names: &std::collections::HashMap<String, String>,
-
     project_uids: &std::collections::HashMap<String, String>,
-
 ) -> Result<(), InstanceError> {
-
-    if !mods_dir.exists() {
-
-        return Ok(());
-
-    }
-
-
-
-    // Existing rows for this instance, from whatever install path put them
-    // there (a Browse install's real `mod:`/`curseforge:` uid, or a previous
-    // sync's `file:` uid) — used below to (a) skip inserting a duplicate
-    // `file:` row for a filename a real uid already tracks, since the unique
-    // constraint is on `(instance_id, mod_uid)` not `(instance_id,
-    // file_name)`, and a modpack sync finding a Browse-installed jar would
-    // otherwise double-count it; and (b) prune rows for files this scan
-    // didn't find, since this insert-only batch never used to prune deleted
-    // jars, leaving phantom entries (and an inflated count) behind forever.
-    // ponytail: no per-instance lock, so this scan racing a concurrent
-    // `remove_mod` (which deletes the DB row before the file) in the narrow
-    // window between those two steps could re-insert a `file:` row for a
-    // file that's about to disappear. Add a per-instance mutex around
-    // instance-mutating commands if that phantom-row case ever actually
-    // shows up in practice.
-    let existing = db.list_instance_mods(instance_id).unwrap_or_default();
-    let existing_filenames: std::collections::HashSet<&str> =
-        existing.iter().map(|m| m.file_name.as_str()).collect();
-
-    // A project whose pinned version just changed resolves to a new
-    // filename this import — CurseForge's importer tracks a project-keyed
-    // manifest specifically to delete the file that superseded, but the
-    // Modrinth importer had no equivalent at all, and this scan is the one
-    // place both paths meet. Without this, an old jar for the same project
-    // (a stale duplicate of whatever `.jar` name the last version happened
-    // to use) is silently never removed and stays loaded by Forge/NeoForge
-    // right alongside the new one.
-    let uid_to_new_filename: std::collections::HashMap<&str, &str> =
-        project_uids.iter().map(|(fname, uid)| (uid.as_str(), fname.as_str())).collect();
-    for row in &existing {
-        let Some(&new_filename) = uid_to_new_filename.get(row.mod_uid.as_str()) else {
-            continue;
-        };
-        if new_filename == row.file_name {
-            continue;
-        }
-        let _ = std::fs::remove_file(mods_dir.join(&row.file_name));
-    }
-
-    // Catches up a row this scan already tracks on two things a later re-sync
-    // can know that an earlier one couldn't: (a) an icon it didn't have
-    // before (an older import, before hash-based icon lookup existed), and
-    // (b) — the bigger one — its real project id, when it's currently just
-    // an untrackable `file:<name>` record. Without (b), "check for updates"
-    // has nothing to re-resolve against for anything synced before this
-    // lookup existed, which is most of a typical modpack-installed library.
-    // The content-tab metadata cache is fingerprinted by the file's own
-    // size+mtime, so it has no way to know either of these side-channel
-    // changes happened — drop its cached row too, or the Content tab keeps
-    // showing the stale result forever even though the DB now has better data.
-    for row in &existing {
-        let icon = icons.get(&row.file_name).cloned().or_else(|| row.icon_url.clone());
-        let resolved_name = content_names.get(&row.file_name);
-        let name = resolved_name.cloned().unwrap_or_else(|| row.mod_name.clone());
-        let needs_icon_backfill = row.icon_url.is_none() && icon.is_some();
-        // The pre-fix default was always the filename with `.jar` stripped —
-        // a real resolved name is always worth taking over that, not just
-        // when the row had none at all.
-        let needs_name_backfill = resolved_name.is_some_and(|n| n != &row.mod_name);
-        let real_uid = project_uids.get(&row.file_name).filter(|_| row.mod_uid.starts_with("file:"));
-
-        if !needs_icon_backfill && !needs_name_backfill && real_uid.is_none() {
-            continue;
-        }
-
-        if let Some(real_uid) = real_uid {
-            if let Ok(Some(file_path)) = db.delete_instance_mod(instance_id, &row.mod_uid) {
-                let _ = db.insert_instance_mod(
-                    instance_id,
-                    real_uid,
-                    &name,
-                    source,
-                    &row.file_name,
-                    &file_path,
-                    icon.as_deref(),
-                    // Same file, better id — the row's origin survives the swap.
-                    row.origin,
-                );
-            }
-        } else {
-            if needs_icon_backfill {
-                let _ = db.update_instance_mod_icon(instance_id, &row.mod_uid, icon.as_deref().unwrap());
-            }
-            if needs_name_backfill {
-                let _ = db.update_instance_mod_name(instance_id, &row.mod_uid, &name);
-            }
-        }
-        let _ = db.delete_content_meta_cache(instance_id, "mod", &row.file_name);
-    }
-
-    let mut mods = Vec::new();
-    let mut seen_filenames = std::collections::HashSet::new();
-
+    let root = mods_dir.parent().ok_or_else(|| InstanceError::Other("Mods directory has no instance root".into()))?;
+    ensure_contained_path(root, mods_dir).map_err(map_download_error)?;
+    if !mods_dir.exists() { return Ok(()); }
+    let existing = db.list_instance_mods(instance_id)?;
+    let pack_files = crate::db::pack_filenames(root);
+    let mut seen = std::collections::HashSet::new();
+    let mut recorded = std::collections::HashSet::new();
     for entry in std::fs::read_dir(mods_dir)? {
-
         let entry = entry?;
-
         let path = entry.path();
-
-        if !path.is_file() {
-
-            continue;
-
-        }
-
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-
-            continue;
-
-        };
-
-        if !file_name.ends_with(".jar") {
-
-            continue;
-
-        }
-
-        seen_filenames.insert(file_name.to_string());
-
-        if existing_filenames.contains(file_name) {
+        ensure_contained_path(root, &path).map_err(map_download_error)?;
+        if !path.is_file() { continue; }
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let base = filename.strip_suffix(crate::commands::content::DISABLED_SUFFIX).unwrap_or(filename);
+        if !base.to_ascii_lowercase().ends_with(".jar") { continue; }
+        seen.insert(filename.to_string());
+        let old_file = existing.iter().find(|row| row.file_name == filename);
+        let resolved_uid = project_uids.get(base);
+        let uid = resolved_uid.map(String::as_str)
+            .or_else(|| old_file.filter(|row| !row.mod_uid.starts_with("file:")).map(|row| row.mod_uid.as_str()))
+            .or_else(|| old_file.map(|row| row.mod_uid.as_str()))
+            .map(str::to_owned).unwrap_or_else(|| format!("file:{filename}"));
+        // A user-added older file for the same project is not removed or
+        // allowed to steal the verified pack replacement's tracking row.
+        if resolved_uid.is_none() && project_uids.values().any(|resolved| resolved == &uid) {
             continue;
         }
-
-        let mod_uid = project_uids
-            .get(file_name)
-            .cloned()
-            .unwrap_or_else(|| format!("file:{file_name}"));
-
-        let mod_name = content_names
-            .get(file_name)
-            .cloned()
-            .unwrap_or_else(|| file_name.trim_end_matches(".jar").to_string());
-
-        mods.push((
-
-            mod_uid,
-
-            mod_name,
-
-            source,
-
-            file_name.to_string(),
-
-            path.display().to_string(),
-
-            icons.get(file_name).cloned(),
-
-        ));
-
+        let old = old_file.or_else(|| existing.iter().find(|row| row.mod_uid == uid));
+        let origin = old.map_or_else(|| resolve_install_origin(None, pack_files.contains(base)), |row| row.origin);
+        let name = content_names.get(base).map(String::as_str)
+            .or_else(|| old.map(|row| row.mod_name.as_str())).unwrap_or_else(|| base.trim_end_matches(".jar"));
+        let icon = icons.get(base).map(String::as_str).or_else(|| old.and_then(|row| row.icon_url.as_deref()));
+        let row_source = if uid.starts_with("modrinth:") { ModSource::Modrinth }
+            else if uid.starts_with("curseforge:") { ModSource::Curseforge }
+            else { old.map_or(source, |row| row.source) };
+        db.insert_instance_mod(instance_id, &uid, name, row_source, filename,
+            &path.display().to_string(), icon, origin)?;
+        if let Some(old) = old_file.filter(|row| row.mod_uid != uid) {
+            db.delete_instance_mod(instance_id, &old.mod_uid)?;
+        }
+        db.delete_content_meta_cache(instance_id, "mod", filename)?;
+        recorded.insert(uid);
     }
-
-
-
-    let _ = db.insert_instance_mods_batch(instance_id, &mods, crate::dto::ModOrigin::Pack);
-
-    for stale in existing.iter().filter(|m| !seen_filenames.contains(&m.file_name)) {
-        let _ = db.delete_instance_mod_by_file(instance_id, &stale.file_name);
+    for stale in existing.iter().filter(|row| !seen.contains(&row.file_name) && !recorded.contains(&row.mod_uid)) {
+        // Keep archive metadata rows and non-mod content.
+        let base = stale.file_name.strip_suffix(crate::commands::content::DISABLED_SUFFIX).unwrap_or(&stale.file_name);
+        if base.to_ascii_lowercase().ends_with(".jar") {
+            db.delete_instance_mod(instance_id, &stale.mod_uid)?;
+        }
     }
-
     Ok(())
 }
 
@@ -1595,7 +1158,7 @@ async fn resolve_download(
 
                 return modrinth
 
-                    .resolve_version_by_id(vid, mc_version, loader)
+                    .resolve_version_by_id(vid, mc_version, loader, summary.project_type)
 
                     .await
 
@@ -1645,11 +1208,9 @@ async fn resolve_download(
 
                 return curseforge
 
-                    .resolve_file_by_id(mod_id, file_id, &api_key, mc_version, loader)
+                    .resolve_file_by_id(mod_id, file_id, &api_key, mc_version, loader, summary.project_type)
 
                     .await
-
-                    .map(|(download, _)| download)
 
                     .map_err(map_curseforge_install_error);
 
@@ -1767,6 +1328,12 @@ fn map_curseforge_install_error(err: crate::sources::curseforge::CurseForgeError
 
         )),
 
+        crate::sources::curseforge::CurseForgeError::WrongGameVersion { filename, file_versions, expected } => InstanceError::Other(format!(
+
+            "{filename} is not built for Minecraft {expected} (it targets {}). This project has no {expected} release — pick a different version or mod.", file_versions.join(", ")
+
+        )),
+
         crate::sources::curseforge::CurseForgeError::Rejected { message, .. } => {
 
             InstanceError::Other(message)
@@ -1775,9 +1342,9 @@ fn map_curseforge_install_error(err: crate::sources::curseforge::CurseForgeError
 
         crate::sources::curseforge::CurseForgeError::Network(err) => InstanceError::Network(err),
 
-        crate::sources::curseforge::CurseForgeError::DistributionRestricted { file_id, filename, sha1 } => {
+        crate::sources::curseforge::CurseForgeError::DistributionRestricted { file_id, filename, sha1, dependencies } => {
 
-            InstanceError::DistributionRestricted { file_id, filename, sha1 }
+            InstanceError::DistributionRestricted { file_id, filename, sha1, dependencies }
 
         }
 
@@ -1872,6 +1439,9 @@ fn map_download_error(err: crate::download::DownloadError) -> InstanceError {
         )),
 
         crate::download::DownloadError::Cancelled => InstanceError::Cancelled,
+        crate::download::DownloadError::Conflict => InstanceError::Other(
+            "File changed during installation; previous files were retained.".into()
+        ),
         crate::download::DownloadError::HashMismatch(algorithm) => InstanceError::Other(format!(
             "Downloaded file failed {algorithm} integrity verification; previous files were retained."
         )),
@@ -1917,8 +1487,17 @@ pub struct ResolvedDownload {
     pub url: String,
 
     pub filename: String,
+    /// Exact upstream identity survives automatic and pinned resolution.
+    pub curseforge_file_id: Option<u32>,
     pub hashes: std::collections::HashMap<String, String>,
+    pub dependencies: Vec<ResolvedDependency>,
 
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedDependency {
+    Modrinth { project_id: Option<String>, version_id: Option<String> },
+    Curseforge(u32),
 }
 
 
@@ -1927,9 +1506,9 @@ pub struct ResolvedDownload {
 
 mod tests {
 
-    use super::{is_installable, is_reserved_windows_name, slugify, strip_pack_extension};
+    use super::{is_installable, is_reserved_windows_name, map_curseforge_install_error, resolve_install_origin, slugify, strip_pack_extension};
 
-    use crate::dto::ContentType;
+    use crate::dto::{ContentType, ModOrigin};
 
 
 
@@ -1939,6 +1518,46 @@ mod tests {
 
         assert!(is_installable(ContentType::Modpack));
 
+    }
+
+    #[test]
+    fn install_origin_explicit_wins_then_sidecar_then_user() {
+        // Browse passes User explicitly: always yours, even overlapping a
+        // pack file. Updates pass the row's origin through the same slot.
+        assert_eq!(resolve_install_origin(Some(ModOrigin::User), true), ModOrigin::User);
+        assert_eq!(resolve_install_origin(Some(ModOrigin::Pack), false), ModOrigin::Pack);
+        // No context (version modal on an untracked file): the sidecar
+        // decides — reinstalling pack content stays pack.
+        assert_eq!(resolve_install_origin(None, true), ModOrigin::Pack);
+        assert_eq!(resolve_install_origin(None, false), ModOrigin::User);
+    }
+
+    #[test]
+    fn pack_loader_provenance_refreshes_only_pack_owned_pins() {
+        use crate::dto::ModLoader;
+        use crate::modpack::PackDeclaredLoader;
+        let old = PackDeclaredLoader { loader: ModLoader::Forge, version: Some("old".into()) };
+        let next = PackDeclaredLoader { loader: ModLoader::Forge, version: Some("new".into()) };
+        let (_, pin, provenance) = super::pack_loader_selection(
+            ModLoader::Forge, Some("old"), Some(&old), Some(&next)).unwrap();
+        assert_eq!(pin.as_deref(), Some("new"));
+        assert_eq!(provenance.unwrap().version.as_deref(), Some("new"));
+        for previous in [None, Some(&old)] {
+            let (_, pin, provenance) = super::pack_loader_selection(
+                ModLoader::Forge, Some("user-pin"), previous, Some(&next)).unwrap();
+            assert_eq!(pin.as_deref(), Some("user-pin"));
+            assert!(provenance.is_none());
+        }
+        let (_, historical, provenance) = super::pack_loader_selection(
+            ModLoader::Forge, Some("old"), None, Some(&next)).unwrap();
+        assert_eq!(historical.as_deref(), Some("old"));
+        assert!(provenance.is_none());
+        let other = PackDeclaredLoader { loader: ModLoader::NeoForge, version: Some("next".into()) };
+        assert!(super::pack_loader_selection(ModLoader::Forge, Some("old"), None, Some(&other)).is_err());
+        let (loader, pin, _) = super::pack_loader_selection(
+            ModLoader::Forge, Some("old"), Some(&old), Some(&other)).unwrap();
+        assert_eq!(loader, ModLoader::NeoForge);
+        assert_eq!(pin.as_deref(), Some("next"));
     }
 
     #[test]
@@ -1967,6 +1586,23 @@ mod tests {
         // Unrecognized extension (or none) is left untouched rather than
         // guessed at.
         assert_eq!(strip_pack_extension("weird-pack.tar.gz"), "weird-pack.tar.gz");
+    }
+
+    #[test]
+    fn wrong_game_version_error_names_the_mismatch() {
+        // The Bigger Stacks case: 1.20.1-only file offered to a 1.21.1
+        // instance must name both sides, not a bare "no compatible file".
+        let err = map_curseforge_install_error(
+            crate::sources::curseforge::CurseForgeError::WrongGameVersion {
+                filename: "biggerstacks-1.20.1-2026.06.17-all.jar".to_string(),
+                file_versions: vec!["1.20.1".to_string()],
+                expected: "1.21.1".to_string(),
+            },
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("biggerstacks-1.20.1-2026.06.17-all.jar"), "got: {msg}");
+        assert!(msg.contains("1.21.1"), "got: {msg}");
+        assert!(msg.contains("1.20.1"), "got: {msg}");
     }
 
 }

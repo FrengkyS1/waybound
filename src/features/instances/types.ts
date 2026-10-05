@@ -50,6 +50,7 @@ export interface InstalledMod {
   modUid: string;
   modName: string;
   source: "modrinth" | "curseforge";
+  /** Exact physical basename, including `.disabled` when disabled. */
   fileName: string;
   installedAt: number;
   /** How the mod arrived: user-installed versus pack-placed. */

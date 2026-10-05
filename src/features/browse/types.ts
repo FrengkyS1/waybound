@@ -7,6 +7,7 @@ export type ModLoader = "fabric" | "forge" | "neoforge" | "quilt" | "vanilla";
 export type SortIndex = "relevance" | "downloads" | "updated" | "new";
 
 export interface ModSummary {
+  /** Canonical project identity: modrinth:<project ID> or curseforge:<project ID>. */
   uid: string;
   slug: string;
   name: string;
@@ -18,8 +19,8 @@ export interface ModSummary {
   loaders: ModLoader[];
   sources: ModSource[];
   updatedAt: string;
-  curseforgeId?: number;
-  modrinthId?: string;
+  curseforgeId?: number | null;
+  modrinthId?: string | null;
 }
 
 export interface ModSearchQuery {

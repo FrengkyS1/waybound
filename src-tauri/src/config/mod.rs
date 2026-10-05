@@ -105,13 +105,23 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf) -> Self {
+        Self { path, inner: RwLock::new(AppConfigFile::default()) }
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
-        let path = config_path()?;
+        Self::load_with_log(config_path()?, |message| {
+            crate::activity::append_log(message, "warn", None);
+        })
+    }
+
+    fn load_with_log(path: PathBuf, warn: impl Fn(&str)) -> Result<Self, ConfigError> {
         let inner = if path.exists() {
             let raw = fs::read_to_string(&path)?;
             match toml::from_str(&raw) {
                 Ok(parsed) => parsed,
-                Err(err) => {
+                Err(_) => {
                     // A truncated/corrupted config.toml (crash mid-write, disk
                     // full, antivirus lock, ...) used to `?` straight out of
                     // here into an `.expect()` in lib.rs, panicking before any
@@ -122,15 +132,13 @@ impl ConfigStore {
                     // is worth recovering by hand) and start fresh instead.
                     let mut backup = path.as_os_str().to_os_string();
                     backup.push(".bak");
-                    let _ = fs::rename(&path, PathBuf::from(&backup));
-                    crate::activity::append_log(
-                        &format!(
-                            "config.toml was invalid ({err}) — backed up to {} and reset to defaults",
-                            PathBuf::from(&backup).display()
-                        ),
-                        "warn",
-                        None,
-                    );
+                    fs::rename(&path, PathBuf::from(&backup))?;
+                    // TOML's Display includes the source line, which can hold
+                    // legacy plaintext credentials. Do not log parser details.
+                    warn(&format!(
+                        "config.toml was invalid — backed up to {} and reset to defaults",
+                        PathBuf::from(&backup).display()
+                    ));
                     AppConfigFile::default()
                 }
             }
@@ -142,16 +150,18 @@ impl ConfigStore {
             path,
             inner: RwLock::new(inner),
         };
-        store.encrypt_legacy_secrets();
+        if store.encrypt_legacy_secrets().is_err() {
+            warn("Legacy config secret migration could not be saved; existing config retained.");
+        }
         Ok(store)
     }
 
     /// One-time migration: configs written before DPAPI support hold plaintext
     /// secrets; re-persist them encrypted. No-op when nothing is plaintext or
     /// DPAPI is unavailable.
-    fn encrypt_legacy_secrets(&self) {
-        let mut changed = false;
-        if let Ok(mut config) = self.inner.write() {
+    fn encrypt_legacy_secrets(&self) -> Result<(), ConfigError> {
+        self.update(|config| {
+            let mut changed = false;
             if let Some(key) = config.curseforge_api_key.as_deref() {
                 if !protected::is_protected(key) {
                     if let Some(blob) = protected::protect(key) {
@@ -173,10 +183,8 @@ impl ConfigStore {
                     None => config.account = Some(account),
                 }
             }
-        }
-        if changed {
-            let _ = self.persist();
-        }
+            changed
+        })
     }
 
     pub fn curseforge_configured(&self) -> bool {
@@ -220,27 +228,18 @@ impl ConfigStore {
             ));
         }
 
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
             config.curseforge_api_key = Some(protected::protect_or_plain(&api_key));
-        }
-
-        self.persist()
+            true
+        })
     }
 
     pub fn clear_curseforge_api_key(&self) -> Result<(), ConfigError> {
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
+            let changed = config.curseforge_api_key.is_some();
             config.curseforge_api_key = None;
-        }
-
-        self.persist()
+            changed
+        })
     }
 
     pub fn global_mc_options(&self) -> Option<McOptions> {
@@ -260,15 +259,11 @@ impl ConfigStore {
         options: McOptions,
         apply_to_new_instances: bool,
     ) -> Result<(), ConfigError> {
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
             config.default_mc_options = Some(options);
             config.apply_default_mc_options_to_new_instances = apply_to_new_instances;
-        }
-        self.persist()
+            true
+        })
     }
 
     // ---- Launch / account settings -------------------------------------
@@ -286,11 +281,7 @@ impl ConfigStore {
     }
 
     pub fn set_account(&self, account: Option<Account>) -> Result<(), ConfigError> {
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
             config.account = None;
             config.account_protected = None;
             if let Some(account) = account {
@@ -303,8 +294,8 @@ impl ConfigStore {
                     None => config.account = Some(account),
                 }
             }
-        }
-        self.persist()
+            true
+        })
     }
 
     pub fn java_path(&self) -> Option<String> {
@@ -341,18 +332,14 @@ impl ConfigStore {
         max_memory_mb: Option<u32>,
         jvm_args: Option<String>,
     ) -> Result<(), ConfigError> {
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
             config.java_path = java_path.filter(|s| !s.trim().is_empty());
             config.jvm_args = jvm_args.filter(|s| !s.trim().is_empty());
             if let Some(mem) = max_memory_mb {
                 config.max_memory_mb = Some(mem.clamp(512, 32768));
             }
-        }
-        self.persist()
+            true
+        })
     }
 
     pub fn curseforge_login_prompted(&self) -> bool {
@@ -367,29 +354,42 @@ impl ConfigStore {
     /// actually persists the first time (`curseforge_login_prompted` was
     /// already false only once).
     pub fn mark_curseforge_login_prompted(&self) -> Result<(), ConfigError> {
-        {
-            let mut config = self
-                .inner
-                .write()
-                .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        self.update(|config| {
+            let changed = !config.curseforge_login_prompted;
             config.curseforge_login_prompted = true;
-        }
-        self.persist()
+            changed
+        })
     }
 
-    fn persist(&self) -> Result<(), ConfigError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    fn update(&self, change: impl FnOnce(&mut AppConfigFile) -> bool) -> Result<(), ConfigError> {
+        self.update_with_persistence(change, |config| self.persist(config))
+    }
 
-        let config = self
+    /// Hold the same lock through snapshot, persistence, and publication.
+    /// Readers and other writers never observe an uncommitted candidate.
+    fn update_with_persistence(
+        &self,
+        change: impl FnOnce(&mut AppConfigFile) -> bool,
+        persist: impl FnOnce(&AppConfigFile) -> Result<(), ConfigError>,
+    ) -> Result<(), ConfigError> {
+        let mut config = self
             .inner
-            .read()
+            .write()
             .map_err(|_| ConfigError::Parse("config lock poisoned".to_string()))?;
+        let mut candidate = config.clone();
+        if !change(&mut candidate) { return Ok(()); }
+        persist(&candidate)?;
+        *config = candidate;
+        Ok(())
+    }
 
-        let raw = toml::to_string_pretty(&*config)
-            .map_err(|err| ConfigError::Parse(err.to_string()))?;
-        fs::write(&self.path, raw)?;
+    fn persist(&self, config: &AppConfigFile) -> Result<(), ConfigError> {
+        let raw = toml::to_string_pretty(config)
+            .map_err(|_| ConfigError::Parse("could not serialize config".to_string()))?;
+        crate::download::atomic_write(&self.path, raw.as_bytes()).map_err(|error| match error {
+            crate::download::DownloadError::Io(error) => ConfigError::Io(error),
+            _ => ConfigError::Parse("could not safely persist config".to_string()),
+        })?;
         Ok(())
     }
 }
@@ -417,10 +417,7 @@ mod config_store_tests {
     }
 
     fn store_at(path: &std::path::Path) -> ConfigStore {
-        ConfigStore {
-            path: path.to_path_buf(),
-            inner: RwLock::new(AppConfigFile::default()),
-        }
+        ConfigStore::for_test(path.to_path_buf())
     }
 
     /// Re-read a persisted file the same way `load()` would, minus the fixed path.
@@ -647,5 +644,150 @@ mod config_store_tests {
         assert!(!reloaded.apply_global_mc_options_to_new_instances());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_legacy_config_warning_never_includes_source_or_credentials() {
+        for raw in [
+            "curseforgeApiKey = \"legacy-credential-must-not-be-logged",
+            "maxMemoryMb = \"legacy-credential-must-not-be-logged\"\n",
+            "[account]\naccessToken = \"legacy-credential-must-not-be-logged",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, raw).unwrap();
+            let messages = std::cell::RefCell::new(Vec::new());
+            let store = ConfigStore::load_with_log(path.clone(), |message| {
+                messages.borrow_mut().push(message.to_owned());
+            }).unwrap();
+            assert!(store.stored_curseforge_api_key().is_none());
+            assert_eq!(fs::read_to_string(dir.path().join("config.toml.bak")).unwrap(), raw);
+            let messages = messages.into_inner();
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].contains("backed up"));
+            assert!(!messages[0].contains("legacy-credential-must-not-be-logged"));
+            assert!(!messages[0].contains(raw));
+            assert!(!messages[0].contains('\n'));
+        }
+    }
+
+    #[test]
+    fn failed_corrupt_config_backup_does_not_discard_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "curseforgeApiKey = \"legacy-private-value";
+        fs::write(&path, raw).unwrap();
+        fs::create_dir(dir.path().join("config.toml.bak")).unwrap();
+        assert!(ConfigStore::load_with_log(path.clone(), |_| {}).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn failed_persistence_keeps_working_key_and_original_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = store_at(&path);
+        store.set_curseforge_api_key("working-key".into()).unwrap();
+        let original = fs::read(&path).unwrap();
+        // Fault injection at the persistence boundary is deterministic on every
+        // OS and does not depend on privileges or filesystem permissions.
+        let result = store.update_with_persistence(
+            |candidate| {
+                candidate.curseforge_api_key = Some("rejected-replacement-key".into());
+                true
+            },
+            |_| Err(ConfigError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))),
+        );
+        assert!(result.is_err());
+        assert_eq!(store.stored_curseforge_api_key().as_deref(), Some("working-key"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(reload(&path).stored_curseforge_api_key().as_deref(), Some("working-key"));
+    }
+
+    #[test]
+    fn failed_atomic_replacement_keeps_existing_target_and_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("good.toml");
+        let mut store = store_at(&good_path);
+        store.set_launch_settings(Some("working-java".into()), Some(4096), None).unwrap();
+        let original = fs::read(&good_path).unwrap();
+        let blocked_path = dir.path().join("config.toml");
+        fs::create_dir(&blocked_path).unwrap();
+        fs::write(blocked_path.join("existing-data"), &original).unwrap();
+        store.path = blocked_path.clone();
+        assert!(store.set_launch_settings(Some("rejected-java".into()), Some(8192), None).is_err());
+        assert_eq!(store.java_path().as_deref(), Some("working-java"));
+        assert_eq!(store.max_memory_mb(), 4096);
+        assert_eq!(fs::read(blocked_path.join("existing-data")).unwrap(), original);
+        assert_eq!(fs::read(&good_path).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "failed staging files must be removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_config_file_preserves_original_bytes_and_working_key() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = store_at(&path);
+        store.set_curseforge_api_key("working-key".into()).unwrap();
+        let original = fs::read(&path).unwrap();
+        // Allow reads but deny replacement/deletion, without changing ACLs.
+        let locked = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        assert!(store.set_curseforge_api_key("rejected-key".into()).is_err());
+        assert_eq!(store.stored_curseforge_api_key().as_deref(), Some("working-key"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(locked);
+        store.set_curseforge_api_key("new-working-key".into()).unwrap();
+        assert_eq!(reload(&path).stored_curseforge_api_key().as_deref(), Some("new-working-key"));
+    }
+
+    #[test]
+    fn concurrent_updates_serialize_disk_commit_and_in_memory_publication() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = Arc::new(store_at(&path));
+        store.set_curseforge_api_key("working-key".into()).unwrap();
+        let original = fs::read(&path).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.update_with_persistence(
+                |candidate| { candidate.max_memory_mb = Some(6144); true },
+                |candidate| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    first_store.persist(candidate)
+                },
+            ).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(store.inner.try_read().is_err(), "uncommitted state must not be readable");
+        assert!(store.inner.try_write().is_err(), "second writer must wait through persistence");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let second_store = store.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second_store.set_global_mc_options(McOptions::default(), false).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        let disk = reload(&path);
+        assert_eq!(store.max_memory_mb(), 6144);
+        assert_eq!(disk.max_memory_mb(), 6144);
+        assert!(store.global_mc_options().is_some());
+        assert!(disk.global_mc_options().is_some());
+        assert!(!disk.apply_global_mc_options_to_new_instances());
+        assert_eq!(disk.stored_curseforge_api_key().as_deref(), Some("working-key"));
+        assert_eq!(
+            toml::Value::try_from(&*store.inner.read().unwrap()).unwrap(),
+            toml::Value::try_from(&*disk.inner.read().unwrap()).unwrap(),
+        );
     }
 }

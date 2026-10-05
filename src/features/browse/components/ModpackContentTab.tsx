@@ -35,23 +35,28 @@ export function ModpackContentTab({
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<ContentFilter>("all");
   const [search, setSearch] = useState("");
+  const [attempt, setAttempt] = useState(0);
 
   const versionId = selectedVersionId ?? detail.versions[0]?.id;
 
   useEffect(() => {
+    let active = true;
+    setContent(null);
+    setError(null);
+    setFilter("all");
     if (!versionId) {
       setLoading(false);
       return;
     }
     setLoading(true);
-    setError(null);
     void fetchModpackContent(detail.summary, versionId)
-      .then(setContent)
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : String(err)),
-      )
-      .finally(() => setLoading(false));
-  }, [detail.summary, versionId]);
+      .then((value) => { if (active) setContent(value); })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [detail.summary, versionId, attempt]);
 
   const filters = useMemo((): ContentFilter[] => {
     if (!content) return ["mod"];
@@ -110,6 +115,7 @@ export function ModpackContentTab({
           type="search"
           className={styles.search}
           placeholder="Search content…"
+          aria-label="Search modpack content"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -124,7 +130,7 @@ export function ModpackContentTab({
       )}
 
       {loading && <p className={styles.status}>Loading modpack content…</p>}
-      {error && <p className={styles.error}>{error}</p>}
+      {error && <p className={styles.error} role="alert">{error} <button type="button" onClick={() => setAttempt((v) => v + 1)}>Retry content</button></p>}
 
       {!loading && !error && filtered.length === 0 && (
         <p className={styles.empty}>No items match this filter.</p>

@@ -56,10 +56,9 @@ pub fn docker_env_format_warnings(content: &str) -> Vec<String> {
 
         let normalized = normalize_curseforge_api_key(trimmed);
         if !normalized.starts_with("$2a$") && trimmed.contains('$') {
-            warnings.push(format!(
-                "CF_API_KEY after normalization does not start with \"$2a$\" (got prefix \"{}\") — the key may already be corrupted by Docker.",
-                &normalized.chars().take(8).collect::<String>()
-            ));
+            warnings.push(
+                "CF_API_KEY after normalization does not start with \"$2a$\" — the key may already be corrupted by Docker.".to_string()
+            );
         }
     }
 
@@ -264,5 +263,13 @@ mod tests {
     fn rejects_compose_placeholder() {
         let compose = "CF_API_KEY: '${CF_API_KEY}'";
         assert!(extract_curseforge_api_key(compose).is_err());
+    }
+
+    #[test]
+    fn malformed_key_warnings_never_include_credential_fragments() {
+        let warnings = docker_env_format_warnings("CF_API_KEY=secret-prefix$sensitive-suffix");
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("secret-prefix"));
+        assert!(!warnings[0].contains("sensitive-suffix"));
     }
 }

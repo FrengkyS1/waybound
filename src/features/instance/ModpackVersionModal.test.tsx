@@ -150,4 +150,18 @@ describe("ModpackVersionModal", () => {
       expect(screen.getByText("wasn't installed from a modpack")).toBeInTheDocument(),
     );
   });
+
+  it("blocks pinned versions with missing or incompatible Minecraft metadata", async () => {
+    mockIPC((cmd) => {
+      if (cmd === "list_pending_missing_mods") return [];
+      if (cmd === "get_modpack_detail_for_instance") return detail([
+        version({ id: "unknown", name: "Unknown target", gameVersions: [], fileName: "unknown.zip" }),
+        version({ id: "other", name: "Other target", gameVersions: ["1.20.1"], fileName: "other.zip" }),
+      ]);
+    });
+    renderModal();
+    await screen.findByText("Unknown target");
+    expect(screen.getAllByRole("button", { name: "Switch" })).toHaveLength(2);
+    for (const button of screen.getAllByRole("button", { name: "Switch" })) expect(button).toBeDisabled();
+  });
 });

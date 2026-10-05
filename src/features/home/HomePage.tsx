@@ -92,6 +92,14 @@ export function HomePage({
   const [checklistDismissed, setChecklistDismissed] = useState(
     () => localStorage.getItem("waybound.gettingStartedDismissed") === "1",
   );
+  const refreshRequest = useRef(0);
+  const mounted = useRef(true);
+  const selection = useRef({ id: selectedId, revision: 0 });
+  if (selection.current.id !== selectedId) {
+    selection.current = { id: selectedId, revision: selection.current.revision + 1 };
+  }
+  const selectRef = useRef(setSelectedId);
+  selectRef.current = setSelectedId;
 
   const selected = instances.find((i) => i.id === selectedId) ?? null;
 
@@ -107,30 +115,40 @@ export function HomePage({
   }, [instances, search]);
 
   async function refresh(selectId?: string | null) {
+    const request = ++refreshRequest.current;
+    const selectionRevision = selection.current.revision;
     try {
       const list = await fetchInstances();
+      if (!mounted.current || request !== refreshRequest.current) return;
       setInstances(list);
       setRefreshError(null);
-      const nextId = selectId === null ? null : (selectId ?? selectedId ?? null);
-      setSelectedId(nextId && list.some((i) => i.id === nextId) ? nextId : null);
+      const currentId = selection.current.id;
+      const nextId = selectId !== undefined && selectionRevision === selection.current.revision
+        ? selectId : currentId;
+      const validId = nextId && list.some((i) => i.id === nextId) ? nextId : null;
+      if (validId !== currentId) selectRef.current(validId);
     } catch (err) {
-      setRefreshError(err instanceof Error ? err.message : String(err));
+      if (mounted.current && request === refreshRequest.current) {
+        setRefreshError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (mounted.current && request === refreshRequest.current) setLoading(false);
     }
   }
 
   useEffect(() => {
-    let active = true;
+    mounted.current = true;
     // Local instances must remain accessible while remote metadata is unavailable.
-    void fetchInstances()
-      .then((list) => { if (active) setInstances(list); })
-      .catch((err) => {
-        if (active) setRefreshError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => { if (active) setLoading(false); });
+    void refresh();
+    let active = true;
     fetchCurseForgeStatus()
       .then((status) => { if (active) setCfConfigured(status.configured); })
       .catch(() => {});
-    return () => { active = false; };
+    return () => {
+      active = false;
+      mounted.current = false;
+      refreshRequest.current++;
+    };
   }, []);
 
   useEffect(() => {
@@ -157,13 +175,13 @@ export function HomePage({
   // Refresh instance stats (play time, last played) after a session ends.
   useEffect(() => {
     if (refreshTick === 0) return;
-    void refresh(selectedId);
+    void refresh();
   }, [refreshTick]);
 
   // Refresh the instance list when a background install finishes.
   useEffect(() => {
     if (installTick === 0) return;
-    void refresh(selectedId);
+    void refresh();
   }, [installTick]);
 
   async function handleCreate(input: {
@@ -202,7 +220,7 @@ export function HomePage({
     setError(null);
     try {
       await setInstanceIcon(instanceId, icon);
-      await refresh(instanceId);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -215,7 +233,7 @@ export function HomePage({
     setError(null);
     try {
       await renameInstance(instanceId, name);
-      await refresh(instanceId);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       throw err;
@@ -228,7 +246,7 @@ export function HomePage({
     setError(null);
     try {
       await setInstanceLoaderVersion(instanceId, loaderVersion);
-      await refresh(instanceId);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       throw err;
@@ -245,7 +263,7 @@ export function HomePage({
     try {
       const copy = await duplicateInstance(id);
       showMessage(`Duplicated to "${copy.name}".`);
-      await refresh(selectedId);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -259,7 +277,7 @@ export function HomePage({
     try {
       await deleteInstance(id);
       showMessage("Instance deleted.");
-      await refresh(null);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -310,7 +328,7 @@ export function HomePage({
   if (selected) {
     return (
       <>
-      {refreshError && <p className={styles.error} role="alert">{refreshError} <button type="button" onClick={() => void refresh(selectedId)}>Retry library</button></p>}
+      {refreshError && <p className={styles.error} role="alert">{refreshError} <button type="button" onClick={() => void refresh()}>Retry library</button></p>}
       {error && <p className={styles.error} role="alert">{error}</p>}
       <InstancePage
         instance={selected}
@@ -344,8 +362,8 @@ export function HomePage({
           >
             <span aria-hidden>+</span> Create
           </button>
+          <button type="button" className={styles.createBtn} onClick={() => setTransfer("import")}>Import</button>
         </div>
-        <button type="button" className={styles.createBtn} onClick={() => setTransfer("import")}>Import</button>
         <div className={styles.toolbarRight}>
           <input
             type="search"

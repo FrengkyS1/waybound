@@ -1,6 +1,7 @@
 import type { ModSummary } from "../types";
 import { CopyNameButton } from "./CopyNameButton";
 import { SourceBadges } from "./SourceBadges";
+import { isInstallableType } from "../detailTypes";
 import styles from "./ModRow.module.css";
 
 function formatDownloads(count: number): string {
@@ -12,9 +13,15 @@ function formatDownloads(count: number): string {
 interface ModRowProps {
   mod: ModSummary;
   onOpen: (mod: ModSummary) => void;
+  onInstall: (mod: ModSummary) => void;
+  /** "Install"/"Install modpack", or "Add to <instance>" when Browse was
+   * opened from an instance. */
+  installLabel: string;
+  installPending: boolean;
 }
 
-export function ModRow({ mod, onOpen }: ModRowProps) {
+export function ModRow({ mod, onOpen, onInstall, installLabel, installPending }: ModRowProps) {
+  const canInstall = isInstallableType(mod.projectType);
   return (
     <article
       className={styles.row}
@@ -69,6 +76,21 @@ export function ModRow({ mod, onOpen }: ModRowProps) {
         </footer>
       </div>
 
+      {canInstall && (
+        <button
+          type="button"
+          className={styles.installBtn}
+          disabled={installPending}
+          onClick={(e) => {
+            e.stopPropagation();
+            onInstall(mod);
+          }}
+          onKeyDown={(e) => e.stopPropagation()}
+          title={installPending ? "Loading project…" : installLabel}
+        >
+          {installPending ? "…" : installLabel}
+        </button>
+      )}
       <span className={styles.chevron} aria-hidden>
         ›
       </span>

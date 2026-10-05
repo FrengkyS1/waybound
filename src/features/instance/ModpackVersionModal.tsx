@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchModpackDetailForInstance } from "../browse/api";
 import type { ModDetail, ModVersionSummary } from "../browse/detailTypes";
 import { useInstallStore } from "../install/installStore";
@@ -35,28 +35,28 @@ export function ModpackVersionModal({
 }: ModpackVersionModalProps) {
   const [state, setState] = useState<LoadState>({ stage: "loading" });
   const [startingId, setStartingId] = useState<string | null>(null);
-  const cancelled = useRef(false);
   const modalRef = useModalFocus();
   useEscapeKey(onClose);
   const startInstall = useInstallStore((s) => s.startInstall);
 
   useEffect(() => {
-    cancelled.current = false;
+    let active = true;
+    setStartingId(null);
     setState({ stage: "loading" });
     void fetchModpackDetailForInstance(instanceId)
       .then((detail) => {
-        if (cancelled.current) return;
+        if (!active) return;
         setState({ stage: "ready", detail });
       })
       .catch((err) => {
-        if (cancelled.current) return;
+        if (!active) return;
         setState({
           stage: "error",
           message: err instanceof Error ? err.message : String(err),
         });
       });
     return () => {
-      cancelled.current = true;
+      active = false;
     };
   }, [instanceId]);
 
@@ -115,7 +115,7 @@ export function ModpackVersionModal({
               {detail.versions.map((v) => {
                 const installed = isCurrentVersion(v, packLabel);
                 const compatible =
-                  v.gameVersions.length === 0 || v.gameVersions.includes(minecraftVersion);
+                  v.gameVersions.includes(minecraftVersion);
                 const busy = startingId === v.id;
                 return (
                   <li key={v.id} className={styles.row}>

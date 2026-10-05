@@ -378,7 +378,7 @@ fn parse_options(content: &str) -> McOptions {
     // percent = value * 200 (0.5 -> 100%, 1.0 -> 200%), not value * 100.
     options.mouse_sensitivity =
         (parse_f64(map.get("mouseSensitivity"), options.mouse_sensitivity as f64 / 200.0) * 200.0)
-            as i32;
+            .round() as i32;
     options.toggle_sprint = parse_bool(map.get("toggleSprint"), options.toggle_sprint);
     options.toggle_crouch = parse_bool(map.get("toggleCrouch"), options.toggle_crouch);
     options.show_subtitles = parse_bool(map.get("showSubtitles"), options.show_subtitles);
@@ -445,7 +445,7 @@ fn serialize_options(options: &McOptions) -> String {
         format!("gamma:{:.2}", options.gamma as f64 / 100.0),
         format!("renderDistance:{}", options.render_distance),
         format!("simulationDistance:{}", options.simulation_distance),
-        format!("fov:{:.1}", fov_to_file(options.fov)),
+        format!("fov:{:.3}", fov_to_file(options.fov)),
         format!("entityShadows:{}", options.entity_shadows),
         format!("enableVsync:{}", options.vsync),
         format!("maxFps:{}", options.max_fps),
@@ -476,7 +476,7 @@ fn serialize_options(options: &McOptions) -> String {
         format!("autoJump:{}", options.auto_jump),
         format!("invertYMouse:{}", options.invert_mouse),
         format!("invertXMouse:{}", options.invert_x_mouse),
-        format!("mouseSensitivity:{:.2}", options.mouse_sensitivity as f64 / 200.0),
+        format!("mouseSensitivity:{:.3}", options.mouse_sensitivity as f64 / 200.0),
         format!("toggleSprint:{}", options.toggle_sprint),
         format!("toggleCrouch:{}", options.toggle_crouch),
         format!("showSubtitles:{}", options.show_subtitles),
@@ -596,6 +596,42 @@ mod tests {
         // free: forget a serialize/parse line and this fails.
         let options = McOptions::default();
         assert_eq!(parse_options(&serialize_options(&options)), options);
+    }
+
+    #[test]
+    fn single_step_fov_and_sensitivity_survive_options_file_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = McOptions::default();
+        options.customize = true;
+        options.fov = 71;
+        options.mouse_sensitivity = 51;
+
+        write_options(root.path(), &options).unwrap();
+        let restored = read_options(root.path()).unwrap();
+        assert_eq!(restored.fov, 71);
+        assert_eq!(restored.mouse_sensitivity, 51);
+
+        // Exercise merging into an existing options.txt, not only creating it.
+        write_options(root.path(), &restored).unwrap();
+        let restored = read_options(root.path()).unwrap();
+        assert_eq!(restored.fov, 71);
+        assert_eq!(restored.mouse_sensitivity, 51);
+    }
+
+    #[test]
+    fn every_integer_fov_and_sensitivity_step_roundtrips() {
+        let mut options = McOptions::default();
+        for fov in 30..=110 {
+            options.fov = fov;
+            assert_eq!(parse_options(&serialize_options(&options)).fov, fov);
+        }
+        for sensitivity in 0..=200 {
+            options.mouse_sensitivity = sensitivity;
+            assert_eq!(
+                parse_options(&serialize_options(&options)).mouse_sensitivity,
+                sensitivity
+            );
+        }
     }
 
     #[test]
